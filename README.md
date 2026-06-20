@@ -1,8 +1,8 @@
 # CodeAtlas
 
-CodeAtlas is a local-first code intelligence platform for AI coding assistants. It indexes a repository once, builds a graph of files, modules, classes, functions, methods, imports, calls, inheritance, and references, then serves focused code context from the persisted index.
+CodeAtlas is a local-first repository intelligence platform for AI coding assistants. It indexes a repository once, builds a graph of files, modules, classes, functions, methods, imports, calls, inheritance, and references, then layers repository memory on top of git history and documentation.
 
-The goal is to reduce repeated repository reads, improve warm-start retrieval speed, and keep all analysis offline. CodeAtlas does not call OpenAI, Anthropic, or any cloud API.
+The goal is to reduce repeated repository reads, improve warm-start retrieval speed, and explain not only what code exists, but why the repository evolved the way it did. CodeAtlas does not call OpenAI, Anthropic, or any cloud API.
 
 ## Status
 
@@ -12,6 +12,10 @@ This repository contains a working Python-first implementation:
 - SQLite graph store under `.codeatlas/index.db`
 - Incremental indexing by file hash
 - Graph-aware context retrieval with token estimates
+- Repository Memory Engine for git history, README/docs, ADRs, RFCs, release notes, and design docs
+- Commit intelligence heuristics for purpose, motivation, impacted components, risk, and architectural impact
+- Repository Time Machine, ownership intelligence, decision lookup, architecture findings, and compressed repository context
+- Local browser visualization for 2D/3D architecture and commit-history maps
 - Typer CLI with Rich output
 - Watchdog-based watch mode
 - MCP tool handlers and optional FastMCP server
@@ -28,12 +32,13 @@ Repository
   -> Semantic resolution layer
   -> Graph builder
   -> SQLite graph store
-  -> Retrieval engine
+  -> Retrieval engine --------\
+  -> Git/docs memory engine ---+-> Context compression
   -> CLI + MCP server
   -> Claude Code / Codex
 ```
 
-The core design keeps expensive work in the indexing phase. Retrieval uses the persisted SQLite index, graph traversal, and selected snippet reads. It does not re-scan or re-parse the full repository for normal queries.
+The core design keeps expensive work in the indexing phase. Retrieval uses the persisted SQLite index, graph traversal, memory evidence, and selected snippet reads. It does not re-scan or re-parse the full repository for normal queries.
 
 ## Project Structure
 
@@ -45,6 +50,7 @@ src/codeatlas/
   storage.py          # SQLite schema and graph persistence
   scanner.py          # source file discovery and ignore rules
   graph.py            # graph neighborhood helpers
+  memory.py           # repository memory, history, ownership, decisions
   benchmark.py        # measured benchmark report
   watcher.py          # watchdog integration
   mcp_server.py       # MCP tools and FastMCP adapter
@@ -106,6 +112,88 @@ codeatlas watch /path/to/repo
 ```
 
 Incremental indexing compares file hashes and only reparses changed files. Deleted files are removed from the SQLite graph.
+
+## Repository Memory Workflow
+
+Index repository memory:
+
+```bash
+codeatlas memory /path/to/repo
+```
+
+This adds memory tables to `.codeatlas/index.db` beside the existing code graph. The memory engine currently mines:
+
+- git commits, authors, timestamps, commit subjects, and changed files
+- README files
+- docs folders
+- ADR/RFC/design folders
+- changelogs and release notes
+
+It creates repository-memory entities such as `Repository`, `Module`, `Feature`, `Developer`, `Commit`, `PullRequest`, `ArchitectureDecision`, `RepositoryEvent`, `Incident`, and `Release`. Relationships include `introduced_by`, `modified_by`, `reviewed_by`, `caused_by`, `related_to`, `superseded_by`, `depends_on`, and `contributes_to`.
+
+Ask historical and reasoning questions:
+
+```bash
+codeatlas history auth --repo-path /path/to/repo
+codeatlas ownership payments --repo-path /path/to/repo
+codeatlas decisions "Why was Redis introduced?" --repo-path /path/to/repo
+codeatlas architecture "cache" --repo-path /path/to/repo
+codeatlas repo-context "authentication" --repo-path /path/to/repo
+codeatlas nexus auth --repo-path /path/to/repo
+```
+
+Every memory answer returns evidence from commits or documents. If CodeAtlas does not have evidence, it says so instead of inventing an answer.
+
+## Git Nexus And Impact Review
+
+CodeAtlas also builds a lightweight git nexus from commit co-change history:
+
+- file memory nodes for files touched by commits
+- file-to-file co-change links
+- component hotspots from churn, authors, and files touched
+- ownership links from authors to files/components
+- FTS5-backed evidence search over commit and document memory
+- a local browser map with architecture and commit-history views
+
+Review local changes against historical context:
+
+```bash
+codeatlas impact /path/to/repo --base-ref HEAD
+```
+
+This produces an impact-radius panel with changed files, risk levels, historical owners, co-change neighbors, related commits, and a token-savings estimate comparing raw changed-file context with compressed impact context.
+
+Find active or risky areas:
+
+```bash
+codeatlas hotspots /path/to/repo
+```
+
+Summarize a component or path from git memory:
+
+```bash
+codeatlas nexus auth --repo-path /path/to/repo
+```
+
+## Local Architecture And Commit Map
+
+Open a repository map in your browser:
+
+```bash
+codeatlas serve /path/to/repo
+```
+
+The command refreshes the code graph and repository memory, starts a local server, and opens a webpage by default. The map has three views:
+
+- Architecture view: major components, internal imports/calls, external modules/services, service-like nodes, and git co-change links.
+- Commit view: developers, commits, and the components each commit touched.
+- Compare view: two git refs or commits are archived into temporary snapshots, indexed side by side, and annotated with red nodes/edges for added, removed, or changed architecture.
+
+Use the 2D/3D toggle to switch between a flat force map and a lightweight depth view. Use the left filter rail to hide/show components, common library nodes, and compare specific commit refs. For terminal-only workflows:
+
+```bash
+codeatlas serve /path/to/repo --no-open --port 8765
+```
 
 ## Retrieval Flow
 
@@ -173,8 +261,18 @@ Convenience views are created for `classes`, `functions`, and `methods`.
 
 ```bash
 codeatlas index /path/to/repo
+codeatlas memory /path/to/repo
 codeatlas context "query" --repo-path /path/to/repo
+codeatlas history "topic" --repo-path /path/to/repo
+codeatlas ownership "topic" --repo-path /path/to/repo
+codeatlas decisions "question" --repo-path /path/to/repo
+codeatlas architecture "topic" --repo-path /path/to/repo
+codeatlas repo-context "query" --repo-path /path/to/repo
+codeatlas impact /path/to/repo --base-ref HEAD
+codeatlas hotspots /path/to/repo
+codeatlas nexus "topic" --repo-path /path/to/repo
 codeatlas graph "SymbolName" --repo-path /path/to/repo
+codeatlas serve /path/to/repo
 codeatlas benchmark /path/to/repo --query "query"
 codeatlas watch /path/to/repo
 codeatlas stats /path/to/repo
@@ -191,6 +289,18 @@ codeatlas mcp --repo-path /path/to/repo
 
 Exposed tools:
 
+- `get_context(query, max_tokens)`
+- `get_history(topic, limit)`
+- `get_architecture(topic, limit)`
+- `get_ownership(topic, limit)`
+- `get_dependencies(symbol_name)`
+- `get_api_flow(query)`
+- `get_decisions(question, limit)`
+- `search_memory(query, limit)`
+- `get_impact(base_ref)`
+- `get_hotspots(limit)`
+- `get_nexus(topic)`
+- `get_visual_map()`
 - `get_code_context(query, max_tokens, depth)`
 - `find_symbol(symbol_name)`
 - `explain_dependencies(symbol_name)`
@@ -229,8 +339,10 @@ The implementation is organized in layers:
 2. Parser layer: Tree-sitter plugin interface, currently Python.
 3. Indexer: scan, parse, persist, and update graph sections.
 4. Retrieval engine: lookup, traversal, ranking, snippets, token reporting.
-5. CLI and MCP: local user and assistant interfaces.
-6. Benchmarks and tests: measured reports and regression coverage.
+5. Memory engine: git/document evidence extraction, memory entities, relationships, and history queries.
+6. Context compression: architecture, history, decisions, ownership, dependencies, files, and related changes.
+7. CLI and MCP: local user and assistant interfaces.
+8. Benchmarks and tests: measured reports and regression coverage.
 
 ## Limitations
 
@@ -239,6 +351,10 @@ The implementation is organized in layers:
 - Retrieval reads selected snippets from disk. It does not re-parse the repository, but it expects files to remain present after indexing.
 - Call resolution is name-based and prefers same-module matches before shortest qualified names.
 - Token counts are estimates, not tokenizer-specific counts.
+- PR review comments and approvals are not fetched from GitHub yet; PullRequest entities are currently inferred from commit messages.
+- Commit intelligence uses deterministic local heuristics, not an LLM. It cites evidence but should be treated as an initial signal.
+- API-flow and infrastructure intelligence have conservative MCP surfaces, but deep endpoint/runtime topology extraction is still roadmap work.
+- Impact radius is conservative and based on local git diff, file names, ownership, co-change history, and indexed evidence. It is not a substitute for test execution.
 
 ## Roadmap
 
@@ -249,6 +365,10 @@ The implementation is organized in layers:
 - Add graph export formats such as GraphML and JSON.
 - Add richer benchmark suites with labeled expected contexts.
 - Add package-aware import resolution for monorepos.
+- Add GitHub/GitLab PR ingestion for review comments, approvals, and requested changes.
+- Add exact architecture evolution diffing between graph snapshots.
+- Add API route/event/infra parsers for end-to-end flow intelligence.
+- Add confidence calibration and larger evidence-backed benchmark suites.
 
 ## Development
 
