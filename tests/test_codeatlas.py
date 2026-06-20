@@ -134,6 +134,8 @@ class ParserTests(CodeAtlasTestCase):
         self.assertIn("app.orders.OrderService.create_order", names)
         self.assertIn("PaymentService", {call.target_name for call in result.calls})
         self.assertIn("charge", {call.target_name for call in result.calls})
+        calls_by_display = {call.display_name: call for call in result.calls}
+        self.assertEqual(calls_by_display["processor.charge"].arguments, ("total",))
 
     def test_scanner_ignores_dependency_directories(self) -> None:
         with self.make_repo() as root_name:
@@ -346,6 +348,19 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertIn("auth.py", component_ids)
         self.assertIn("docs", component_ids)
         self.assertTrue(payload["component_graph"]["edges"])
+        example_edges = [
+            edge for edge in payload["component_graph"]["edges"] if edge.get("examples")
+        ]
+        call_examples = [
+            example
+            for edge in example_edges
+            for example in edge["examples"]
+            if example["type"] == "calls"
+        ]
+        self.assertTrue(example_edges)
+        self.assertTrue(call_examples)
+        self.assertTrue(any(example["arguments"] == ["total"] for example in call_examples))
+        self.assertTrue(any(example["target"].get("signature") for example in call_examples))
         self.assertIn("commit", commit_types)
         self.assertIn("developer", commit_types)
 
@@ -415,11 +430,39 @@ class VisualizationTests(CodeAtlasTestCase):
     def test_visualization_page_exposes_filters_and_edge_selection(self) -> None:
         self.assertIn('id="componentFilters"', HTML_APP)
         self.assertIn('id="showCommonInput"', HTML_APP)
+        self.assertIn('id="refreshBtn"', HTML_APP)
+        self.assertIn('id="zoomInBtn"', HTML_APP)
+        self.assertIn('id="zoomOutBtn"', HTML_APP)
+        self.assertIn('id="baseCommitSelect"', HTML_APP)
+        self.assertIn('id="headCommitSelect"', HTML_APP)
+        self.assertIn('id="topCompareControls"', HTML_APP)
         self.assertIn('id="runCompareBtn"', HTML_APP)
+        self.assertIn('id="runTopCompareBtn"', HTML_APP)
         self.assertIn('id="askBtn"', HTML_APP)
+        self.assertIn("/api/refresh", HTML_APP)
         self.assertIn("/api/chat", HTML_APP)
+        self.assertIn("populateCommitSelectors", HTML_APP)
+        self.assertIn("commitOptionsFromPayload", HTML_APP)
+        self.assertIn("'dateutil'", HTML_APP)
+        self.assertIn("'operator'", HTML_APP)
+        self.assertIn("setZoom", HTML_APP)
+        self.assertIn("handleGraphWheel", HTML_APP)
+        self.assertIn("handleGraphPointerDown", HTML_APP)
+        self.assertIn("handleGraphPointerMove", HTML_APP)
+        self.assertIn("gesturechange", HTML_APP)
+        self.assertIn("canvas.panning", HTML_APP)
         self.assertIn("distanceToSegment", HTML_APP)
         self.assertIn("renderEdgeSelection", HTML_APP)
+        self.assertIn("renderNodeConnections", HTML_APP)
+        self.assertIn("nodeEdgesForSelection", HTML_APP)
+        self.assertIn("renderDetailLines", HTML_APP)
+        self.assertIn("appendExampleSection", HTML_APP)
+        self.assertIn("detail-card", HTML_APP)
+        self.assertIn("detail-call", HTML_APP)
+        self.assertIn("detail-signature", HTML_APP)
+        self.assertIn("parameters:", HTML_APP)
+        self.assertIn("renderEdgeExample", HTML_APP)
+        self.assertIn("target signature", HTML_APP)
         self.assertIn("drawCompare", HTML_APP)
 
 

@@ -92,6 +92,7 @@ class CallRecord:
     target_name: str
     display_name: str
     line_number: int
+    arguments: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

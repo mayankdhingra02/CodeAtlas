@@ -254,7 +254,11 @@ class RepositoryIndexer:
                 target_key,
                 target_type,
                 EdgeType.CALLS,
-                metadata={"display": call.display_name, "line": call.line_number},
+                metadata={
+                    "display": call.display_name,
+                    "line": call.line_number,
+                    "arguments": list(call.arguments),
+                },
             )
 
         for inheritance in parse_result.inheritance:

@@ -241,13 +241,29 @@ class VisualizationService:
                   s.type AS source_type,
                   s.label AS source_label,
                   s.file_path AS source_path,
+                  ss.qualified_name AS source_qualified_name,
+                  ss.name AS source_symbol_name,
+                  ss.kind AS source_symbol_kind,
+                  ss.module AS source_module,
+                  ss.signature AS source_signature,
+                  ss.line_start AS source_line_start,
+                  ss.line_end AS source_line_end,
                   t.key AS target_key,
                   t.type AS target_type,
                   t.label AS target_label,
-                  t.file_path AS target_path
+                  t.file_path AS target_path,
+                  ts.qualified_name AS target_qualified_name,
+                  ts.name AS target_symbol_name,
+                  ts.kind AS target_symbol_kind,
+                  ts.module AS target_module,
+                  ts.signature AS target_signature,
+                  ts.line_start AS target_line_start,
+                  ts.line_end AS target_line_end
                 FROM edges e
                 LEFT JOIN nodes s ON s.key = e.source_key
                 LEFT JOIN nodes t ON t.key = e.target_key
+                LEFT JOIN symbols ss ON ss.id = s.symbol_id
+                LEFT JOIN symbols ts ON ts.id = t.symbol_id
                 """
             ).fetchall()
         )
@@ -272,6 +288,7 @@ class VisualizationService:
     ) -> dict[str, Any]:
         components: dict[str, dict[str, Any]] = {}
         edge_weights: dict[tuple[str, str, str], dict[str, Any]] = {}
+        import_targets_by_file = import_targets_for_files(code_edges)
 
         for file_row in files:
             component = component_for_path(str(file_row["path"]))
@@ -304,13 +321,17 @@ class VisualizationService:
 
         for row in code_edges:
             edge_type = str(row["edge_type"]).upper()
-            if row.get("target_path") is None and edge_type != "IMPORTS":
+            target_component = target_component_for_code_edge(
+                row,
+                edge_type=edge_type,
+                import_targets_by_file=import_targets_by_file,
+            )
+            if row.get("target_path") is None and edge_type != "IMPORTS" and target_component is None:
                 continue
             source_component = component_from_edge_path(row.get("source_path"), row.get("source_label"))
-            target_component = component_from_edge_path(row.get("target_path"), row.get("target_label"))
             if not source_component or not target_component or source_component == target_component:
                 continue
-            if row.get("target_path") is None and row.get("target_type") == "MODULE":
+            if row.get("target_path") is None:
                 components.setdefault(target_component, external_node(target_component))
             edge_key = (source_component, target_component, edge_type)
             edge = edge_weights.setdefault(
@@ -322,11 +343,16 @@ class VisualizationService:
                     "type": str(row["edge_type"]).lower(),
                     "weight": 0,
                     "reasons": [],
+                    "examples": [],
                 },
             )
             edge["weight"] += 1
             if len(edge["reasons"]) < 5:
                 edge["reasons"].append(str(row.get("source_label") or row.get("source_key")))
+            if len(edge["examples"]) < 10:
+                edge["examples"].append(
+                    component_edge_example(row, target_component=target_component)
+                )
 
         for row in memory_edges:
             metadata = parse_json(row.get("metadata_json"))
@@ -350,11 +376,23 @@ class VisualizationService:
                     "type": "cochange",
                     "weight": 0,
                     "reasons": [],
+                    "examples": [],
                 },
             )
             edge["weight"] += 1
             if len(edge["reasons"]) < 5:
                 edge["reasons"].append(str(metadata.get("commit", ""))[:12])
+            if len(edge["examples"]) < 10:
+                edge["examples"].append(
+                    {
+                        "type": "cochange",
+                        "source": {"label": source, "path": source},
+                        "target": {"label": target, "path": target},
+                        "file_path": source,
+                        "related_file_path": target,
+                        "commit": str(metadata.get("commit", ""))[:12],
+                    }
+                )
 
         nodes = []
         for component, node in components.items():
@@ -479,6 +517,18 @@ def create_visualization_server(
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
+            if parsed.path == "/api/refresh":
+                try:
+                    payload = self._read_json()
+                    max_commits = int(payload.get("max_commits", 1000))
+                    service.prepare(repo_root, refresh=True, max_commits=max_commits)
+                    graph = service.build_map(repo_root)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **graph})
+                return
+
             if parsed.path != "/api/chat":
                 self.send_error(404)
                 return
@@ -702,12 +752,136 @@ def node_signature(node: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def import_targets_for_files(code_edges: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    targets: dict[str, dict[str, str]] = defaultdict(dict)
+    for row in code_edges:
+        if str(row.get("edge_type", "")).upper() != "IMPORTS":
+            continue
+        source_path = row.get("source_path")
+        if not source_path:
+            continue
+        metadata = parse_json(row.get("metadata_json"))
+        module = str(row.get("target_label") or "").strip()
+        component = component_from_edge_path(row.get("target_path"), module)
+        if not component:
+            continue
+        module_root = module.split(".", 1)[0] if module else ""
+        for alias in (module_root, metadata.get("alias"), metadata.get("name")):
+            alias_text = str(alias or "").strip()
+            if alias_text:
+                targets[str(source_path)][alias_text] = component
+    return targets
+
+
+def target_component_for_code_edge(
+    row: dict[str, Any],
+    *,
+    edge_type: str,
+    import_targets_by_file: dict[str, dict[str, str]],
+) -> str | None:
+    if edge_type == "CALLS" and row.get("target_path") is None:
+        metadata = parse_json(row.get("metadata_json"))
+        display = str(metadata.get("display") or "").strip()
+        if not display:
+            return None
+        root = display.split(".", 1)[0]
+        source_path = str(row.get("source_path") or "")
+        return import_targets_by_file.get(source_path, {}).get(root)
+    component = component_from_edge_path(row.get("target_path"), row.get("target_label"))
+    if component is not None:
+        return component
+    return None
+
+
+def component_edge_example(row: dict[str, Any], *, target_component: str) -> dict[str, Any]:
+    metadata = parse_json(row.get("metadata_json"))
+    edge_type = str(row.get("edge_type", "")).lower()
+    source = edge_endpoint(row, "source")
+    target = edge_endpoint(row, "target")
+    display = edge_display(edge_type, row, metadata)
+    arguments = edge_arguments(metadata)
+
+    if edge_type == "calls" and display:
+        target["label"] = display
+        if row.get("target_path") is None:
+            target["kind"] = "external api"
+            target["component"] = target_component
+    elif edge_type == "imports" and display:
+        target["label"] = display
+        target["component"] = target_component
+
+    return {
+        "type": edge_type,
+        "source": source,
+        "target": target,
+        "display": display,
+        "arguments": arguments,
+        "file_path": source.get("path") or target.get("path"),
+        "line": metadata.get("line") or source.get("line_start"),
+    }
+
+
+def edge_endpoint(row: dict[str, Any], side: str) -> dict[str, Any]:
+    qualified = row.get(f"{side}_qualified_name")
+    label = qualified or row.get(f"{side}_label") or row.get(f"{side}_key")
+    endpoint = {
+        "key": row.get(f"{side}_key"),
+        "type": row.get(f"{side}_type"),
+        "label": label,
+        "name": row.get(f"{side}_symbol_name") or row.get(f"{side}_label"),
+        "qualified_name": qualified,
+        "kind": row.get(f"{side}_symbol_kind") or row.get(f"{side}_type"),
+        "module": row.get(f"{side}_module"),
+        "signature": row.get(f"{side}_signature"),
+        "path": row.get(f"{side}_path"),
+        "line_start": row.get(f"{side}_line_start"),
+        "line_end": row.get(f"{side}_line_end"),
+    }
+    return {key: value for key, value in endpoint.items() if value not in (None, "")}
+
+
+def edge_display(edge_type: str, row: dict[str, Any], metadata: dict[str, Any]) -> str:
+    if edge_type == "imports":
+        module = str(row.get("target_label") or "")
+        name = str(metadata.get("name") or "")
+        alias = str(metadata.get("alias") or "")
+        display = f"{module}.{name}" if module and name else module or name
+        return f"{display} as {alias}" if alias else display
+    for key in ("display", "import"):
+        value = metadata.get(key)
+        if value:
+            return str(value)
+    return str(row.get("target_qualified_name") or row.get("target_label") or "")
+
+
+def edge_arguments(metadata: dict[str, Any]) -> list[str]:
+    arguments = metadata.get("arguments")
+    if not isinstance(arguments, list):
+        return []
+    return [str(argument) for argument in arguments if str(argument).strip()]
+
+
+def edge_example_signature(example: dict[str, Any]) -> tuple[Any, ...]:
+    source = example.get("source") or {}
+    target = example.get("target") or {}
+    return (
+        example.get("type"),
+        source.get("qualified_name") or source.get("label"),
+        target.get("qualified_name") or target.get("label"),
+        example.get("display"),
+        tuple(example.get("arguments") or ()),
+        example.get("file_path"),
+        example.get("line"),
+    )
+
+
 def edge_signature(edge: dict[str, Any]) -> tuple[Any, ...]:
     return (
         edge.get("source"),
         edge.get("target"),
         edge.get("type"),
         edge.get("weight"),
+        tuple(edge_example_signature(example) for example in edge.get("examples", ())[:20]),
     )
 
 
@@ -787,14 +961,20 @@ HTML_APP = r"""
     h1 { margin: 0; font-size: 16px; font-weight: 650; }
     .meta { color: var(--muted); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .toolbar { margin-left: auto; display: flex; align-items: center; gap: 8px; }
-    button, input, textarea { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; }
-    input { height: 34px; padding: 0 10px; }
+    button, input, select, textarea { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; }
+    input, select { height: 34px; padding: 0 10px; }
     textarea { width: 100%; min-height: 72px; padding: 8px 10px; resize: vertical; font: inherit; }
     button { cursor: pointer; }
+    .icon-btn { width: 34px; height: 34px; padding: 0; font-size: 18px; line-height: 1; }
     button.active { border-color: var(--blue); color: white; background: #23304a; }
-    input { width: 220px; outline: none; }
+    input, select { width: 220px; outline: none; }
+    .compare-picker { display: none; align-items: center; gap: 6px; min-width: 0; }
+    .compare-picker.active { display: flex; }
+    .compare-picker select { width: clamp(130px, 16vw, 230px); }
+    .compare-picker button { height: 34px; }
     main { position: relative; min-width: 0; min-height: 0; }
-    canvas { width: 100%; height: 100%; display: block; }
+    canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+    canvas.panning { cursor: grabbing; }
     aside { background: var(--panel); overflow: auto; padding: 14px; }
     .filter-panel { border-right: 1px solid var(--line); }
     .detail-panel { border-left: 1px solid var(--line); }
@@ -804,7 +984,24 @@ HTML_APP = r"""
     .stat strong { font-size: 18px; }
     .section-title { margin: 16px 0 8px; color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .08em; }
     .pill { display: inline-flex; border: 1px solid var(--line); background: var(--panel2); border-radius: 999px; padding: 3px 8px; margin: 0 5px 5px 0; color: var(--muted); font-size: 12px; cursor: pointer; }
-    .details { white-space: pre-wrap; color: var(--muted); }
+    .details { color: var(--muted); }
+    .detail-stack { display: grid; gap: 8px; }
+    .detail-card { border: 1px solid var(--line); background: #151922; border-radius: 6px; overflow: hidden; }
+    .detail-card summary { cursor: pointer; padding: 8px 10px; color: var(--text); font-weight: 700; }
+    .detail-card[open] summary { color: var(--blue); }
+    .detail-body { border-top: 1px solid var(--line); padding: 8px 10px 10px; }
+    .detail-lines { white-space: pre-wrap; }
+    .detail-nested { margin-top: 8px; background: rgba(32, 36, 45, .55); }
+    .detail-nested summary { color: var(--amber); font-size: 12px; }
+    .detail-empty { color: var(--muted); font-size: 12px; }
+    .details .detail-key { color: var(--blue); font-weight: 650; }
+    .details .detail-section { color: var(--text); font-weight: 700; }
+    .details .detail-edge { color: var(--amber); font-weight: 650; }
+    .details .detail-call { color: var(--green); }
+    .details .detail-signature { color: var(--violet); }
+    .details .detail-path { color: #8fc7ff; }
+    .details .detail-change { color: var(--red); }
+    .details .detail-value { color: var(--text); }
     .chat-box { display: grid; gap: 8px; }
     .chat-actions { display: flex; gap: 8px; align-items: center; }
     .chat-actions button { flex: 0 0 auto; }
@@ -836,7 +1033,8 @@ HTML_APP = r"""
       #app { grid-template-columns: 1fr; grid-template-rows: 54px 220px minmax(0, 1fr) 280px; }
       header, aside, main { grid-column: 1; }
       .filter-panel, .detail-panel { border-left: 0; border-right: 0; border-top: 1px solid var(--line); }
-      input { width: 140px; }
+      input, select { width: 140px; }
+      .compare-picker select { width: 120px; }
     }
   </style>
 </head>
@@ -846,10 +1044,17 @@ HTML_APP = r"""
       <h1>CodeAtlas Map</h1>
       <div id="repoMeta" class="meta">Loading repository graph...</div>
       <div class="toolbar">
+        <button id="refreshBtn">Refresh</button>
         <button id="architectureBtn" class="active">Architecture</button>
         <button id="commitsBtn">Commits</button>
         <button id="compareViewBtn">Compare</button>
-        <button id="modeBtn">3D</button>
+        <div id="topCompareControls" class="compare-picker">
+          <select id="baseCommitSelect" aria-label="Base commit"></select>
+          <select id="headCommitSelect" aria-label="Head commit"></select>
+          <button id="runTopCompareBtn">Compare</button>
+        </div>
+        <button id="zoomOutBtn" class="icon-btn" title="Zoom out" aria-label="Zoom out">-</button>
+        <button id="zoomInBtn" class="icon-btn" title="Zoom in" aria-label="Zoom in">+</button>
         <input id="searchInput" placeholder="Filter nodes">
       </div>
     </header>
@@ -910,9 +1115,9 @@ HTML_APP = r"""
     const ctx = canvas.getContext('2d');
     const COMMON_NODE_IDS = new Set([
       '.gitignore', '__init__.py', 'abc', 'ast', 'collections', 'dataclasses',
-      'datetime', 'docs', 'enum', 'hashlib', 'http', 'json', 'mcp', 'networkx',
-      'os', 'pathlib', 'pyproject.toml', 're', 'readme.md', 'rich', 'shutil',
-      'socket', 'sqlite3', 'subprocess', 'tempfile', 'textwrap', 'threading',
+      'datetime', 'dateutil', 'docs', 'enum', 'hashlib', 'http', 'json', 'mcp',
+      'networkx', 'operator', 'os', 'pathlib', 'pyproject.toml', 're', 'readme.md',
+      'rich', 'shutil', 'socket', 'sqlite3', 'subprocess', 'tempfile', 'textwrap', 'threading',
       'time', 'tree_sitter', 'tree_sitter_language_pack', 'typer', 'typing',
       'unittest', 'urllib', 'watchdog', 'webbrowser'
     ]);
@@ -920,7 +1125,16 @@ HTML_APP = r"""
       raw: null,
       view: 'architecture',
       compare: null,
-      pseudo3d: false,
+      commitOptions: [],
+      zoom: 1,
+      panX: 0,
+      panY: 0,
+      isPanning: false,
+      panStartX: 0,
+      panStartY: 0,
+      panBaseX: 0,
+      panBaseY: 0,
+      suppressClick: false,
       allNodes: [],
       allEdges: [],
       nodes: [],
@@ -929,44 +1143,39 @@ HTML_APP = r"""
       search: '',
       componentFilter: '',
       hiddenNodeIds: new Set(),
-      showCommon: false,
-      angle: 0
+      showCommon: false
     };
 
     function setActiveViewButton() {
       document.getElementById('architectureBtn').classList.toggle('active', state.view === 'architecture');
       document.getElementById('commitsBtn').classList.toggle('active', state.view === 'commits');
       document.getElementById('compareViewBtn').classList.toggle('active', state.view === 'compare');
+      document.getElementById('topCompareControls').classList.toggle('active', state.view === 'compare');
     }
 
-    fetch('/api/graph')
-      .then(r => r.json())
-      .then(data => {
-        state.raw = data;
-        document.getElementById('repoMeta').textContent = data.repo.name + ' - ' + data.repo.path;
-        renderStats(data.stats);
-        setGraph('architecture');
-        requestAnimationFrame(tick);
-      })
-      .catch(err => {
-        document.getElementById('repoMeta').textContent = 'Failed to load graph: ' + err.message;
-      });
+    loadGraph();
 
+    document.getElementById('refreshBtn').onclick = () => refreshGraph();
     document.getElementById('architectureBtn').onclick = () => setGraph('architecture');
     document.getElementById('commitsBtn').onclick = () => setGraph('commits');
-    document.getElementById('compareViewBtn').onclick = () => {
-      if (state.compare) setGraph('compare');
-      else runCompare();
-    };
+    document.getElementById('compareViewBtn').onclick = () => setGraph('compare');
     document.getElementById('runCompareBtn').onclick = () => runCompare();
+    document.getElementById('runTopCompareBtn').onclick = () => runCompare();
+    document.getElementById('baseCommitSelect').onchange = event => syncCommitSelectToInput(event.target, 'baseRefInput');
+    document.getElementById('headCommitSelect').onchange = event => syncCommitSelectToInput(event.target, 'headRefInput');
     document.getElementById('askBtn').onclick = () => askQuestion();
     document.getElementById('chatQuestion').addEventListener('keydown', event => {
       if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') askQuestion();
     });
-    document.getElementById('modeBtn').onclick = () => {
-      state.pseudo3d = !state.pseudo3d;
-      document.getElementById('modeBtn').textContent = state.pseudo3d ? '2D' : '3D';
-    };
+    document.getElementById('zoomOutBtn').onclick = () => setZoom(state.zoom / 1.2);
+    document.getElementById('zoomInBtn').onclick = () => setZoom(state.zoom * 1.2);
+    canvas.addEventListener('wheel', handleGraphWheel, { passive: false });
+    canvas.addEventListener('gesturestart', handleGraphGestureStart, { passive: false });
+    canvas.addEventListener('gesturechange', handleGraphGestureChange, { passive: false });
+    canvas.addEventListener('pointerdown', handleGraphPointerDown);
+    window.addEventListener('pointermove', handleGraphPointerMove);
+    window.addEventListener('pointerup', handleGraphPointerEnd);
+    window.addEventListener('pointercancel', handleGraphPointerEnd);
     document.getElementById('searchInput').oninput = event => {
       state.search = event.target.value.toLowerCase();
     };
@@ -992,6 +1201,10 @@ HTML_APP = r"""
       renderFilterControls();
     };
     canvas.addEventListener('click', event => {
+      if (state.suppressClick) {
+        state.suppressClick = false;
+        return;
+      }
       if (!state.nodes.length) {
         state.selected = null;
         renderSelection(null);
@@ -1085,6 +1298,124 @@ HTML_APP = r"""
       return bestEdge
         ? { distance: bestEdgeDist, selection: { kind: 'edge', edge: bestEdge, side: sideName } }
         : null;
+    }
+
+    function loadGraph() {
+      fetch('/api/graph')
+        .then(r => r.json())
+        .then(data => {
+          applyGraphPayload(data, 'architecture');
+          requestAnimationFrame(tick);
+        })
+        .catch(err => {
+          document.getElementById('repoMeta').textContent = 'Failed to load graph: ' + err.message;
+        });
+    }
+
+    function refreshGraph() {
+      const button = document.getElementById('refreshBtn');
+      const previousText = button.textContent;
+      const nextView = state.view === 'commits' ? 'commits' : 'architecture';
+      button.disabled = true;
+      button.textContent = 'Refreshing...';
+      setRepoStatus('Refreshing index and graph...');
+      fetch('/api/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ max_commits: 1000 })
+      })
+        .then(async response => {
+          const payload = await response.json();
+          if (!response.ok || !payload.ok) throw new Error(payload.error || 'Refresh failed');
+          return payload;
+        })
+        .then(payload => {
+          state.compare = null;
+          document.getElementById('compareStatus').textContent = '';
+          applyGraphPayload(payload, nextView);
+        })
+        .catch(err => {
+          setRepoStatus('Refresh failed: ' + err.message);
+        })
+        .finally(() => {
+          button.disabled = false;
+          button.textContent = previousText;
+        });
+    }
+
+    function applyGraphPayload(payload, view) {
+      state.raw = payload;
+      populateCommitSelectors(payload);
+      setRepoStatus(payload.repo.name + ' - ' + payload.repo.path);
+      renderStats(payload.stats);
+      setGraph(view || state.view || 'architecture');
+    }
+
+    function setRepoStatus(text) {
+      document.getElementById('repoMeta').textContent = text;
+    }
+
+    function populateCommitSelectors(payload) {
+      const commits = commitOptionsFromPayload(payload);
+      state.commitOptions = commits;
+      const baseSelect = document.getElementById('baseCommitSelect');
+      const headSelect = document.getElementById('headCommitSelect');
+      fillCommitSelect(baseSelect, commits);
+      fillCommitSelect(headSelect, commits);
+
+      const baseInput = document.getElementById('baseRefInput');
+      const headInput = document.getElementById('headRefInput');
+      const defaultBase = commits[1] ? commits[1].ref : commits[0] ? commits[0].ref : 'HEAD~1';
+      const defaultHead = commits[0] ? commits[0].ref : 'HEAD';
+      baseSelect.value = matchingCommitRef(baseInput.value, commits) || defaultBase;
+      headSelect.value = matchingCommitRef(headInput.value, commits) || defaultHead;
+      syncCommitSelectToInput(baseSelect, 'baseRefInput');
+      syncCommitSelectToInput(headSelect, 'headRefInput');
+    }
+
+    function commitOptionsFromPayload(payload) {
+      return (payload.commit_graph.nodes || [])
+        .filter(node => node.type === 'commit')
+        .map(node => ({
+          ref: node.id.replace(/^commit:/, ''),
+          title: node.label || 'Untitled commit',
+          timestamp: node.timestamp || '',
+          files: node.metrics ? node.metrics.files || 0 : 0
+        }))
+        .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+    }
+
+    function fillCommitSelect(select, commits) {
+      select.innerHTML = '';
+      for (const commit of commits) {
+        const option = document.createElement('option');
+        option.value = commit.ref;
+        option.textContent = commitOptionLabel(commit);
+        select.appendChild(option);
+      }
+      select.disabled = commits.length === 0;
+    }
+
+    function commitOptionLabel(commit) {
+      const date = commit.timestamp ? commit.timestamp.slice(0, 10) + ' ' : '';
+      return date + commit.ref + ' ' + truncateText(commit.title, 54);
+    }
+
+    function matchingCommitRef(value, commits) {
+      const clean = String(value || '').trim();
+      if (!clean) return '';
+      const match = commits.find(commit => clean === commit.ref || clean.startsWith(commit.ref) || commit.ref.startsWith(clean));
+      return match ? match.ref : '';
+    }
+
+    function syncCommitSelectToInput(select, inputId) {
+      const input = document.getElementById(inputId);
+      if (!select.disabled && select.value) input.value = select.value;
+    }
+
+    function truncateText(value, length) {
+      const text = String(value || '');
+      return text.length > length ? text.slice(0, length - 1) + '...' : text;
     }
 
     function runCompare() {
@@ -1183,6 +1514,101 @@ HTML_APP = r"""
       }[char]));
     }
 
+    function setZoom(value, anchor) {
+      const previous = state.zoom;
+      const next = clamp(value, 0.35, 3.2);
+      if (anchor && previous > 0 && next !== previous) {
+        const center = zoomAnchorCenter(anchor);
+        const localX = anchor.x - center.x;
+        const localY = anchor.y - center.y;
+        const ratio = next / previous;
+        state.panX = localX - (localX - state.panX) * ratio;
+        state.panY = localY - (localY - state.panY) * ratio;
+      }
+      state.zoom = next;
+    }
+
+    function handleGraphWheel(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      const intensity = event.ctrlKey || event.metaKey ? 0.01 : 0.0025;
+      const delta = clamp(event.deltaY, -140, 140);
+      setZoom(state.zoom * Math.exp(-delta * intensity), canvasPoint(event));
+    }
+
+    let gestureStartZoom = 1;
+    let gestureStartPoint = null;
+
+    function handleGraphGestureStart(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      gestureStartZoom = state.zoom;
+      gestureStartPoint = canvasPoint(event);
+    }
+
+    function handleGraphGestureChange(event) {
+      event.preventDefault();
+      event.stopPropagation();
+      setZoom(gestureStartZoom * event.scale, gestureStartPoint || canvasPoint(event));
+    }
+
+    function handleGraphPointerDown(event) {
+      if (event.button !== 0) return;
+      state.isPanning = true;
+      state.panStartX = event.clientX;
+      state.panStartY = event.clientY;
+      state.panBaseX = state.panX;
+      state.panBaseY = state.panY;
+      state.suppressClick = false;
+      canvas.classList.add('panning');
+      try {
+        canvas.setPointerCapture(event.pointerId);
+      } catch (err) {
+        // Some browsers skip pointer capture for synthetic events.
+      }
+    }
+
+    function handleGraphPointerMove(event) {
+      if (!state.isPanning) return;
+      event.preventDefault();
+      const dx = event.clientX - state.panStartX;
+      const dy = event.clientY - state.panStartY;
+      if (Math.hypot(dx, dy) > 3) state.suppressClick = true;
+      state.panX = state.panBaseX + dx;
+      state.panY = state.panBaseY + dy;
+    }
+
+    function handleGraphPointerEnd(event) {
+      if (!state.isPanning) return;
+      state.isPanning = false;
+      canvas.classList.remove('panning');
+      try {
+        canvas.releasePointerCapture(event.pointerId);
+      } catch (err) {
+        // Pointer capture may already be released.
+      }
+    }
+
+    function canvasPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top
+      };
+    }
+
+    function zoomAnchorCenter(anchor) {
+      if (state.view === 'compare' && state.compare) {
+        const rects = compareRects(canvas.clientWidth, canvas.clientHeight);
+        for (const rect of [rects.base, rects.head]) {
+          if (anchor.x >= rect.x && anchor.x <= rect.x + rect.w && anchor.y >= rect.y && anchor.y <= rect.y + rect.h) {
+            return { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+          }
+        }
+      }
+      return { x: canvas.clientWidth / 2, y: canvas.clientHeight / 2 };
+    }
+
     function setGraph(view) {
       state.view = view;
       setActiveViewButton();
@@ -1236,10 +1662,8 @@ HTML_APP = r"""
         ...node,
         x: Math.cos(index * 2.399) * (140 + (index % 7) * 28),
         y: Math.sin(index * 2.399) * (140 + (index % 7) * 28),
-        z: ((index % 11) - 5) * 28,
         vx: 0,
-        vy: 0,
-        vz: 0
+        vy: 0
       };
     }
 
@@ -1444,11 +1868,9 @@ HTML_APP = r"""
       if (state.view === 'compare' && state.compare) {
         simulateGraph(state.compare.base.nodes, state.compare.base.edges, 165);
         simulateGraph(state.compare.head.nodes, state.compare.head.edges, 165);
-        state.angle += state.pseudo3d ? 0.004 : 0;
         return;
       }
       simulateGraph(state.nodes, state.edges, state.view === 'commits' ? 115 : 165);
-      state.angle += state.pseudo3d ? 0.004 : 0;
     }
 
     function simulateGraph(nodes, edges, desiredDistance) {
@@ -1456,36 +1878,33 @@ HTML_APP = r"""
       for (const node of nodes) {
         node.vx += -node.x * 0.0008;
         node.vy += -node.y * 0.0008;
-        node.vz += -node.z * 0.0008;
       }
       for (let i = 0; i < nodes.length; i++) {
         for (let j = i + 1; j < nodes.length; j++) {
           const a = nodes[i], b = nodes[j];
-          const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
-          const distSq = Math.max(120, dx * dx + dy * dy + dz * dz);
+          const dx = a.x - b.x, dy = a.y - b.y;
+          const distSq = Math.max(120, dx * dx + dy * dy);
           const dist = Math.sqrt(distSq);
           const force = 2400 / distSq;
-          a.vx += dx / dist * force; a.vy += dy / dist * force; a.vz += dz / dist * force;
-          b.vx -= dx / dist * force; b.vy -= dy / dist * force; b.vz -= dz / dist * force;
+          a.vx += dx / dist * force; a.vy += dy / dist * force;
+          b.vx -= dx / dist * force; b.vy -= dy / dist * force;
         }
       }
       for (const edge of edges) {
         const a = nodesById.get(edge.source), b = nodesById.get(edge.target);
         if (!a || !b) continue;
-        const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
-        const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy + dz * dz));
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy));
         const weight = Math.min(3, Math.log2((edge.weight || 1) + 1));
         const force = clamp((dist - desiredDistance) * 0.014 * weight, -4, 4);
-        a.vx += dx / dist * force; a.vy += dy / dist * force; a.vz += dz / dist * force;
-        b.vx -= dx / dist * force; b.vy -= dy / dist * force; b.vz -= dz / dist * force;
+        a.vx += dx / dist * force; a.vy += dy / dist * force;
+        b.vx -= dx / dist * force; b.vy -= dy / dist * force;
       }
       for (const node of nodes) {
         node.vx = clamp(node.vx * 0.82, -10, 10);
         node.vy = clamp(node.vy * 0.82, -10, 10);
-        node.vz = clamp(node.vz * 0.82, -10, 10);
         node.x = clamp(node.x + node.vx, -1200, 1200);
         node.y = clamp(node.y + node.vy, -1200, 1200);
-        node.z = clamp(node.z + node.vz, -500, 500);
       }
     }
 
@@ -1597,16 +2016,15 @@ HTML_APP = r"""
     function graphTransformFor(nodes, rect) {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
       for (const node of nodes) {
-        const p = rotatedPoint(node);
-        minX = Math.min(minX, p.x);
-        minY = Math.min(minY, p.y);
-        maxX = Math.max(maxX, p.x);
-        maxY = Math.max(maxY, p.y);
+        minX = Math.min(minX, node.x);
+        minY = Math.min(minY, node.y);
+        maxX = Math.max(maxX, node.x);
+        maxY = Math.max(maxY, node.y);
       }
       const spanX = Math.max(1, maxX - minX);
       const spanY = Math.max(1, maxY - minY);
       const pad = state.view === 'commits' ? 80 : 110;
-      const zoom = Math.min(
+      const fitZoom = Math.min(
         1.7,
         Math.max(
           0.22,
@@ -1619,19 +2037,8 @@ HTML_APP = r"""
       return {
         centerX: (minX + maxX) / 2,
         centerY: (minY + maxY) / 2,
-        zoom
+        zoom: fitZoom * state.zoom
       };
-    }
-
-    function rotatedPoint(node) {
-      let x = node.x, y = node.y, z = node.z || 0;
-      if (state.pseudo3d) {
-        const cos = Math.cos(state.angle), sin = Math.sin(state.angle);
-        const rx = x * cos - z * sin;
-        const rz = x * sin + z * cos;
-        x = rx; z = rz;
-      }
-      return { x, y, z };
     }
 
     function project(node, transform) {
@@ -1640,14 +2047,12 @@ HTML_APP = r"""
     }
 
     function projectInRect(node, transform, rect) {
-      const p = rotatedPoint(node);
       const fit = transform || graphTransformFor([node], rect);
-      const depth = state.pseudo3d ? clamp(600 / (600 + p.z), 0.55, 1.6) : 1;
-      const radiusScale = clamp(Math.sqrt(fit.zoom), 0.75, 1.25) * depth;
+      const radiusScale = clamp(Math.sqrt(fit.zoom), 0.75, 1.35);
       return {
-        x: rect.x + rect.w / 2 + (p.x - fit.centerX) * fit.zoom * depth,
-        y: rect.y + rect.h / 2 + (p.y - fit.centerY) * fit.zoom * depth,
-        scale: depth,
+        x: rect.x + rect.w / 2 + state.panX + (node.x - fit.centerX) * fit.zoom,
+        y: rect.y + rect.h / 2 + state.panY + (node.y - fit.centerY) * fit.zoom,
+        scale: 1,
         r: Math.max(5, Math.min(34, (node.size || 14) * radiusScale))
       };
     }
@@ -1717,33 +2122,67 @@ HTML_APP = r"""
       const meta = document.getElementById('selectionMeta');
       if (!selection) {
         title.textContent = 'Nothing selected';
-        meta.textContent = '';
+        meta.innerHTML = '';
         return;
       }
       if (selection.kind === 'edge') {
         renderEdgeSelection(selection.edge, title, meta, selection.side);
         return;
       }
+      renderNodeSelection(selection, title, meta);
+    }
+
+    function renderNodeSelection(selection, title, meta) {
       const node = selection.node;
       title.textContent = node.label;
-      const lines = ['type: ' + node.type];
-      if (selection.side) lines.push('side: ' + selection.side);
-      if (node.change) lines.push('change: ' + node.change);
-      if (node.risk) lines.push('risk: ' + node.risk);
-      if (node.timestamp) lines.push('time: ' + node.timestamp);
+      const stack = detailStack(meta);
+      const overview = ['type: ' + node.type];
+      if (selection.side) overview.push('side: ' + selection.side);
+      if (node.change) overview.push('change: ' + node.change);
+      if (node.risk) overview.push('risk: ' + node.risk);
+      if (node.timestamp) overview.push('time: ' + node.timestamp);
       if (node.metrics) {
-        for (const [key, value] of Object.entries(node.metrics)) lines.push(key + ': ' + value);
+        for (const [key, value] of Object.entries(node.metrics)) overview.push(key + ': ' + value);
       }
-      if (node.tags && node.tags.length) lines.push('tags: ' + node.tags.join(', '));
-      if (node.details) lines.push('', node.details);
-      meta.textContent = lines.join('\n');
+      if (node.tags && node.tags.length) overview.push('tags: ' + node.tags.join(', '));
+      if (node.details) overview.push('', node.details);
+      appendDetailSection(stack, 'Overview', overview, true);
+      renderNodeConnections(stack, node, selection.side);
+    }
+
+    function renderNodeConnections(stack, node, side) {
+      const edges = nodeEdgesForSelection(node, side)
+        .sort((a, b) => edgeDetailRank(b) - edgeDetailRank(a) || (b.weight || 1) - (a.weight || 1));
+      if (!edges.length) {
+        appendDetailSection(stack, 'Connections', ['connections: none visible with current filters'], true);
+        return;
+      }
+      const codeEdges = edges.filter(edge => !['cochange', 'authored', 'touched'].includes(edge.type));
+      const historyEdges = edges.filter(edge => ['cochange', 'authored', 'touched'].includes(edge.type));
+      appendEdgeGroupSection(stack, 'Functions / APIs', codeEdges, true);
+      appendComponentEdgeSummary(stack, 'Components / Edges', edges, false);
+      if (historyEdges.length) {
+        appendEdgeGroupSection(stack, 'Commit / Co-change Evidence', historyEdges, false);
+      }
+    }
+
+    function nodeEdgesForSelection(node, side) {
+      let edges = state.edges;
+      if (side && state.compare && state.compare[side]) edges = state.compare[side].edges;
+      return edges.filter(edge => edge.source === node.id || edge.target === node.id);
+    }
+
+    function edgeDetailRank(edge) {
+      const typeRank = { calls: 4, references: 3, imports: 2, inherits: 2, cochange: 1 };
+      return (typeRank[edge.type] || 0) * 1000 + Math.min(edge.examples ? edge.examples.length : 0, 50);
     }
 
     function renderEdgeSelection(edge, title, meta, side) {
       const source = labelForNode(edge.source);
       const target = labelForNode(edge.target);
       title.textContent = source + ' -> ' + target;
-      const lines = [
+      const stack = detailStack(meta);
+      const overview = [
         'connection: ' + edge.type,
         side ? 'side: ' + side : '',
         edge.change ? 'change: ' + edge.change : '',
@@ -1751,14 +2190,199 @@ HTML_APP = r"""
         'target: ' + target,
         'weight: ' + (edge.weight || 1)
       ].filter(Boolean);
-      if (edge.file) lines.push('file: ' + edge.file);
+      if (edge.file) overview.push('file: ' + edge.file);
+      appendDetailSection(stack, 'Overview', overview, true);
+      appendExampleSection(stack, 'Function / API Examples', edge.examples || [], true);
       if (edge.reasons && edge.reasons.length) {
-        lines.push('', 'evidence:');
+        const evidence = [];
         for (const reason of edge.reasons.slice(0, 8)) {
-          if (reason) lines.push('- ' + reason);
+          if (reason) evidence.push('- ' + reason);
         }
+        appendDetailSection(stack, 'Summary Evidence', evidence, false);
       }
-      meta.textContent = lines.join('\n');
+    }
+
+    function detailStack(root) {
+      root.innerHTML = '';
+      const stack = document.createElement('div');
+      stack.className = 'detail-stack';
+      root.appendChild(stack);
+      return stack;
+    }
+
+    function appendDetailSection(stack, title, lines, open) {
+      const section = document.createElement('details');
+      section.className = 'detail-card';
+      section.open = Boolean(open);
+      const summary = document.createElement('summary');
+      summary.textContent = title;
+      const body = document.createElement('div');
+      body.className = 'detail-body';
+      if (lines.length) renderDetailLines(body, lines);
+      section.append(summary, body);
+      stack.appendChild(section);
+      return body;
+    }
+
+    function appendEdgeGroupSection(stack, title, edges, open) {
+      const body = appendDetailSection(
+        stack,
+        title + ' (' + edges.length + ')',
+        edges.length ? [] : ['No visible connections in this group.'],
+        open
+      );
+      if (!edges.length) return;
+      for (const edge of edges.slice(0, 10)) {
+        appendEdgeDetails(body, edge, false);
+      }
+      if (edges.length > 10) appendPlainLine(body, '... ' + (edges.length - 10) + ' more visible connections');
+    }
+
+    function appendComponentEdgeSummary(stack, title, edges, open) {
+      const lines = edges.slice(0, 16).map(edge =>
+        '- ' + labelForNode(edge.source) + ' -> ' + labelForNode(edge.target) +
+        ' (' + edge.type + ', weight ' + (edge.weight || 1) + ')'
+      );
+      if (edges.length > 16) lines.push('... ' + (edges.length - 16) + ' more visible edges');
+      appendDetailSection(stack, title + ' (' + edges.length + ')', lines, open);
+    }
+
+    function appendEdgeDetails(parent, edge, open) {
+      const section = document.createElement('details');
+      section.className = 'detail-card detail-nested';
+      section.open = Boolean(open);
+      const summary = document.createElement('summary');
+      summary.textContent = edgeSummary(edge);
+      const body = document.createElement('div');
+      body.className = 'detail-body';
+      renderDetailLines(body, [
+        'type: ' + edge.type,
+        'source component: ' + labelForNode(edge.source),
+        'target component: ' + labelForNode(edge.target),
+        'weight: ' + (edge.weight || 1)
+      ]);
+      appendExampleSection(body, 'Examples', edge.examples || [], false);
+      section.append(summary, body);
+      parent.appendChild(section);
+    }
+
+    function appendExampleSection(parent, title, examples, open) {
+      const wrapper = document.createElement('details');
+      wrapper.className = 'detail-card' + (parent.classList.contains('detail-body') ? ' detail-nested' : '');
+      wrapper.open = Boolean(open);
+      const wrapperSummary = document.createElement('summary');
+      wrapperSummary.textContent = title + ' (' + examples.length + ')';
+      const wrapperBody = document.createElement('div');
+      wrapperBody.className = 'detail-body';
+      wrapper.append(wrapperSummary, wrapperBody);
+      parent.appendChild(wrapper);
+      if (!examples.length) {
+        appendPlainLine(wrapperBody, 'No function/API examples available for this connection.');
+        return;
+      }
+      for (const [index, example] of examples.slice(0, 8).entries()) {
+        const section = document.createElement('details');
+        section.className = 'detail-card detail-nested';
+        section.open = Boolean(open && index === 0);
+        const summary = document.createElement('summary');
+        summary.textContent = title + ' ' + (index + 1) + ': ' + edgeExampleTitle(example);
+        const body = document.createElement('div');
+        body.className = 'detail-body';
+        renderDetailLines(body, renderEdgeExample(example));
+        section.append(summary, body);
+        wrapperBody.appendChild(section);
+      }
+      if (examples.length > 8) appendPlainLine(wrapperBody, '... ' + (examples.length - 8) + ' more examples');
+    }
+
+    function appendPlainLine(parent, line) {
+      const div = document.createElement('div');
+      div.className = 'detail-lines detail-empty';
+      div.innerHTML = colorizeDetailLine(line);
+      parent.appendChild(div);
+    }
+
+    function edgeSummary(edge) {
+      return labelForNode(edge.source) + ' -> ' + labelForNode(edge.target) +
+        ' (' + edge.type + ', weight ' + (edge.weight || 1) + ')';
+    }
+
+    function edgeExampleTitle(example) {
+      return formatCall(example) || (formatEndpoint(example.source) + ' -> ' + formatEndpoint(example.target));
+    }
+
+    function renderDetailLines(root, lines) {
+      root.innerHTML = lines.map(colorizeDetailLine).join('\n');
+    }
+
+    function colorizeDetailLine(line) {
+      if (!line) return '';
+      const trimmed = line.trim();
+      if (!trimmed) return '';
+      const leading = line.match(/^\s*/)[0];
+      const clean = line.slice(leading.length);
+      const prefix = escapeHtml(leading);
+      if (clean.startsWith('- ')) {
+        return prefix + '<span class="detail-edge">' + escapeHtml(clean) + '</span>';
+      }
+      if (clean.startsWith('... ')) {
+        return prefix + '<span class="detail-value">' + escapeHtml(clean) + '</span>';
+      }
+      if (/connections( \(|:)/.test(clean) || clean === 'summary evidence:') {
+        return prefix + '<span class="detail-section">' + escapeHtml(clean) + '</span>';
+      }
+      const keyMatch = clean.match(/^([^:]{1,40}):\s?(.*)$/);
+      if (keyMatch) {
+        const key = keyMatch[1];
+        const value = keyMatch[2] || '';
+        const valueClass = detailValueClass(key);
+        return prefix +
+          '<span class="detail-key">' + escapeHtml(key) + ':</span>' +
+          (value ? ' <span class="' + valueClass + '">' + escapeHtml(value) + '</span>' : '');
+      }
+      return prefix + '<span class="detail-value">' + escapeHtml(clean) + '</span>';
+    }
+
+    function detailValueClass(key) {
+      const lower = key.toLowerCase();
+      if (lower === 'call') return 'detail-call';
+      if (lower === 'parameters') return 'detail-call';
+      if (lower.includes('signature')) return 'detail-signature';
+      if (lower === 'location' || lower === 'file') return 'detail-path';
+      if (lower === 'change') return 'detail-change';
+      return 'detail-value';
+    }
+
+    function renderEdgeExample(example) {
+      const source = formatEndpoint(example.source);
+      const target = formatEndpoint(example.target);
+      const lines = ['- ' + source + ' -> ' + target + ' (' + example.type + ')'];
+      const call = formatCall(example);
+      if (call) lines.push('  call: ' + call);
+      if (example.arguments && example.arguments.length) lines.push('  parameters: ' + example.arguments.join(', '));
+      if (example.source && example.source.signature) lines.push('  source signature: ' + example.source.signature);
+      if (example.target && example.target.signature) lines.push('  target signature: ' + example.target.signature);
+      const location = formatLocation(example);
+      if (location) lines.push('  location: ' + location);
+      if (example.commit) lines.push('  commit: ' + example.commit);
+      return lines;
+    }
+
+    function formatEndpoint(endpoint) {
+      if (!endpoint) return 'unknown';
+      return endpoint.qualified_name || endpoint.label || endpoint.name || endpoint.key || 'unknown';
+    }
+
+    function formatCall(example) {
+      if (!example.display) return '';
+      const args = example.arguments && example.arguments.length ? '(' + example.arguments.join(', ') + ')' : '';
+      return example.display + args;
+    }
+
+    function formatLocation(example) {
+      const file = example.file_path || (example.source && example.source.path) || '';
+      if (!file) return '';
+      return example.line ? file + ':' + example.line : file;
     }
 
     function renderTopEdges() {

@@ -203,6 +203,7 @@ class _PythonTreeSitterExtractor:
                             target_name=target_name,
                             display_name=target_display,
                             line_number=self._line_start(call_node),
+                            arguments=self._call_arguments(call_node),
                         )
                     )
             for identifier_node in self._iter_non_nested_nodes(body, {"identifier"}):
@@ -304,6 +305,17 @@ class _PythonTreeSitterExtractor:
             if _node_type(node) == "identifier"
         ]
         return display, identifiers[-1] if identifiers else display
+
+    def _call_arguments(self, call_node: Node) -> tuple[str, ...]:
+        arguments_node = call_node.child_by_field_name("arguments")
+        if arguments_node is None:
+            return ()
+        arguments: list[str] = []
+        for child in _named_children(arguments_node):
+            text = self._text(child).strip()
+            if text:
+                arguments.append(text)
+        return tuple(arguments)
 
     def _argument_names(self, argument_list: Node | None) -> tuple[str, ...]:
         if argument_list is None:
