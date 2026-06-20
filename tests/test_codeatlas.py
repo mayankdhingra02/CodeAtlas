@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import tempfile
+import threading
 import textwrap
 import unittest
 from pathlib import Path
+from urllib.request import urlopen
 
 from codeatlas.benchmark import Benchmarker
 from codeatlas.indexer import RepositoryIndexer
+from codeatlas.memory import MemoryQueryEngine
 from codeatlas.mcp_server import create_tool_handlers
 from codeatlas.models import SourceFile, estimate_tokens
 from codeatlas.parsers.python import PythonParser
 from codeatlas.retrieval import RetrievalEngine
 from codeatlas.scanner import iter_source_files
+from codeatlas.visualization import HTML_APP, VisualizationService, create_visualization_server
 
 
 class CodeAtlasTestCase(unittest.TestCase):
@@ -48,6 +55,67 @@ class CodeAtlasTestCase(unittest.TestCase):
         )
         (root / "node_modules").mkdir()
         (root / "node_modules" / "ignored.py").write_text("def ignored(): pass\n", encoding="utf-8")
+        return temp
+
+    def make_memory_repo(self) -> tempfile.TemporaryDirectory[str]:
+        temp = self.make_repo()
+        root = Path(temp.name)
+        (root / "docs" / "adr").mkdir(parents=True)
+        (root / "README.md").write_text(
+            "# Memory Repo\n\nAuthentication and payments are core repository areas.\n",
+            encoding="utf-8",
+        )
+        run_git(root, "init", "-b", "main")
+        run_git(root, "config", "user.name", "Alice Example")
+        run_git(root, "config", "user.email", "alice@example.com")
+        run_git(root, "add", ".")
+        run_git(
+            root,
+            "commit",
+            "-m",
+            "Add payment service",
+            env=git_env("Alice Example", "alice@example.com", "2024-01-01T12:00:00+00:00"),
+        )
+
+        (root / "app" / "auth.py").write_text(
+            textwrap.dedent(
+                '''
+                class AuthService:
+                    def login(self, token):
+                        return token
+                '''
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        (root / "docs" / "adr" / "0001-redis-auth.md").write_text(
+            textwrap.dedent(
+                '''
+                # ADR 0001: Redis cache for authentication retries
+
+                ## Context
+
+                Authentication requests were timing out during transient upstream failures.
+
+                ## Decision
+
+                Introduce Redis as a short-lived cache for authentication retry state.
+
+                ## Alternatives
+
+                We considered local in-process caches, but rejected them because workers
+                would not share retry state.
+                '''
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        run_git(root, "add", ".")
+        run_git(
+            root,
+            "commit",
+            "-m",
+            "Introduce Redis cache for auth retry timeouts (#12)",
+            env=git_env("Bob Reviewer", "bob@example.com", "2025-02-01T12:00:00+00:00"),
+        )
         return temp
 
 
@@ -156,6 +224,115 @@ class BenchmarkAndMcpTests(CodeAtlasTestCase):
         self.assertEqual(stats["files_indexed"], 3)
 
 
+class RepositoryMemoryTests(CodeAtlasTestCase):
+    def test_memory_indexer_extracts_git_history_and_documents(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            report = MemoryQueryEngine().index_memory(root)
+
+        self.assertTrue(report.git_available)
+        self.assertEqual(report.commits_indexed, 2)
+        self.assertEqual(report.documents_indexed, 2)
+        self.assertGreaterEqual(report.entities_indexed, 6)
+        self.assertGreaterEqual(report.evidence_indexed, 4)
+
+    def test_history_ownership_and_decisions_are_evidence_backed(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            memory = MemoryQueryEngine()
+            memory.index_memory(root)
+            history = memory.history(root, "auth")
+            ownership = memory.ownership(root, "auth")
+            decisions = memory.decisions(root, "Why was Redis introduced?")
+            context = memory.compressed_context(root, "auth", max_tokens=1000)
+
+        self.assertTrue(any("Redis" in event.title or "Redis" in event.summary for event in history))
+        self.assertEqual(ownership[0].developer, "Bob Reviewer")
+        self.assertGreater(ownership[0].evidence[0].confidence, 0)
+        self.assertNotIn("No evidence-backed", decisions[0].answer)
+        self.assertTrue(decisions[0].evidence)
+        self.assertTrue(context.evidence)
+
+    def test_mcp_memory_handlers_are_available(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            MemoryQueryEngine().index_memory(root)
+            handlers = create_tool_handlers(root)
+            history = handlers["get_history"]("auth")
+            decisions = handlers["get_decisions"]("Redis")
+            context = handlers["get_context"]("auth", max_tokens=1000)
+
+        self.assertIn("get_ownership", handlers)
+        self.assertTrue(history)
+        self.assertTrue(decisions[0]["evidence"])
+        self.assertEqual(context["query"], "auth")
+
+    def test_git_nexus_related_files_hotspots_and_fts_search(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            memory = MemoryQueryEngine()
+            memory.index_memory(root)
+            search = memory.search_memory(root, "authentication retry state")
+            related = memory.related_files(root, "app/auth.py")
+            hotspots = memory.hotspots(root)
+            summary = memory.component_summary(root, "auth")
+
+        self.assertTrue(any("Redis" in item["title"] for item in search))
+        self.assertIn(
+            "docs/adr/0001-redis-auth.md",
+            {link.related_file_path for link in related},
+        )
+        self.assertTrue(hotspots)
+        self.assertIn("auth", summary.summary.lower())
+
+    def test_impact_report_uses_changed_files_history_and_token_savings(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            memory = MemoryQueryEngine()
+            memory.index_memory(root)
+            (root / "app" / "auth.py").write_text(
+                textwrap.dedent(
+                    '''
+                    class AuthService:
+                        def login(self, token):
+                            if not token:
+                                return None
+                            return token
+                    '''
+                ).lstrip(),
+                encoding="utf-8",
+            )
+            report = memory.impact(root, base_ref="HEAD")
+
+        self.assertEqual(report.changed_files, ("app/auth.py",))
+        self.assertEqual(report.risk_level, "high")
+        self.assertEqual(report.impacted_files[0].owners[0].developer, "Bob Reviewer")
+        self.assertGreaterEqual(
+            report.token_report.baseline_tokens,
+            report.token_report.optimized_tokens,
+        )
+
+    def test_mcp_git_nexus_handlers_are_available(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            MemoryQueryEngine().index_memory(root)
+            (root / "app" / "auth.py").write_text("# changed\n", encoding="utf-8")
+            handlers = create_tool_handlers(root)
+            impact = handlers["get_impact"]("HEAD")
+            hotspots = handlers["get_hotspots"](limit=3)
+            nexus = handlers["get_nexus"]("auth")
+
+        self.assertIn("get_impact", handlers)
+        self.assertEqual(impact["changed_files"], ("app/auth.py",))
+        self.assertTrue(hotspots)
+        self.assertEqual(nexus["component"], "auth")
+
+
 class SourceFileTests(unittest.TestCase):
     def test_source_file_model_can_be_constructed_for_parser_plugins(self) -> None:
         source_file = SourceFile(
@@ -169,6 +346,34 @@ class SourceFileTests(unittest.TestCase):
         )
 
         self.assertEqual(source_file.language, "python")
+
+
+def run_git(
+    root: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=merged_env,
+    )
+
+
+def git_env(name: str, email: str, timestamp: str) -> dict[str, str]:
+    return {
+        "GIT_AUTHOR_NAME": name,
+        "GIT_AUTHOR_EMAIL": email,
+        "GIT_AUTHOR_DATE": timestamp,
+        "GIT_COMMITTER_NAME": name,
+        "GIT_COMMITTER_EMAIL": email,
+        "GIT_COMMITTER_DATE": timestamp,
+    }
 
 
 if __name__ == "__main__":
