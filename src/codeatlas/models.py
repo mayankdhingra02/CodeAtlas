@@ -24,6 +24,32 @@ class EdgeType(StrEnum):
     INHERITS = "INHERITS"
 
 
+class MemoryEntityKind(StrEnum):
+    REPOSITORY = "Repository"
+    FILE = "File"
+    SERVICE = "Service"
+    MODULE = "Module"
+    FEATURE = "Feature"
+    DEVELOPER = "Developer"
+    COMMIT = "Commit"
+    PULL_REQUEST = "PullRequest"
+    ARCHITECTURE_DECISION = "ArchitectureDecision"
+    REPOSITORY_EVENT = "RepositoryEvent"
+    INCIDENT = "Incident"
+    RELEASE = "Release"
+
+
+class MemoryRelationshipKind(StrEnum):
+    INTRODUCED_BY = "introduced_by"
+    MODIFIED_BY = "modified_by"
+    REVIEWED_BY = "reviewed_by"
+    CAUSED_BY = "caused_by"
+    RELATED_TO = "related_to"
+    SUPERSEDED_BY = "superseded_by"
+    DEPENDS_ON = "depends_on"
+    CONTRIBUTES_TO = "contributes_to"
+
+
 class SymbolKind(StrEnum):
     CLASS = "CLASS"
     FUNCTION = "FUNCTION"
@@ -231,6 +257,174 @@ class BenchmarkReport:
     retrieval_accuracy: str
     query: str
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MemoryEvidence:
+    id: int | None
+    source_type: str
+    source_id: str
+    title: str
+    snippet: str
+    path: str | None = None
+    author: str | None = None
+    timestamp: str | None = None
+    url: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MemoryEntity:
+    key: str
+    kind: MemoryEntityKind
+    name: str
+    summary: str
+    confidence: float
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MemoryRelationship:
+    source_key: str
+    target_key: str
+    relationship: MemoryRelationshipKind
+    confidence: float
+    evidence_id: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MemoryIndexReport:
+    repo_root: Path
+    database_path: Path
+    duration_seconds: float
+    git_available: bool
+    commits_indexed: int
+    documents_indexed: int
+    entities_indexed: int
+    relationships_indexed: int
+    evidence_indexed: int
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class EvidenceRef:
+    source_type: str
+    source_id: str
+    title: str
+    snippet: str
+    path: str | None = None
+    author: str | None = None
+    timestamp: str | None = None
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class HistoryEvent:
+    date: str | None
+    title: str
+    summary: str
+    entity_key: str
+    entity_kind: str
+    confidence: float
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class OwnershipEntry:
+    developer: str
+    email: str | None
+    expertise_score: float
+    commits: int
+    files_touched: int
+    last_active: str | None
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class DecisionAnswer:
+    question: str
+    answer: str
+    confidence: float
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class ArchitectureFinding:
+    topic: str
+    summary: str
+    confidence: float
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class CompressedContext:
+    query: str
+    architecture: tuple[ArchitectureFinding, ...]
+    history: tuple[HistoryEvent, ...]
+    design_decisions: tuple[DecisionAnswer, ...]
+    ownership: tuple[OwnershipEntry, ...]
+    dependencies: dict[str, Any]
+    critical_files: tuple[str, ...]
+    related_changes: tuple[str, ...]
+    relevant_context: tuple[str, ...]
+    estimated_tokens: int
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class CoChangeLink:
+    file_path: str
+    related_file_path: str
+    commits: int
+    confidence: float
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class HotspotEntry:
+    component: str
+    commits: int
+    authors: int
+    files: int
+    risk_score: float
+    last_changed: str | None
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class ImpactedFile:
+    file_path: str
+    status: str
+    component: str
+    risk: str
+    reasons: tuple[str, ...]
+    owners: tuple[OwnershipEntry, ...]
+    related_files: tuple[CoChangeLink, ...]
+    evidence: tuple[EvidenceRef, ...] = ()
+
+
+@dataclass(frozen=True)
+class ImpactReport:
+    base_ref: str
+    changed_files: tuple[str, ...]
+    impacted_files: tuple[ImpactedFile, ...]
+    related_commits: tuple[str, ...]
+    token_report: TokenReport
+    risk_level: str
+    summary: str
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ComponentSummary:
+    component: str
+    summary: str
+    commits: int
+    authors: tuple[str, ...]
+    files: tuple[str, ...]
+    related_files: tuple[CoChangeLink, ...]
+    evidence: tuple[EvidenceRef, ...] = ()
 
 
 def estimate_tokens(text: str) -> int:
