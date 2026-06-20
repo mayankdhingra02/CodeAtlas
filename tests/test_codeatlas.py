@@ -333,6 +333,96 @@ class RepositoryMemoryTests(CodeAtlasTestCase):
         self.assertEqual(nexus["component"], "auth")
 
 
+class VisualizationTests(CodeAtlasTestCase):
+    def test_visualization_map_contains_architecture_and_commit_graphs(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            MemoryQueryEngine().index_memory(root)
+            payload = VisualizationService().build_map(root)
+
+        component_ids = {node["id"] for node in payload["component_graph"]["nodes"]}
+        commit_types = {node["type"] for node in payload["commit_graph"]["nodes"]}
+        self.assertIn("auth.py", component_ids)
+        self.assertIn("docs", component_ids)
+        self.assertTrue(payload["component_graph"]["edges"])
+        self.assertIn("commit", commit_types)
+        self.assertIn("developer", commit_types)
+
+    def test_visualization_compare_marks_architecture_changes(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            payload = VisualizationService().build_compare(
+                root,
+                base_ref="HEAD~1",
+                head_ref="HEAD",
+            )
+
+        head_nodes = {node["id"]: node for node in payload["head"]["graph"]["nodes"]}
+        self.assertGreaterEqual(payload["summary"]["added_nodes"], 1)
+        self.assertEqual(head_nodes["auth.py"]["change"], "added")
+        self.assertEqual(payload["base"]["ref"], "HEAD~1")
+        self.assertEqual(payload["head"]["ref"], "HEAD")
+
+    def test_visualization_chat_answers_from_code_and_memory(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            MemoryQueryEngine().index_memory(root)
+            payload = VisualizationService().ask(root, "AuthService Redis auth")
+
+        self.assertIn("Question: AuthService Redis auth", payload["answer"])
+        self.assertTrue(payload["code"])
+        self.assertTrue(payload["evidence"])
+        self.assertTrue(any("AuthService" in item["symbol"] for item in payload["code"]))
+
+    def test_visualization_server_serves_graph_json(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            MemoryQueryEngine().index_memory(root)
+            try:
+                server = create_visualization_server(root, host="127.0.0.1", port=0)
+            except PermissionError as exc:
+                raise self.skipTest("local socket binding is blocked in this sandbox") from exc
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                with urlopen(f"http://127.0.0.1:{port}/api/graph", timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(payload["repo"]["name"], root.name)
+        self.assertGreaterEqual(payload["stats"]["files"], 1)
+        self.assertTrue(payload["component_graph"]["nodes"])
+
+    def test_mcp_visual_map_handler_is_available(self) -> None:
+        with self.make_memory_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            MemoryQueryEngine().index_memory(root)
+            handlers = create_tool_handlers(root)
+            payload = handlers["get_visual_map"]()
+
+        self.assertIn("get_visual_map", handlers)
+        self.assertTrue(payload["component_graph"]["nodes"])
+        self.assertTrue(payload["commit_graph"]["nodes"])
+
+    def test_visualization_page_exposes_filters_and_edge_selection(self) -> None:
+        self.assertIn('id="componentFilters"', HTML_APP)
+        self.assertIn('id="showCommonInput"', HTML_APP)
+        self.assertIn('id="runCompareBtn"', HTML_APP)
+        self.assertIn('id="askBtn"', HTML_APP)
+        self.assertIn("/api/chat", HTML_APP)
+        self.assertIn("distanceToSegment", HTML_APP)
+        self.assertIn("renderEdgeSelection", HTML_APP)
+        self.assertIn("drawCompare", HTML_APP)
+
+
 class SourceFileTests(unittest.TestCase):
     def test_source_file_model_can_be_constructed_for_parser_plugins(self) -> None:
         source_file = SourceFile(
