@@ -4,11 +4,11 @@
 
 AI coding assistants often spend a lot of tokens repeatedly reading broad parts of a repository to understand how code fits together. CodeAtlas precomputes repository structure and dependencies once, stores that knowledge locally, and returns only the most relevant snippets for a query.
 
-This reduces context size, improves warm retrieval speed, and avoids cloud APIs.
+The newer direction is repository intelligence: CodeAtlas also mines git history and documentation so it can explain why code exists, how architecture changed, and which evidence supports an answer. This reduces context size, improves warm retrieval speed, and avoids cloud APIs.
 
 ## Concise Project Story
 
-I built CodeAtlas because I was using AI coding assistants on personal and academic projects and noticed they were spending a large number of tokens repeatedly reading unrelated files. I wanted a local system that could precompute repository structure and dependencies so the AI could retrieve only the most relevant code context. In testing, the system significantly reduced context size and improved retrieval speed.
+I built CodeAtlas because I was using AI coding assistants on personal and academic projects and noticed they were spending a large number of tokens repeatedly reading unrelated files. I wanted a local system that could precompute repository structure, dependencies, and historical repository memory so the AI could retrieve only the most relevant code and reasoning context. In testing, the system significantly reduced context size and improved retrieval speed.
 
 ## What Is An AST?
 
@@ -42,6 +42,94 @@ Code relationships are naturally graph-shaped:
 - files import modules
 
 A graph model makes traversal easy. If a user asks about `create_order`, CodeAtlas can return that method, the class that contains it, the service it calls, and nearby related code without reading the whole repository.
+
+The memory graph uses the same idea for repository history. Developers, commits, modules, features, architecture decisions, releases, incidents, and repository events are nodes. Relationships such as `introduced_by`, `modified_by`, `related_to`, and `contributes_to` connect them.
+
+## What Is The Repository Memory Engine?
+
+The Repository Memory Engine indexes evidence that explains why a codebase changed:
+
+- git commits
+- commit authors and timestamps
+- changed files
+- README and documentation files
+- ADRs, RFCs, design docs, changelogs, and release notes
+
+It stores memory entities and evidence in SQLite beside the existing code graph. The goal is to answer historical and reasoning questions with citations.
+
+## What Is Commit Intelligence?
+
+Commit intelligence turns raw commit data into structured signals:
+
+- purpose of the change
+- likely motivation
+- impacted components
+- risk level
+- architectural impact
+- related files and features
+
+The current implementation uses deterministic local heuristics. It does not claim certainty; it stores confidence scores and cites the commit as evidence.
+
+## How Does The Repository Time Machine Work?
+
+For a topic like `auth`, CodeAtlas searches indexed memory evidence and orders matching commits and documents by time. The result is a timeline of repository events with evidence references.
+
+This lets a developer ask questions like "How did authentication evolve?" and get a compact timeline rather than manually reading git logs, PRs, and docs.
+
+## How Is Ownership Intelligence Calculated?
+
+Ownership intelligence starts from evidence matching a topic. For each developer, CodeAtlas counts commits and touched files, then produces an expertise score. The score is simple by design: it is evidence-backed and explainable.
+
+This can answer questions like "Who knows payments best?" or "Who introduced Redis?" without guessing.
+
+## How Does CodeAtlas Avoid Hallucinating Decisions?
+
+Decision answers are built from indexed evidence such as ADRs, design docs, or architecture-significant commits. If CodeAtlas cannot find evidence, it returns that no evidence-backed decision was found.
+
+This is important because repository intelligence should be more like a memory and citation layer than a chatbot.
+
+## What Is Context Compression?
+
+Context compression combines multiple signals into one compact response:
+
+- architecture findings
+- timeline events
+- design decisions
+- ownership
+- dependencies
+- critical files
+- related changes
+- relevant code snippets
+
+The output is meant for tools like Codex, Claude Code, Cursor, Windsurf, Continue, ChatGPT, Gemini, and local LLMs.
+
+## What Is The Git Nexus Layer?
+
+The Git Nexus layer connects source files through commit history. If two files are repeatedly changed in the same commit, CodeAtlas records a co-change relationship between them.
+
+This is useful because dependency graphs only show static code relationships. Git history shows human workflow relationships: files that developers tend to modify together, components that churn often, and areas with many contributors.
+
+## How Does Impact Review Work?
+
+`codeatlas impact` compares the working tree against a git base ref, then enriches each changed file with:
+
+- historical owners
+- co-change neighbors
+- matching commit/document evidence
+- component risk signals
+- token savings from compressed impact context
+
+This is inspired by blast-radius review workflows, but CodeAtlas keeps the result evidence-backed and local.
+
+## How Does The Visualization Work?
+
+`codeatlas serve` starts a local web server, refreshes the code graph and repository memory, and opens a browser map. The page is intentionally local-first: the graph JSON comes from `.codeatlas/index.db`, and the frontend uses a built-in canvas view instead of hosted visualization services.
+
+The architecture tab groups files into major components, then connects them with static code edges such as imports/calls plus historical co-change links from git. The commit tab is different: it shows developers, commits, and the components each commit touched, so someone can understand how the repository evolved instead of only seeing current code dependencies.
+
+The compare tab accepts two git refs or commit SHAs. CodeAtlas archives each ref into a temporary snapshot, indexes both snapshots without checking anything out in the working tree, then shows the two architecture graphs side by side. Red nodes and edges mark added, removed, or changed architecture.
+
+The 2D/3D toggle changes the layout from a flat force map to a depth-based view. The left filter rail can hide common library/documentation nodes or focus on specific components. The visualization is meant as a fast orientation tool for unfamiliar repositories, not a replacement for exact dependency inspection.
 
 ## Why Not Only Embeddings?
 
@@ -95,6 +183,11 @@ The current tradeoff is to build a reliable structural graph first, then leave a
 - Token counts use a simple character-based estimate.
 - Retrieval reads selected snippets from disk instead of storing full source text in SQLite.
 - MCP support is optional so the core CLI works without MCP dependencies installed.
+- PR review comments are not ingested yet; PullRequest memory is inferred from commit messages.
+- Commit intelligence uses heuristics instead of LLM summaries.
+- API-flow and infrastructure intelligence are exposed conservatively but not deeply implemented yet.
+- Co-change links are historical signals, not proof of runtime dependency.
+- Impact review is a prioritization aid, not a replacement for tests.
 
 These tradeoffs keep the MVP local, understandable, and functional while leaving room for deeper language support.
 
@@ -106,4 +199,9 @@ These tradeoffs keep the MVP local, understandable, and functional while leaving
 - Local embeddings as an optional ranking signal.
 - Snippet caching inside SQLite.
 - Graph visualization exports.
+- Richer visualization filters for API routes, queues, databases, and deployment services.
 - Labeled retrieval benchmarks for accuracy scoring.
+- GitHub/GitLab PR ingestion for reviews, approvals, and requested changes.
+- Snapshot-based architecture evolution detection.
+- Endpoint, event, and infrastructure parsers for runtime flow intelligence.
+- Stronger confidence scoring and evidence ranking.
