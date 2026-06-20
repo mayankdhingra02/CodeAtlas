@@ -37,10 +37,15 @@ class PythonParser(ParserPlugin):
 
     def parse(self, repo_root: Path, source_file: SourceFile) -> ParseResult:
         content = source_file.path.read_bytes()
-        tree = self._parser.parse(content)
+        source_text = content.decode("utf-8", errors="replace")
+        try:
+            tree = self._parser.parse(source_text)
+        except TypeError:
+            tree = self._parser.parse(content)
+        root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
         module_name = module_name_for_path(source_file.relative_path)
         extractor = _PythonTreeSitterExtractor(content, module_name)
-        return extractor.extract(source_file, tree.root_node)
+        return extractor.extract(source_file, root_node)
 
 
 def module_name_for_path(relative_path: str) -> str:
@@ -83,7 +88,7 @@ class _PythonTreeSitterExtractor:
         scope_kind: str,
         decorators: tuple[str, ...] = (),
     ) -> None:
-        for child in block.named_children:
+        for child in _named_children(block):
             self._process_statement(child, parent_parts, scope_kind, decorators)
 
     def _process_statement(
@@ -93,14 +98,14 @@ class _PythonTreeSitterExtractor:
         scope_kind: str,
         decorators: tuple[str, ...],
     ) -> None:
-        if node.type == "decorated_definition":
+        if _node_type(node) == "decorated_definition":
             found_decorators = tuple(
                 self._clean_decorator(self._text(child))
-                for child in node.named_children
-                if child.type == "decorator"
+                for child in _named_children(node)
+                if _node_type(child) == "decorator"
             )
-            for child in node.named_children:
-                if child.type in {"class_definition", "function_definition"}:
+            for child in _named_children(node):
+                if _node_type(child) in {"class_definition", "function_definition"}:
                     self._process_statement(
                         child,
                         parent_parts,
@@ -109,11 +114,11 @@ class _PythonTreeSitterExtractor:
                     )
             return
 
-        if node.type == "class_definition":
+        if _node_type(node) == "class_definition":
             self._handle_class(node, parent_parts, decorators)
             return
 
-        if node.type == "function_definition":
+        if _node_type(node) == "function_definition":
             self._handle_function(node, parent_parts, scope_kind, decorators)
 
     def _handle_class(
@@ -214,16 +219,14 @@ class _PythonTreeSitterExtractor:
 
     def _collect_imports(self, root: Node) -> None:
         for node in self._iter_nodes(root):
-            if node.type == "import_statement":
+            if _node_type(node) == "import_statement":
                 self.imports.extend(self._parse_import_statement(node))
-            elif node.type == "import_from_statement":
+            elif _node_type(node) == "import_from_statement":
                 self.imports.extend(self._parse_import_from_statement(node))
 
     def _parse_import_statement(self, node: Node) -> tuple[ImportRecord, ...]:
         records: list[ImportRecord] = []
-        for child_index, child in enumerate(node.children):
-            if node.field_name_for_child(child_index) != "name":
-                continue
+        for child in _named_children(node):
             module, alias = self._import_name_and_alias(child)
             if module:
                 records.append(
@@ -238,14 +241,9 @@ class _PythonTreeSitterExtractor:
         return tuple(records)
 
     def _parse_import_from_statement(self, node: Node) -> tuple[ImportRecord, ...]:
-        module_node: Node | None = None
-        names: list[Node] = []
-        for child_index, child in enumerate(node.children):
-            field = node.field_name_for_child(child_index)
-            if field == "module_name":
-                module_node = child
-            elif field == "name":
-                names.append(child)
+        named = _named_children(node)
+        module_node = named[0] if named else None
+        names = list(named[1:])
         module = self._text(module_node) if module_node is not None else ""
         records: list[ImportRecord] = []
         for name_node in names:
@@ -263,16 +261,11 @@ class _PythonTreeSitterExtractor:
         return tuple(records)
 
     def _import_name_and_alias(self, node: Node) -> tuple[str, str | None]:
-        if node.type != "aliased_import":
+        if _node_type(node) != "aliased_import":
             return self._text(node), None
-        name_node: Node | None = None
-        alias_node: Node | None = None
-        for child_index, child in enumerate(node.children):
-            field = node.field_name_for_child(child_index)
-            if field == "name":
-                name_node = child
-            elif field == "alias":
-                alias_node = child
+        named = _named_children(node)
+        name_node = named[0] if named else None
+        alias_node = named[1] if len(named) > 1 else None
         return (
             self._text(name_node) if name_node is not None else "",
             self._text(alias_node) if alias_node is not None else None,
@@ -284,19 +277,20 @@ class _PythonTreeSitterExtractor:
         while stack:
             current = stack.pop()
             found.append(current)
-            stack.extend(reversed(current.named_children))
+            stack.extend(reversed(_named_children(current)))
         return tuple(found)
 
     def _iter_non_nested_nodes(self, root: Node, wanted_types: set[str]) -> tuple[Node, ...]:
         found: list[Node] = []
-        stack = list(reversed(root.named_children))
+        stack = list(reversed(_named_children(root)))
         while stack:
             current = stack.pop()
-            if current.type in {"class_definition", "function_definition", "decorated_definition"}:
+            current_type = _node_type(current)
+            if current_type in {"class_definition", "function_definition", "decorated_definition"}:
                 continue
-            if current.type in wanted_types:
+            if current_type in wanted_types:
                 found.append(current)
-            stack.extend(reversed(current.named_children))
+            stack.extend(reversed(_named_children(current)))
         return tuple(found)
 
     def _call_target(self, call_node: Node) -> tuple[str, str]:
@@ -307,7 +301,7 @@ class _PythonTreeSitterExtractor:
         identifiers = [
             self._text(node)
             for node in self._iter_nodes(function_node)
-            if node.type == "identifier"
+            if _node_type(node) == "identifier"
         ]
         return display, identifiers[-1] if identifiers else display
 
@@ -315,7 +309,7 @@ class _PythonTreeSitterExtractor:
         if argument_list is None:
             return ()
         names: list[str] = []
-        for child in argument_list.named_children:
+        for child in _named_children(argument_list):
             text = self._text(child).strip()
             if text:
                 names.append(text)
@@ -324,8 +318,9 @@ class _PythonTreeSitterExtractor:
     def _docstring(self, body: Node | None) -> str | None:
         if body is None:
             return None
-        first = body.named_children[0] if body.named_children else None
-        if first is None or first.type != "string":
+        children = _named_children(body)
+        first = children[0] if children else None
+        if first is None or _node_type(first) != "string":
             return None
         raw = self._text(first)
         try:
@@ -333,15 +328,15 @@ class _PythonTreeSitterExtractor:
         except Exception:
             value = "".join(
                 self._text(child)
-                for child in first.named_children
-                if child.type == "string_content"
+                for child in _named_children(first)
+                if _node_type(child) == "string_content"
             )
         return value if isinstance(value, str) and value else None
 
     def _header(self, node: Node) -> str:
         body = node.child_by_field_name("body")
-        end_byte = body.start_byte if body is not None else node.end_byte
-        header = self.content[node.start_byte:end_byte].decode("utf-8", errors="replace")
+        end_byte = _start_byte(body) if body is not None else _end_byte(node)
+        header = self.content[_start_byte(node) : end_byte].decode("utf-8", errors="replace")
         first_line = header.splitlines()[0] if header.splitlines() else header
         return first_line.strip().removesuffix(":")
 
@@ -365,19 +360,56 @@ class _PythonTreeSitterExtractor:
     def _text(self, node: Node | None) -> str:
         if node is None:
             return ""
-        return self.content[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+        return self.content[_start_byte(node) : _end_byte(node)].decode("utf-8", errors="replace")
 
     def _line_start(self, node: Node) -> int:
-        return _point_row(node.start_point) + 1
+        return _point_row(_start_point(node)) + 1
 
     def _line_end(self, node: Node) -> int:
-        return _point_row(node.end_point) + 1
+        return _point_row(_end_point(node)) + 1
 
     def _col_start(self, node: Node) -> int:
-        return _point_column(node.start_point) + 1
+        return _point_column(_start_point(node)) + 1
 
     def _col_end(self, node: Node) -> int:
-        return _point_column(node.end_point) + 1
+        return _point_column(_end_point(node)) + 1
+
+
+def _member_value(obj: Any, *names: str) -> Any:
+    for name in names:
+        if hasattr(obj, name):
+            value = getattr(obj, name)
+            return value() if callable(value) else value
+    return None
+
+
+def _node_type(node: Node) -> str:
+    return str(_member_value(node, "type", "kind") or "")
+
+
+def _named_children(node: Node) -> tuple[Node, ...]:
+    children = getattr(node, "named_children", None)
+    if children is not None:
+        value = children() if callable(children) else children
+        return tuple(value)
+    count = _member_value(node, "named_child_count") or 0
+    return tuple(node.named_child(index) for index in range(int(count)))
+
+
+def _start_byte(node: Node) -> int:
+    return int(_member_value(node, "start_byte") or 0)
+
+
+def _end_byte(node: Node) -> int:
+    return int(_member_value(node, "end_byte") or 0)
+
+
+def _start_point(node: Node) -> Any:
+    return _member_value(node, "start_point", "start_position")
+
+
+def _end_point(node: Node) -> Any:
+    return _member_value(node, "end_point", "end_position")
 
 
 def _point_row(point: Any) -> int:
