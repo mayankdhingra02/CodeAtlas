@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,7 @@ from .models import (
     SourceFile,
 )
 from .parsers import ParserRegistry
+from .project_config import load_project_config
 from .scanner import iter_source_files
 from .storage import (
     GraphStore,
@@ -34,6 +37,7 @@ class RepositoryIndexer:
         start = time.perf_counter()
         repo_root = resolve_repo_root(repo_path)
         paths = CodeAtlasPaths(repo_root)
+        project_config = load_project_config(repo_root)
         paths.artifact_dir.mkdir(parents=True, exist_ok=True)
         paths.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -109,6 +113,15 @@ class RepositoryIndexer:
             store.set_metadata("repo_root", str(repo_root))
             store.set_metadata("last_indexed_at", utc_now())
             store.set_metadata("supported_languages", list(self.parser_registry.supported_languages))
+            store.set_metadata("project_config", project_config.public_payload())
+            store.set_metadata("last_index_report", {
+                "files_scanned": len(source_files),
+                "files_indexed": len(parsed_results),
+                "files_skipped": skipped,
+                "files_deleted": files_deleted,
+                "parser_errors": parser_errors,
+                "file_results": [asdict(result) for result in sorted(file_results, key=lambda item: item.relative_path)],
+            })
             store.commit()
 
             stats_payload = store.repository_stats()
@@ -173,6 +186,10 @@ class RepositoryIndexer:
             file_path=relative_path,
             metadata={"language": parse_result.source_file.language},
         )
+        store.upsert_file_search(
+            parse_result.source_file,
+            parse_result.source_file.path.read_text(encoding="utf-8", errors="replace"),
+        )
         store.insert_node(
             module_key,
             NodeType.MODULE,
@@ -212,6 +229,25 @@ class RepositoryIndexer:
 
         for symbol in parse_result.symbols:
             store.insert_symbol(file_id, relative_path, symbol)
+            route = route_info_for_symbol(symbol)
+            if route:
+                route_key = route_node_key(symbol.qualified_name)
+                store.insert_node(
+                    route_key,
+                    NodeType.ROUTE,
+                    route["label"],
+                    file_path=relative_path,
+                    metadata=route | {"handler": symbol.qualified_name},
+                )
+                store.insert_edge(
+                    route_key,
+                    NodeType.ROUTE,
+                    symbol.node_key,
+                    symbol.node_type,
+                    EdgeType.HANDLES,
+                    weight=0.95,
+                    metadata=route | {"confidence": 0.95},
+                )
             parent_key = (
                 symbol_node_key(symbol.parent_qualified_name)
                 if symbol.parent_qualified_name
@@ -238,6 +274,24 @@ class RepositoryIndexer:
     def _write_resolution_edges(self, store: GraphStore, parse_result: ParseResult) -> None:
         for call in parse_result.calls:
             source_key = symbol_node_key(call.source_qualified_name)
+            http_call = http_call_info(call)
+            if http_call:
+                target_key = route_external_key(http_call["method"], http_call["target"])
+                store.insert_node(
+                    target_key,
+                    NodeType.ROUTE,
+                    http_call["label"],
+                    metadata=http_call | {"external": True},
+                )
+                store.insert_edge(
+                    source_key,
+                    NodeType.SYMBOL,
+                    target_key,
+                    NodeType.ROUTE,
+                    EdgeType.HTTP_CALLS,
+                    weight=http_call["confidence"],
+                    metadata=http_call,
+                )
             target_key = store.resolve_symbol_node_key(call.target_name, parse_result.module_name)
             target_type = NodeType.SYMBOL
             if target_key is None:
@@ -315,3 +369,89 @@ class RepositoryIndexer:
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options"}
+
+
+def route_info_for_symbol(symbol: Any) -> dict[str, Any] | None:
+    js_route = route_info_from_js_symbol(symbol.name, symbol.signature or "")
+    if js_route:
+        return js_route
+    for decorator in getattr(symbol, "decorators", ()) or ():
+        route = route_info_from_decorator(str(decorator))
+        if route:
+            return route
+    return None
+
+
+def route_info_from_js_symbol(name: str, signature: str) -> dict[str, Any] | None:
+    if not name.startswith("route_"):
+        return None
+    match = re.match(r"route_(get|post|put|patch|delete|use|head|options)_(.+)", name)
+    method = match.group(1).upper() if match else "ROUTE"
+    route_match = re.search(r"\.\w+\s*\(\s*['\"]([^'\"]+)['\"]", signature)
+    path = route_match.group(1) if route_match else "/" + name.removeprefix("route_").split("_", 1)[-1]
+    return {"method": method, "path": path, "label": f"{method} {path}", "source": "js-route"}
+
+
+def route_info_from_decorator(decorator: str) -> dict[str, Any] | None:
+    match = re.search(
+        r"(?:route|api_route|get|post|put|patch|delete|head|options)\s*\(\s*['\"]([^'\"]+)['\"]",
+        decorator,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    method_match = re.search(r"\.(get|post|put|patch|delete|head|options|route|api_route)\s*\(", decorator, re.IGNORECASE)
+    method = method_match.group(1).upper() if method_match else "ROUTE"
+    if method in {"ROUTE", "API_ROUTE"}:
+        methods_match = re.search(r"methods\s*=\s*\[([^\]]+)\]", decorator, re.IGNORECASE)
+        if methods_match:
+            first = re.search(r"['\"]([A-Za-z]+)['\"]", methods_match.group(1))
+            method = first.group(1).upper() if first else "ROUTE"
+    path = match.group(1)
+    return {"method": method, "path": path, "label": f"{method} {path}", "source": "python-decorator"}
+
+
+def http_call_info(call: Any) -> dict[str, Any] | None:
+    display = str(call.display_name or "")
+    name = str(call.target_name or "").lower()
+    owner_method = display.rsplit(".", 1)[-1].lower()
+    if name not in HTTP_METHODS and owner_method not in HTTP_METHODS and name not in {"fetch", "request"}:
+        return None
+    target = first_literal_argument(tuple(call.arguments or ()))
+    if not target:
+        return None
+    method = owner_method if owner_method in HTTP_METHODS else name
+    if method == "fetch":
+        method = "get"
+    confidence = 0.78 if target.startswith(("http://", "https://", "/")) else 0.52
+    return {
+        "method": method.upper(),
+        "target": target,
+        "label": f"{method.upper()} {target}",
+        "display": display,
+        "line": int(call.line_number or 0),
+        "confidence": confidence,
+    }
+
+
+def first_literal_argument(arguments: tuple[str, ...]) -> str | None:
+    if not arguments:
+        return None
+    value = arguments[0].strip().strip("rubfRUBF")
+    if (value.startswith("'") and value.endswith("'")) or (value.startswith('"') and value.endswith('"')):
+        return value[1:-1]
+    if value.startswith(("http://", "https://", "/")):
+        return value
+    return None
+
+
+def route_node_key(qualified_name: str) -> str:
+    return f"route:{qualified_name}"
+
+
+def route_external_key(method: str, target: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.:/-]+", "_", target.strip())
+    return f"route:external:{method.upper()}:{cleaned}"

@@ -4,8 +4,16 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
+from .analysis import dead_code, http_confidence_summary, route_summary, structural_query
+from .artifacts import export_graph_artifact, import_graph_artifact
+from .external_index import import_external_index
 from .memory import MemoryQueryEngine
+from .packs import context_pack, render_context_pack
 from .retrieval import RetrievalEngine
+from .rules import run_rule_checks
+from .source import source_outline
+from .status import index_status
+from .verification import verification_plan
 from .visualization import VisualizationService
 
 
@@ -104,6 +112,61 @@ def create_tool_handlers(repo_path: str | Path = ".") -> dict[str, Callable[...,
     def get_visual_map() -> dict[str, Any]:
         return visualization.build_map(repo_path)
 
+    def get_index_status() -> dict[str, Any]:
+        return index_status(repo_path)
+
+    def query_code_graph(expression: str, limit: int = 25) -> dict[str, Any]:
+        return structural_query(repo_path, expression, limit=limit)
+
+    def find_dead_code(limit: int = 50) -> dict[str, Any]:
+        return dead_code(repo_path, limit=limit)
+
+    def get_routes(limit: int = 100) -> dict[str, Any]:
+        return route_summary(repo_path, limit=limit)
+
+    def get_http_confidence(limit: int = 100) -> dict[str, Any]:
+        return http_confidence_summary(repo_path, limit=limit)
+
+    def export_graph() -> dict[str, Any]:
+        report = export_graph_artifact(repo_path)
+        return report.__dict__ | {
+            "repo_root": str(report.repo_root),
+            "database_path": str(report.database_path),
+            "artifact_path": str(report.artifact_path),
+        }
+
+    def import_graph(overwrite: bool = False) -> dict[str, Any]:
+        report = import_graph_artifact(repo_path, overwrite=overwrite)
+        return report.__dict__ | {
+            "repo_root": str(report.repo_root),
+            "database_path": str(report.database_path),
+            "artifact_path": str(report.artifact_path),
+        }
+
+    def get_context_pack(
+        task: str,
+        max_tokens: int = 6000,
+        output_format: str = "json",
+    ) -> dict[str, Any]:
+        pack = context_pack(repo_path, task, max_tokens=max_tokens)
+        return {
+            "pack": pack,
+            "rendered": render_context_pack(pack, output_format=output_format),
+            "format": output_format,
+        }
+
+    def get_verification_plan(base_ref: str = "HEAD", task: str = "") -> dict[str, Any]:
+        return verification_plan(repo_path, base_ref=base_ref, task=task)
+
+    def run_rules(limit: int = 100, severity: str | None = None) -> dict[str, Any]:
+        return run_rule_checks(repo_path, limit=limit, severity=severity)
+
+    def get_source_outline(query: str = "", limit: int = 80) -> dict[str, Any]:
+        return source_outline(repo_path, query, limit=limit)
+
+    def import_code_index(input_path: str, index_format: str = "auto") -> dict[str, Any]:
+        return import_external_index(repo_path, input_path, index_format=index_format)
+
     return {
         "get_code_context": get_code_context,
         "find_symbol": find_symbol,
@@ -122,6 +185,18 @@ def create_tool_handlers(repo_path: str | Path = ".") -> dict[str, Callable[...,
         "get_hotspots": get_hotspots,
         "get_nexus": get_nexus,
         "get_visual_map": get_visual_map,
+        "get_index_status": get_index_status,
+        "query_code_graph": query_code_graph,
+        "find_dead_code": find_dead_code,
+        "get_routes": get_routes,
+        "get_http_confidence": get_http_confidence,
+        "export_graph": export_graph,
+        "import_graph": import_graph,
+        "get_context_pack": get_context_pack,
+        "get_verification_plan": get_verification_plan,
+        "run_rules": run_rules,
+        "get_source_outline": get_source_outline,
+        "import_code_index": import_code_index,
     }
 
 

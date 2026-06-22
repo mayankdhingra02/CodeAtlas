@@ -35,6 +35,7 @@ class RetrievalEngine:
             lookup_start = time.perf_counter()
             matches = store.find_symbols(query)
             symbol_lookup_ms = elapsed_ms(lookup_start)
+            intent = detect_query_intent(query)
 
             graph_start = time.perf_counter()
             start_keys = [symbol_node_key(str(row["qualified_name"])) for row in matches]
@@ -52,7 +53,10 @@ class RetrievalEngine:
                 matches,
                 edges,
                 max_tokens=max_tokens,
+                intent=intent,
             )
+            if not snippets:
+                snippets = self._text_search_snippets(repo_root, store, query, max_tokens=max_tokens)
             token_report = self._token_report(store, snippets)
             ranking_ms = elapsed_ms(ranking_start)
 
@@ -155,10 +159,13 @@ class RetrievalEngine:
         edges: list[Any],
         *,
         max_tokens: int,
+        intent: str,
     ) -> list[ContextSnippet]:
         query_lower = query.lower()
+        terms = query_terms(query)
         exact_keys = {symbol_node_key(str(row["qualified_name"])) for row in matches}
         edge_bonus = self._edge_bonus(edges)
+        edge_types = self._edge_types_by_key(edges)
         ranked: list[tuple[float, str, Any]] = []
         seen: set[str] = set()
         for row in symbol_rows:
@@ -187,9 +194,23 @@ class RetrievalEngine:
                 reasons.append("qualified name contains query")
             if str(row["kind"]) == "METHOD":
                 score += 6
+                reasons.append("method definition")
+            else:
+                reasons.append(str(row["kind"]).lower() + " definition")
+            file_path = str(row["file_path"]).lower()
+            if terms and any(term in file_path for term in terms):
+                score += 12
+                reasons.append("file path matches query")
+            if intent == "test" and is_test_path(file_path):
+                score += 35
+                reasons.append("test-focused query")
+            if intent == "architecture" and is_doc_path(file_path):
+                score += 20
+                reasons.append("architecture/documentation path")
             score += edge_bonus.get(key, 0.0)
             if key in edge_bonus:
-                reasons.append("graph neighbor")
+                related = ", ".join(sorted(edge_types.get(key, ())))
+                reasons.append("graph neighbor" + (f" via {related}" if related else ""))
             ranked.append((score, ", ".join(reasons) or "graph context", row))
 
         ranked.sort(
@@ -232,6 +253,103 @@ class RetrievalEngine:
             used_tokens += snippet_tokens
         return snippets
 
+    def _text_search_snippets(
+        self,
+        repo_root: Path,
+        store: GraphStore,
+        query: str,
+        *,
+        max_tokens: int,
+    ) -> list[ContextSnippet]:
+        terms = query_terms(query)
+        if not terms:
+            return []
+        intent = detect_query_intent(query)
+        fts_rows = store.search_files(query, limit=30)
+        fts_rank_by_path = {str(row["path"]): float(row["rank"]) for row in fts_rows}
+        candidate_paths = list(fts_rank_by_path)
+        if not candidate_paths:
+            candidate_paths = [str(row["path"]) for row in store.file_rows()]
+        ranked: list[tuple[float, ContextSnippet]] = []
+        for relative_path in candidate_paths:
+            path = repo_root / relative_path
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            haystack_path = relative_path.lower()
+            path_hits = sum(1 for term in terms if term in haystack_path)
+            best_line = 0
+            best_hits = 0
+            for index, line in enumerate(lines, start=1):
+                lower = line.lower()
+                hits = sum(1 for term in terms if term in lower)
+                if hits > best_hits:
+                    best_hits = hits
+                    best_line = index
+            if not path_hits and not best_hits:
+                continue
+            start = max(1, best_line - 6) if best_line else 1
+            end = min(len(lines), (best_line + 8) if best_line else 28)
+            code = "\n".join(lines[start - 1 : end])
+            score = path_hits * 18 + best_hits * 12 + (4 if path_hits and best_hits else 0)
+            if relative_path in fts_rank_by_path:
+                score += 40 + min(20, abs(fts_rank_by_path[relative_path]))
+            if intent == "test" and is_test_path(relative_path):
+                score += 35
+            if intent == "architecture" and is_doc_path(relative_path):
+                score += 30
+            reason_parts = []
+            if relative_path in fts_rank_by_path:
+                reason_parts.append("SQLite FTS match")
+            if path_hits:
+                reason_parts.append("file path contains query terms")
+            if best_hits:
+                reason_parts.append("file text contains query terms")
+            if intent != "general":
+                reason_parts.append("intent: " + intent)
+            ranked.append(
+                (
+                    score,
+                    ContextSnippet(
+                        file_path=relative_path,
+                        symbol_name=Path(relative_path).name,
+                        qualified_name=relative_path,
+                        kind="FILE",
+                        line_start=start,
+                        line_end=end,
+                        score=score,
+                        reason=", ".join(reason_parts) or "text search fallback",
+                        code=code,
+                    ),
+                )
+            )
+        ranked.sort(key=lambda item: (-item[0], item[1].file_path))
+        snippets: list[ContextSnippet] = []
+        used_tokens = 0
+        for _, snippet in ranked:
+            tokens = snippet.estimated_tokens
+            if snippets and used_tokens + tokens > max_tokens:
+                continue
+            if not snippets and tokens > max_tokens:
+                snippet = ContextSnippet(
+                    file_path=snippet.file_path,
+                    symbol_name=snippet.symbol_name,
+                    qualified_name=snippet.qualified_name,
+                    kind=snippet.kind,
+                    line_start=snippet.line_start,
+                    line_end=snippet.line_end,
+                    score=snippet.score,
+                    reason=snippet.reason,
+                    code=trim_to_tokens(snippet.code, max_tokens),
+                )
+                tokens = snippet.estimated_tokens
+            snippets.append(snippet)
+            used_tokens += tokens
+            if len(snippets) >= 8:
+                break
+        return snippets
+
     def _edge_bonus(self, edges: list[Any]) -> dict[str, float]:
         bonuses: dict[str, float] = {}
         for edge in edges:
@@ -247,6 +365,14 @@ class RetrievalEngine:
             bonuses[str(edge["source_key"])] = bonuses.get(str(edge["source_key"]), 0.0) + bonus
             bonuses[str(edge["target_key"])] = bonuses.get(str(edge["target_key"]), 0.0) + bonus
         return bonuses
+
+    def _edge_types_by_key(self, edges: list[Any]) -> dict[str, set[str]]:
+        edge_types: dict[str, set[str]] = {}
+        for edge in edges:
+            edge_type = str(edge["edge_type"]).lower()
+            edge_types.setdefault(str(edge["source_key"]), set()).add(edge_type)
+            edge_types.setdefault(str(edge["target_key"]), set()).add(edge_type)
+        return edge_types
 
     def _token_report(self, store: GraphStore, snippets: list[ContextSnippet]) -> TokenReport:
         optimized = sum(snippet.estimated_tokens for snippet in snippets)
@@ -288,6 +414,63 @@ def trim_to_tokens(code: str, max_tokens: int) -> str:
     if len(code) <= max_chars:
         return code
     return code[:max_chars].rstrip() + "\n# ... truncated by CodeAtlas token limit"
+
+
+def query_terms(query: str) -> tuple[str, ...]:
+    stop_words = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "for",
+        "from",
+        "how",
+        "in",
+        "is",
+        "of",
+        "or",
+        "the",
+        "this",
+        "to",
+        "what",
+        "where",
+        "why",
+        "with",
+    }
+    terms = []
+    for raw in query.replace("/", " ").replace(".", " ").replace("_", " ").split():
+        term = "".join(char for char in raw.lower() if char.isalnum() or char in "-")
+        if len(term) < 3 or term in stop_words:
+            continue
+        terms.append(term)
+    return tuple(dict.fromkeys(terms))
+
+
+def detect_query_intent(query: str) -> str:
+    text = query.lower()
+    if any(term in text for term in ("test", "spec", "coverage", "validate", "assert")):
+        return "test"
+    if any(term in text for term in ("bug", "fix", "error", "exception", "fail", "regression")):
+        return "bug"
+    if any(term in text for term in ("owner", "owns", "authored", "maintainer", "who changed")):
+        return "ownership"
+    if any(term in text for term in ("architecture", "design", "decision", "adr", "why")):
+        return "architecture"
+    if any(term in text for term in ("api", "request", "route", "endpoint", "flow")):
+        return "api"
+    if any(term in text for term in ("data", "database", "db", "sql", "model", "schema")):
+        return "data"
+    return "general"
+
+
+def is_test_path(path: str) -> bool:
+    lowered = path.lower()
+    return any(part in lowered for part in ("test", "tests", "spec", "__tests__", ".spec.", ".test."))
+
+
+def is_doc_path(path: str) -> bool:
+    lowered = path.lower()
+    return lowered.startswith("docs/") or any(part in lowered for part in ("readme", "adr", "design", "architecture", "rfcs"))
 
 
 def row_to_dict(row: Any) -> dict[str, Any]:

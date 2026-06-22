@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from .base import ParserPlugin
+from .javascript import JavaScriptParser
 from .python import PythonParser
 
 
 class ParserRegistry:
     def __init__(self, parsers: Iterable[ParserPlugin] | None = None) -> None:
-        parser_list = tuple(parsers) if parsers is not None else (PythonParser(),)
+        parser_list = tuple(parsers) if parsers is not None else (PythonParser(), JavaScriptParser())
         self._by_language = {parser.language: parser for parser in parser_list}
 
     def get(self, language: str) -> ParserPlugin:

@@ -13,6 +13,7 @@ class NodeType(StrEnum):
     FUNCTION = "FUNCTION"
     METHOD = "METHOD"
     SYMBOL = "SYMBOL"
+    ROUTE = "ROUTE"
 
 
 class EdgeType(StrEnum):
@@ -22,6 +23,8 @@ class EdgeType(StrEnum):
     REFERENCES = "REFERENCES"
     DEFINES = "DEFINES"
     INHERITS = "INHERITS"
+    HANDLES = "HANDLES"
+    HTTP_CALLS = "HTTP_CALLS"
 
 
 class MemoryEntityKind(StrEnum):

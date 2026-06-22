@@ -90,6 +90,12 @@ class GraphStore:
               value TEXT NOT NULL
             );
 
+            CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+              path,
+              language,
+              content
+            );
+
             CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
             CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
             CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);
@@ -118,6 +124,7 @@ class GraphStore:
             DELETE FROM imports;
             DELETE FROM symbols;
             DELETE FROM files;
+            DELETE FROM files_fts;
             DELETE FROM metadata WHERE key NOT IN ('schema_version');
             """
         )
@@ -185,6 +192,7 @@ class GraphStore:
                 tuple(keys),
             )
         self.connection.execute("DELETE FROM files WHERE id = ?", (int(row["id"]),))
+        self.connection.execute("DELETE FROM files_fts WHERE path = ?", (relative_path,))
         self.connection.commit()
         return True
 
@@ -299,6 +307,16 @@ class GraphStore:
                 record.line_number,
                 1 if record.is_from else 0,
             ),
+        )
+
+    def upsert_file_search(self, source_file: SourceFile, content: str) -> None:
+        self.connection.execute("DELETE FROM files_fts WHERE path = ?", (source_file.relative_path,))
+        self.connection.execute(
+            """
+            INSERT INTO files_fts(path, language, content)
+            VALUES (?, ?, ?)
+            """,
+            (source_file.relative_path, source_file.language, content),
         )
 
     def insert_edge(
@@ -528,6 +546,29 @@ class GraphStore:
     def file_rows(self) -> list[sqlite3.Row]:
         return list(self.connection.execute("SELECT * FROM files ORDER BY path").fetchall())
 
+    def search_files(self, query: str, limit: int = 20) -> list[sqlite3.Row]:
+        fts_query = fts_query_for(query)
+        if not fts_query:
+            return []
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT
+                  path,
+                  language,
+                  snippet(files_fts, 2, '', '', ' ... ', 18) AS snippet,
+                  bm25(files_fts) AS rank
+                FROM files_fts
+                WHERE files_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return list(rows)
+
     def files_in_directories(self, directories: Iterable[str]) -> list[sqlite3.Row]:
         directory_list = sorted(set(directories))
         if not directory_list:
@@ -609,6 +650,36 @@ def symbol_node_key(qualified_name: str) -> str:
 
 def unresolved_symbol_node_key(name: str) -> str:
     return f"symbol_ref:{name}"
+
+
+def fts_query_for(query: str) -> str:
+    stop_words = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "for",
+        "from",
+        "how",
+        "in",
+        "is",
+        "of",
+        "or",
+        "the",
+        "this",
+        "to",
+        "what",
+        "where",
+        "why",
+        "with",
+    }
+    terms = []
+    for raw in query.replace("/", " ").replace(".", " ").replace("-", " ").split():
+        term = "".join(char for char in raw.lower() if char.isalnum() or char == "_")
+        if len(term) < 3 or term in stop_words:
+            continue
+        terms.append(term)
+    return " OR ".join(f"{term}*" for term in dict.fromkeys(terms[:8]))
 
 
 def node_type_for_symbol_kind(kind: str) -> NodeType:

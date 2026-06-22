@@ -1,0 +1,50 @@
+{
+  "metadata": {
+    "tool_info": {
+      "name": "codeatlas-fixture",
+      "version": "1.0.0"
+    },
+    "project_root": "file:///fixture"
+  },
+  "documents": [
+    {
+      "relative_path": "web/router.ts",
+      "language": "typescript",
+      "symbols": [
+        {
+          "symbol": "scip-typescript npm fixture 1.0.0 `web/router.ts`/route_get_health().",
+          "name": "route_get_health",
+          "kind": "FUNCTION",
+          "line_start": 3,
+          "line_end": 5,
+          "relationships": [
+            {
+              "symbol": "scip-typescript npm fixture 1.0.0 `web/client.ts`/callHealth().",
+              "type": "CALLS",
+              "is_reference": true
+            }
+          ]
+        },
+        {
+          "symbol": "scip-typescript npm fixture 1.0.0 `web/client.ts`/callHealth().",
+          "name": "callHealth",
+          "kind": "FUNCTION",
+          "line_start": 8,
+          "line_end": 10
+        }
+      ],
+      "occurrences": [
+        {
+          "symbol": "scip-typescript npm fixture 1.0.0 `web/router.ts`/route_get_health().",
+          "symbol_roles": 1,
+          "range": [2, 0, 4, 1]
+        },
+        {
+          "symbol": "scip-typescript npm fixture 1.0.0 `web/client.ts`/callHealth().",
+          "symbol_roles": 1,
+          "range": [7, 0, 9, 1]
+        }
+      ]
+    }
+  ]
+}

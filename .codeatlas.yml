@@ -1,0 +1,57 @@
+version: 1
+
+languages:
+  python: true
+  javascript: true
+
+ignore:
+  dirs:
+    - .tox
+    - .nox
+  paths:
+    - generated/**
+    - vendor/**
+
+rules:
+  enabled: true
+  tests_lower_severity: true
+  suppressions:
+    - rule: possible-secret
+      path: tests/fixtures/**
+      reason: fixture data
+    - rule: possible-secret
+      path: tests/test_codeatlas.py
+      reason: inline fixture data
+    - rule: python-requests-without-timeout
+      path: tests/test_codeatlas.py
+      reason: inline fixture data
+    - rule: dynamic-code-execution
+      path: tests/test_codeatlas.py
+      reason: inline fixture data
+  severity_overrides:
+    fetch-without-abort: low
+
+ui:
+  default_lens: overview
+  node_budget: 180
+  min_edge_weight: 1
+  connected_only: true
+  edge_contrast: 64
+
+classification:
+  owned_prefixes:
+    - codeatlas
+  team_prefixes: []
+  company_prefixes: []
+  third_party_packages: []
+  hide_packages:
+    - docutils
+    - sphinx
+    - numpy
+    - pandas
+    - datetime
+  show_packages: []
+
+cache:
+  enabled: true
+  ttl_seconds: 300

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import socket
 import subprocess
@@ -12,17 +13,52 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .analysis import dead_code, http_confidence_summary, route_summary, structural_query
 from .config import CodeAtlasPaths, resolve_repo_root
 from .indexer import RepositoryIndexer
 from .memory import MemoryQueryEngine, MemoryStore, component_for_path, metadata_files, parse_json
+from .packs import context_pack, render_context_pack
+from .project_config import load_project_config, restore_classification_config, update_classification_config
 from .retrieval import RetrievalEngine
+from .rules import run_rule_checks
+from .source import source_outline
+from .status import index_status
 from .storage import GraphStore
+from .verification import verification_plan
+from .workflow_cache import cached_workflow
+
+COMPARE_CACHE_VERSION = 1
+SERVER_STARTED = datetime.now(UTC)
+SERVER_STARTED_AT = SERVER_STARTED.isoformat()
+UI_VERSION = "compare-evidence-mode-1"
+ASSET_DIR = Path(__file__).with_name("assets")
+VISUALIZATION_ASSET_NAMES = (
+    "visualization.html",
+    "visualization.css",
+    "visualization.js",
+)
+
+
+def source_freshness() -> dict[str, Any]:
+    paths = [Path(__file__), *(ASSET_DIR / name for name in VISUALIZATION_ASSET_NAMES)]
+    try:
+        modified_at = max(datetime.fromtimestamp(path.stat().st_mtime, UTC) for path in paths)
+    except OSError:
+        return {"source_modified_at": "", "server_source_stale": False}
+    return {
+        "source_modified_at": modified_at.isoformat(),
+        "server_source_stale": modified_at > SERVER_STARTED,
+    }
 
 
 class VisualizationService:
+    def __init__(self) -> None:
+        self._snapshot_locks: dict[str, Lock] = {}
+
     def prepare(
         self,
         repo_path: str | Path,
@@ -44,6 +80,7 @@ class VisualizationService:
     def build_map(self, repo_path: str | Path) -> dict[str, Any]:
         repo_root = resolve_repo_root(repo_path)
         paths = CodeAtlasPaths(repo_root)
+        project_config = load_project_config(repo_root)
         if not paths.database_path.exists():
             msg = f"No CodeAtlas index found at {paths.database_path}. Run `codeatlas serve {repo_root}`."
             raise FileNotFoundError(msg)
@@ -58,6 +95,9 @@ class VisualizationService:
             code_edges = [dict(row) for row in self._code_edges(graph_store)]
             commit_rows = memory_store.commit_evidence(limit=2000)
             memory_edges = [dict(row) for row in self._memory_edges(memory_store)]
+            supported_languages = graph_store.get_metadata("supported_languages", ["python"])
+            index_report = graph_store.get_metadata("last_index_report", {})
+            repository_stats = graph_store.repository_stats()
 
             component_graph = self._component_graph(files, symbols, code_edges, commit_rows, memory_edges)
             commit_graph = self._commit_graph(commit_rows)
@@ -67,6 +107,7 @@ class VisualizationService:
                 "components": len(component_graph["nodes"]),
                 "component_edges": len(component_graph["edges"]),
                 "commits": len(commit_rows),
+                "last_indexed_at": repository_stats.get("last_indexed_at"),
                 "generated_at": datetime.now(UTC).isoformat(),
             }
             return {
@@ -76,6 +117,29 @@ class VisualizationService:
                     "database": str(paths.database_path),
                 },
                 "stats": stats,
+                "build": {
+                    "server_started_at": SERVER_STARTED_AT,
+                    "ui_version": UI_VERSION,
+                    "config_fingerprint": project_config.fingerprint,
+                    "config_path": str(project_config.path) if project_config.path else "",
+                    "cache_enabled": project_config.cache.enabled,
+                    "cache_ttl_seconds": project_config.cache.ttl_seconds,
+                    **source_freshness(),
+                },
+                "config": project_config.public_payload(),
+                "inventory": {
+                    "files": compact_file_inventory(files),
+                    "symbols": compact_symbol_inventory(symbols),
+                    "commits": compact_commit_inventory(commit_rows),
+                },
+                "diagnostics": compact_index_diagnostics(
+                    files,
+                    symbols,
+                    code_edges,
+                    stats,
+                    supported_languages=supported_languages,
+                    index_report=index_report,
+                ),
                 "component_graph": component_graph,
                 "commit_graph": commit_graph,
             }
@@ -93,18 +157,8 @@ class VisualizationService:
         repo_root = resolve_repo_root(repo_path)
         base_sha = resolve_git_ref(repo_root, base_ref)
         head_sha = resolve_git_ref(repo_root, head_ref)
-        with tempfile.TemporaryDirectory(prefix="codeatlas-compare-") as temp_name:
-            temp_root = Path(temp_name)
-            base_root = temp_root / "base"
-            head_root = temp_root / "head"
-            base_root.mkdir()
-            head_root.mkdir()
-            extract_git_archive(repo_root, base_sha, base_root)
-            extract_git_archive(repo_root, head_sha, head_root)
-            RepositoryIndexer().index(base_root, incremental=False)
-            RepositoryIndexer().index(head_root, incremental=False)
-            base_map = self.build_map(base_root)
-            head_map = self.build_map(head_root)
+        base_map = self._compare_snapshot(repo_root, base_sha)
+        head_map = self._compare_snapshot(repo_root, head_sha)
 
         base_graph = base_map["component_graph"]
         head_graph = head_map["component_graph"]
@@ -129,8 +183,52 @@ class VisualizationService:
             "summary": summary
             | {
                 "generated_at": datetime.now(UTC).isoformat(),
+                "cache": {
+                    "base": "hit" if base_map.get("cache_hit") else "miss",
+                    "head": "hit" if head_map.get("cache_hit") else "miss",
+                },
             },
         }
+
+    def warm_compare_cache(self, repo_path: str | Path, refs: list[str]) -> dict[str, Any]:
+        repo_root = resolve_repo_root(repo_path)
+        warmed = []
+        for ref in refs[:4]:
+            clean_ref = str(ref).strip()
+            if not clean_ref:
+                continue
+            sha = resolve_git_ref(repo_root, clean_ref)
+            snapshot = self._compare_snapshot(repo_root, sha)
+            warmed.append(
+                {
+                    "ref": clean_ref,
+                    "sha": sha,
+                    "cache": "hit" if snapshot.get("cache_hit") else "miss",
+                }
+            )
+        return {"warmed": warmed, "generated_at": datetime.now(UTC).isoformat()}
+
+    def _compare_snapshot(self, repo_root: Path, sha: str) -> dict[str, Any]:
+        lock = self._snapshot_locks.setdefault(sha, Lock())
+        with lock:
+            cached = load_compare_snapshot(repo_root, sha)
+            if cached:
+                return cached | {"cache_hit": True}
+            with tempfile.TemporaryDirectory(prefix="codeatlas-compare-") as temp_name:
+                snapshot_root = Path(temp_name) / "snapshot"
+                snapshot_root.mkdir()
+                extract_git_archive(repo_root, sha, snapshot_root)
+                RepositoryIndexer().index(snapshot_root, incremental=False)
+                snapshot_map = self.build_map(snapshot_root)
+            snapshot = {
+                "schema_version": COMPARE_CACHE_VERSION,
+                "sha": sha,
+                "generated_at": datetime.now(UTC).isoformat(),
+                "stats": snapshot_map["stats"],
+                "component_graph": snapshot_map["component_graph"],
+            }
+            write_compare_snapshot(repo_root, sha, snapshot)
+            return snapshot | {"cache_hit": False}
 
     def ask(
         self,
@@ -148,17 +246,22 @@ class VisualizationService:
         context = memory.compressed_context(repo_root, query, max_tokens=max_tokens)
         code_result = retrieval.retrieve(repo_root, query, depth=2, max_tokens=max_tokens)
         code_snippets = list(code_result.snippets)
-        if not code_snippets:
+        if not code_snippets or all(snippet.kind == "FILE" for snippet in code_snippets):
             seen_symbols: set[str] = set()
+            text_fallback_snippets = code_snippets
+            code_snippets = []
             for term in chat_query_terms(query):
                 fallback = retrieval.retrieve(repo_root, term, depth=2, max_tokens=max_tokens)
                 for snippet in fallback.snippets:
+                    if snippet.kind == "FILE":
+                        continue
                     if snippet.qualified_name in seen_symbols:
                         continue
                     seen_symbols.add(snippet.qualified_name)
                     code_snippets.append(snippet)
                 if len(code_snippets) >= 5:
                     break
+            code_snippets.extend(text_fallback_snippets)
         snippets = [
             {
                 "file_path": snippet.file_path,
@@ -203,6 +306,46 @@ class VisualizationService:
             | {"savings_percent": code_result.token_report.savings_percent},
             "estimated_context_tokens": context.estimated_tokens,
         }
+
+    def agent_context(
+        self,
+        repo_path: str | Path,
+        task: str,
+        *,
+        max_tokens: int = 5000,
+    ) -> dict[str, Any]:
+        query = task.strip()
+        if not query:
+            raise ValueError("Task cannot be empty.")
+        repo_root = resolve_repo_root(repo_path)
+        retrieval = RetrievalEngine()
+        memory = MemoryQueryEngine()
+        code_result = retrieval.retrieve(repo_root, query, depth=2, max_tokens=max_tokens)
+        context = memory.compressed_context(repo_root, query, max_tokens=max_tokens)
+        snippets = [
+            {
+                "file_path": snippet.file_path,
+                "symbol": snippet.qualified_name,
+                "kind": snippet.kind,
+                "lines": f"{snippet.line_start}-{snippet.line_end}",
+                "reason": snippet.reason,
+                "code": snippet.code,
+            }
+            for snippet in code_result.snippets[:8]
+        ]
+        evidence = [asdict(ref) for ref in context.evidence[:8]]
+        ownership = [asdict(entry) for entry in context.ownership[:5]]
+        payload = {
+            "task": query,
+            "code": snippets,
+            "evidence": evidence,
+            "ownership": ownership,
+            "token_report": code_result.token_report.__dict__
+            | {"savings_percent": code_result.token_report.savings_percent},
+            "estimated_context_tokens": context.estimated_tokens,
+        }
+        payload["markdown"] = build_agent_context_markdown(payload)
+        return payload
 
     def serve(
         self,
@@ -512,6 +655,52 @@ def create_visualization_server(
                 self._send_json(payload)
             elif route == "/api/health":
                 self._send_json({"ok": True, "repo": str(repo_root)})
+            elif route == "/api/index-status":
+                try:
+                    payload = index_status(repo_root)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **payload})
+            elif route == "/api/routes":
+                try:
+                    payload = route_summary(repo_root)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **payload})
+            elif route == "/api/http-confidence":
+                try:
+                    payload = http_confidence_summary(repo_root)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **payload})
+            elif route == "/api/rules":
+                try:
+                    payload = cached_workflow(
+                        repo_root,
+                        "rules",
+                        {"limit": 100, "severity": ""},
+                        lambda: run_rule_checks(repo_root, limit=100),
+                    )
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **payload})
+            elif route == "/api/source-outline":
+                try:
+                    query = parse_qs(parsed.query).get("query", [""])[0]
+                    payload = cached_workflow(
+                        repo_root,
+                        "source-outline",
+                        {"query": query, "limit": 80},
+                        lambda: source_outline(repo_root, query, limit=80),
+                    )
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **payload})
             else:
                 self.send_error(404)
 
@@ -527,6 +716,203 @@ def create_visualization_server(
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
                     return
                 self._send_json({"ok": True, **graph})
+                return
+
+            if parsed.path == "/api/compare/warm":
+                try:
+                    payload = self._read_json()
+                    refs_payload = payload.get("refs", [])
+                    refs = [str(ref) for ref in refs_payload] if isinstance(refs_payload, list) else []
+                    result = service.warm_compare_cache(repo_root, refs)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/agent-context":
+                try:
+                    payload = self._read_json()
+                    task = str(payload.get("task", ""))
+                    max_tokens = int(payload.get("max_tokens", 5000))
+                    result = service.agent_context(repo_root, task, max_tokens=max_tokens)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/index-status":
+                try:
+                    result = index_status(repo_root)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/classification":
+                try:
+                    payload = self._read_json()
+                    package_name = str(payload.get("package", ""))
+                    category = str(payload.get("category", ""))
+                    previous = load_project_config(repo_root).public_payload()["classification"]
+                    updated = update_classification_config(repo_root, package_name, category)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json(
+                    {
+                        "ok": True,
+                        "config": updated.public_payload(),
+                        "previous_classification": previous,
+                        "build": {
+                            "ui_version": UI_VERSION,
+                            "server_started_at": SERVER_STARTED_AT,
+                            "config_fingerprint": updated.fingerprint,
+                            "config_path": str(updated.path) if updated.path else "",
+                            **source_freshness(),
+                        },
+                    }
+                )
+                return
+
+            if parsed.path == "/api/classification/restore":
+                try:
+                    payload = self._read_json()
+                    classification = payload.get("classification")
+                    if not isinstance(classification, dict):
+                        raise ValueError("classification payload is required")
+                    updated = restore_classification_config(repo_root, classification)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json(
+                    {
+                        "ok": True,
+                        "config": updated.public_payload(),
+                        "build": {
+                            "ui_version": UI_VERSION,
+                            "server_started_at": SERVER_STARTED_AT,
+                            "config_fingerprint": updated.fingerprint,
+                            "config_path": str(updated.path) if updated.path else "",
+                            **source_freshness(),
+                        },
+                    }
+                )
+                return
+
+            if parsed.path == "/api/query":
+                try:
+                    payload = self._read_json()
+                    expression = str(payload.get("query", ""))
+                    limit = int(payload.get("limit", 25))
+                    result = structural_query(repo_root, expression, limit=limit)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/dead-code":
+                try:
+                    payload = self._read_json()
+                    limit = int(payload.get("limit", 50))
+                    result = dead_code(repo_root, limit=limit)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/routes":
+                try:
+                    result = route_summary(repo_root)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/http-confidence":
+                try:
+                    result = http_confidence_summary(repo_root)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/context-pack":
+                try:
+                    payload = self._read_json()
+                    task = str(payload.get("task", ""))
+                    max_tokens = int(payload.get("max_tokens", 6000))
+                    output_format = str(payload.get("format", "markdown"))
+                    result = cached_workflow(
+                        repo_root,
+                        "context-pack",
+                        {"task": task, "max_tokens": max_tokens, "format": output_format},
+                        lambda: context_pack(repo_root, task, max_tokens=max_tokens),
+                    )
+                    pack_cache = result.pop("cache", None)
+                    rendered = render_context_pack(result, output_format=output_format)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, "pack": result, "rendered": rendered, "format": output_format, "cache": pack_cache})
+                return
+
+            if parsed.path == "/api/verify-plan":
+                try:
+                    payload = self._read_json()
+                    base_ref = str(payload.get("base_ref", "HEAD"))
+                    task = str(payload.get("task", ""))
+                    result = cached_workflow(
+                        repo_root,
+                        "verify-plan",
+                        {"base_ref": base_ref, "task": task},
+                        lambda: verification_plan(repo_root, base_ref=base_ref, task=task),
+                    )
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/rules":
+                try:
+                    payload = self._read_json()
+                    limit = int(payload.get("limit", 100))
+                    severity = payload.get("severity")
+                    severity_text = str(severity) if severity else ""
+                    result = cached_workflow(
+                        repo_root,
+                        "rules",
+                        {"limit": limit, "severity": severity_text},
+                        lambda: run_rule_checks(repo_root, limit=limit, severity=severity_text or None),
+                    )
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/source-outline":
+                try:
+                    payload = self._read_json()
+                    query = str(payload.get("query", ""))
+                    limit = int(payload.get("limit", 80))
+                    result = cached_workflow(
+                        repo_root,
+                        "source-outline",
+                        {"query": query, "limit": limit},
+                        lambda: source_outline(repo_root, query, limit=limit),
+                    )
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
                 return
 
             if parsed.path != "/api/chat":
@@ -577,7 +963,10 @@ def find_available_port(host: str, preferred: int) -> int:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind((host, port))
-            except OSError:
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EPERM}:
+                    msg = f"Cannot bind local visualization server on {host}:{port}: permission denied."
+                    raise RuntimeError(msg) from exc
                 continue
             return port
     msg = f"No free port found near {preferred} on {host}."
@@ -723,6 +1112,70 @@ def build_chat_answer(
 
     lines.append("")
     lines.append("Use the code snippets and evidence below for exact inspection.")
+    return "\n".join(lines)
+
+
+def build_agent_context_markdown(payload: dict[str, Any]) -> str:
+    code = payload.get("code") or []
+    evidence = payload.get("evidence") or []
+    ownership = payload.get("ownership") or []
+    token_report = payload.get("token_report") or {}
+    lines = [
+        "# CodeAtlas Agent Context",
+        "",
+        f"Task: {payload.get('task', '')}",
+        "",
+        "## Likely Edit/Inspection Files",
+    ]
+    if code:
+        for item in code[:8]:
+            lines.append(
+                f"- {item.get('file_path')}:{item.get('lines')} "
+                f"- {item.get('symbol')} ({item.get('reason')})"
+            )
+    else:
+        lines.append("- No matching indexed code snippets were found.")
+    lines.extend(["", "## Context Snippets"])
+    for item in code[:5]:
+        language = "python" if item.get("file_path", "").endswith(".py") else ""
+        lines.extend(
+            [
+                f"### {item.get('symbol')} - {item.get('file_path')}:{item.get('lines')}",
+                f"```{language}",
+                str(item.get("code") or ""),
+                "```",
+            ]
+        )
+    lines.extend(["", "## Evidence"])
+    if evidence:
+        for item in evidence[:8]:
+            source = item.get("path") or str(item.get("source_id") or "")[:12]
+            lines.append(f"- {item.get('source_type', 'evidence')} {source}: {item.get('title', '')}")
+    else:
+        lines.append("- No repository-memory evidence matched this task.")
+    lines.extend(["", "## Likely Owners"])
+    if ownership:
+        for owner in ownership[:5]:
+            lines.append(
+                f"- {owner.get('developer', 'Unknown')}: "
+                f"{owner.get('commits', 0)} commits, {owner.get('files_touched', 0)} files"
+            )
+    else:
+        lines.append("- No ownership signal found.")
+    lines.extend(
+        [
+            "",
+            "## Verification Hints",
+            "- Run the most focused tests for the files above.",
+            "- Inspect direct callers/callees before editing shared functions.",
+            "- Re-run `codeatlas context` or refresh the map after large edits.",
+            "",
+            "## Token Report",
+            f"- Optimized context: {token_report.get('optimized_tokens', 0)} tokens",
+            f"- Baseline estimate: {token_report.get('baseline_tokens', 0)} tokens",
+            f"- Estimated savings: {token_report.get('savings_percent', 0):.0f}%",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -912,6 +1365,175 @@ def external_node(label: str) -> dict[str, Any]:
     return node
 
 
+def compact_file_inventory(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items = []
+    for row in files:
+        path = str(row.get("path") or "")
+        items.append(
+            {
+                "path": path,
+                "component": component_for_path(path),
+                "language": str(row.get("language") or ""),
+                "lines": int(row.get("line_count") or 0),
+                "size_bytes": int(row.get("size_bytes") or 0),
+            }
+        )
+    return sorted(items, key=lambda item: item["path"])
+
+
+def compact_symbol_inventory(symbols: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items = []
+    for row in symbols:
+        file_path = str(row.get("file_path") or "")
+        items.append(
+            {
+                "name": str(row.get("name") or ""),
+                "qualified_name": str(row.get("qualified_name") or ""),
+                "kind": str(row.get("kind") or ""),
+                "module": str(row.get("module") or ""),
+                "file_path": file_path,
+                "component": component_for_path(file_path),
+                "line_start": int(row.get("line_start") or 0),
+                "line_end": int(row.get("line_end") or 0),
+                "signature": str(row.get("signature") or ""),
+            }
+        )
+    return sorted(items, key=lambda item: (item["qualified_name"], item["file_path"]))
+
+
+def compact_commit_inventory(commit_rows: list[Any]) -> list[dict[str, Any]]:
+    items = []
+    for row in commit_rows:
+        metadata = parse_json(row["metadata_json"])
+        files = metadata_files(row)
+        sha = str(row["source_id"])
+        items.append(
+            {
+                "sha": sha,
+                "short_sha": sha[:12],
+                "title": str(row["title"]),
+                "author": str(row["author"] or "Unknown"),
+                "timestamp": str(row["timestamp"] or ""),
+                "files": len(files),
+                "risk": str(metadata.get("risk", "low")),
+                "architectural_impact": str(metadata.get("architectural_impact", "low")),
+                "snippet": str(row["snippet"] or ""),
+            }
+        )
+    return items
+
+
+def compact_index_diagnostics(
+    files: list[dict[str, Any]],
+    symbols: list[dict[str, Any]],
+    code_edges: list[dict[str, Any]],
+    stats: dict[str, Any],
+    *,
+    supported_languages: Any,
+    index_report: Any,
+) -> dict[str, Any]:
+    language_counts: dict[str, int] = {}
+    for row in files:
+        language = str(row.get("language") or "unknown")
+        language_counts[language] = language_counts.get(language, 0) + 1
+    symbol_files = {str(row.get("file_path") or "") for row in symbols}
+    files_without_symbols = [
+        str(row.get("path") or "")
+        for row in files
+        if str(row.get("path") or "") not in symbol_files
+    ]
+    unresolved_calls = [
+        row
+        for row in code_edges
+        if str(row.get("edge_type") or "").upper() == "CALLS" and row.get("target_path") is None
+    ]
+    external_dependencies = {
+        str(row.get("target_label") or row.get("target_key") or "")
+        for row in code_edges
+        if row.get("target_path") is None
+    }
+    report = index_report if isinstance(index_report, dict) else {}
+    parser_errors = report.get("parser_errors") if isinstance(report.get("parser_errors"), list) else []
+    files_skipped = int(report.get("files_skipped") or 0)
+    last_indexed = str(stats.get("last_indexed_at") or "")
+    stale = False
+    if last_indexed:
+        try:
+            indexed_at = datetime.fromisoformat(last_indexed.replace("Z", "+00:00"))
+            stale = (datetime.now(UTC) - indexed_at).total_seconds() > 60 * 60 * 24
+        except ValueError:
+            stale = False
+    edge_count = int(stats.get("component_edges") or 0)
+    node_count = int(stats.get("components") or 0)
+    suggestions = []
+    if files_without_symbols:
+        suggestions.append(
+            f"{len(files_without_symbols)} indexed file(s) have no parsed symbols; check parser coverage or generated/config files."
+        )
+    if unresolved_calls:
+        suggestions.append(
+            f"{len(unresolved_calls)} call edge(s) resolve to external or unknown targets; use evidence cards before relying on them."
+        )
+    if parser_errors:
+        suggestions.append(f"{len(parser_errors)} parser error(s) were recorded during the last index.")
+    if files_skipped:
+        suggestions.append(f"{files_skipped} file(s) were skipped in the last incremental index.")
+    if stale:
+        suggestions.append("Index is older than 24 hours; refresh before making risky changes.")
+    if node_count > 180 or edge_count > 280:
+        suggestions.append("Large graph detected; use Overview, Trace, or API/Data lenses for progressive disclosure.")
+    if not suggestions:
+        suggestions.append("Index health looks good for the currently supported languages.")
+    return {
+        "supported_languages": [str(language) for language in supported_languages or []],
+        "language_counts": dict(sorted(language_counts.items())),
+        "files_without_symbols": len(files_without_symbols),
+        "sample_files_without_symbols": files_without_symbols[:8],
+        "files_skipped": files_skipped,
+        "parser_errors": len(parser_errors),
+        "sample_parser_errors": parser_errors[:5],
+        "unresolved_calls": len(unresolved_calls),
+        "external_dependencies": len([value for value in external_dependencies if value]),
+        "sample_external_dependencies": sorted(value for value in external_dependencies if value)[:8],
+        "last_indexed_at": last_indexed,
+        "stale": stale,
+        "symbols_per_file": round(len(symbols) / len(files), 2) if files else 0,
+        "graph_density": round(edge_count / max(node_count, 1), 2),
+        "suggestions": suggestions,
+    }
+
+
+def compare_snapshot_path(repo_root: Path, sha: str) -> Path:
+    return CodeAtlasPaths(repo_root).cache_dir / "compare" / f"{sha}.json"
+
+
+def load_compare_snapshot(repo_root: Path, sha: str) -> dict[str, Any] | None:
+    path = compare_snapshot_path(repo_root, sha)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != COMPARE_CACHE_VERSION:
+        return None
+    if payload.get("sha") != sha:
+        return None
+    if "component_graph" not in payload or "stats" not in payload:
+        return None
+    return payload
+
+
+def write_compare_snapshot(repo_root: Path, sha: str, payload: dict[str, Any]) -> None:
+    path = compare_snapshot_path(repo_root, sha)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    temp_path.replace(path)
+
+
 def component_from_edge_path(path: Any, label: Any) -> str | None:
     if path:
         return component_for_path(str(path))
@@ -931,1516 +1553,15 @@ def component_risk(node: dict[str, Any]) -> str:
     return "low"
 
 
-HTML_APP = r"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>CodeAtlas Map</title>
-  <style>
-    :root {
-      --bg: #0f1115;
-      --panel: #171a21;
-      --panel2: #20242d;
-      --text: #eef1f5;
-      --muted: #9ba7b6;
-      --line: #343a46;
-      --blue: #77a7ff;
-      --green: #71d49b;
-      --amber: #e4b363;
-      --red: #ef7b7b;
-      --violet: #b69cff;
-      --soft-red: rgba(239, 123, 123, .16);
-    }
-    * { box-sizing: border-box; }
-    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { overflow: hidden; }
-    #app { display: grid; grid-template-columns: 280px minmax(0, 1fr) 330px; grid-template-rows: 54px 1fr; height: 100%; }
-    header { grid-column: 1 / 4; display: flex; align-items: center; gap: 12px; padding: 0 14px; border-bottom: 1px solid var(--line); background: #12151b; }
-    h1 { margin: 0; font-size: 16px; font-weight: 650; }
-    .meta { color: var(--muted); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .toolbar { margin-left: auto; display: flex; align-items: center; gap: 8px; }
-    button, input, select, textarea { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; }
-    input, select { height: 34px; padding: 0 10px; }
-    textarea { width: 100%; min-height: 72px; padding: 8px 10px; resize: vertical; font: inherit; }
-    button { cursor: pointer; }
-    .icon-btn { width: 34px; height: 34px; padding: 0; font-size: 18px; line-height: 1; }
-    button.active { border-color: var(--blue); color: white; background: #23304a; }
-    input, select { width: 220px; outline: none; }
-    .compare-picker { display: none; align-items: center; gap: 6px; min-width: 0; }
-    .compare-picker.active { display: flex; }
-    .compare-picker select { width: clamp(130px, 16vw, 230px); }
-    .compare-picker button { height: 34px; }
-    main { position: relative; min-width: 0; min-height: 0; }
-    canvas { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
-    canvas.panning { cursor: grabbing; }
-    aside { background: var(--panel); overflow: auto; padding: 14px; }
-    .filter-panel { border-right: 1px solid var(--line); }
-    .detail-panel { border-left: 1px solid var(--line); }
-    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
-    .stat { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
-    .stat span { display: block; color: var(--muted); font-size: 11px; }
-    .stat strong { font-size: 18px; }
-    .section-title { margin: 16px 0 8px; color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: .08em; }
-    .pill { display: inline-flex; border: 1px solid var(--line); background: var(--panel2); border-radius: 999px; padding: 3px 8px; margin: 0 5px 5px 0; color: var(--muted); font-size: 12px; cursor: pointer; }
-    .details { color: var(--muted); }
-    .detail-stack { display: grid; gap: 8px; }
-    .detail-card { border: 1px solid var(--line); background: #151922; border-radius: 6px; overflow: hidden; }
-    .detail-card summary { cursor: pointer; padding: 8px 10px; color: var(--text); font-weight: 700; }
-    .detail-card[open] summary { color: var(--blue); }
-    .detail-body { border-top: 1px solid var(--line); padding: 8px 10px 10px; }
-    .detail-lines { white-space: pre-wrap; }
-    .detail-nested { margin-top: 8px; background: rgba(32, 36, 45, .55); }
-    .detail-nested summary { color: var(--amber); font-size: 12px; }
-    .detail-empty { color: var(--muted); font-size: 12px; }
-    .details .detail-key { color: var(--blue); font-weight: 650; }
-    .details .detail-section { color: var(--text); font-weight: 700; }
-    .details .detail-edge { color: var(--amber); font-weight: 650; }
-    .details .detail-call { color: var(--green); }
-    .details .detail-signature { color: var(--violet); }
-    .details .detail-path { color: #8fc7ff; }
-    .details .detail-change { color: var(--red); }
-    .details .detail-value { color: var(--text); }
-    .chat-box { display: grid; gap: 8px; }
-    .chat-actions { display: flex; gap: 8px; align-items: center; }
-    .chat-actions button { flex: 0 0 auto; }
-    .chat-status { color: var(--muted); font-size: 12px; }
-    .chat-answer { white-space: pre-wrap; color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 10px; min-height: 72px; }
-    .chat-section { margin-top: 8px; }
-    .chat-item { border: 1px solid var(--line); background: #151922; border-radius: 6px; padding: 8px; margin-top: 6px; color: var(--muted); font-size: 12px; }
-    .chat-item strong { color: var(--text); font-size: 13px; }
-    .filter-tools { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0; }
-    .filter-tools button { width: 100%; }
-    .filter-toggle { display: flex; align-items: center; gap: 8px; color: var(--text); margin: 8px 0 10px; }
-    .filter-toggle input, .filter-row input { width: 16px; height: 16px; accent-color: var(--blue); }
-    .filter-search { width: 100%; margin-bottom: 4px; }
-    .compare-controls { display: grid; gap: 8px; margin-top: 10px; }
-    .compare-controls input { width: 100%; }
-    .compare-controls button { width: 100%; }
-    .compare-status { color: var(--muted); font-size: 12px; min-height: 18px; }
-    .filter-summary { color: var(--muted); font-size: 12px; margin-top: 4px; }
-    .filter-list { display: grid; gap: 4px; margin-top: 8px; }
-    .filter-row { display: grid; grid-template-columns: 18px 10px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 30px; color: var(--text); }
-    .filter-row.disabled { opacity: .45; }
-    .filter-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .filter-kind { color: var(--muted); font-size: 11px; }
-    .swatch { width: 9px; height: 9px; border-radius: 50%; }
-    .legend { position: absolute; left: 14px; bottom: 14px; display: flex; gap: 8px; flex-wrap: wrap; max-width: calc(100% - 28px); }
-    .legend span { background: rgba(23, 26, 33, .9); border: 1px solid var(--line); border-radius: 999px; padding: 5px 8px; color: var(--muted); font-size: 12px; }
-    .error-text { color: var(--red); }
-    @media (max-width: 860px) {
-      #app { grid-template-columns: 1fr; grid-template-rows: 54px 220px minmax(0, 1fr) 280px; }
-      header, aside, main { grid-column: 1; }
-      .filter-panel, .detail-panel { border-left: 0; border-right: 0; border-top: 1px solid var(--line); }
-      input, select { width: 140px; }
-      .compare-picker select { width: 120px; }
-    }
-  </style>
-</head>
-<body>
-  <div id="app">
-    <header>
-      <h1>CodeAtlas Map</h1>
-      <div id="repoMeta" class="meta">Loading repository graph...</div>
-      <div class="toolbar">
-        <button id="refreshBtn">Refresh</button>
-        <button id="architectureBtn" class="active">Architecture</button>
-        <button id="commitsBtn">Commits</button>
-        <button id="compareViewBtn">Compare</button>
-        <div id="topCompareControls" class="compare-picker">
-          <select id="baseCommitSelect" aria-label="Base commit"></select>
-          <select id="headCommitSelect" aria-label="Head commit"></select>
-          <button id="runTopCompareBtn">Compare</button>
-        </div>
-        <button id="zoomOutBtn" class="icon-btn" title="Zoom out" aria-label="Zoom out">-</button>
-        <button id="zoomInBtn" class="icon-btn" title="Zoom in" aria-label="Zoom in">+</button>
-        <input id="searchInput" placeholder="Filter nodes">
-      </div>
-    </header>
-    <aside class="filter-panel">
-      <div class="section-title">Filters</div>
-      <label class="filter-toggle">
-        <input id="showCommonInput" type="checkbox">
-        <span>Common</span>
-      </label>
-      <div class="filter-tools">
-        <button id="showAllBtn">All</button>
-        <button id="hideAllBtn">None</button>
-      </div>
-      <div class="section-title">Compare</div>
-      <div class="compare-controls">
-        <input id="baseRefInput" value="HEAD~1" aria-label="Base commit">
-        <input id="headRefInput" value="HEAD" aria-label="Head commit">
-        <button id="runCompareBtn">Compare</button>
-        <div id="compareStatus" class="compare-status"></div>
-      </div>
-      <input id="componentFilterInput" class="filter-search" placeholder="Find component">
-      <div id="filterSummary" class="filter-summary">0 of 0 visible</div>
-      <div class="section-title">Components</div>
-      <div id="componentFilters" class="filter-list"></div>
-    </aside>
-    <main>
-      <canvas id="graphCanvas"></canvas>
-      <div class="legend">
-        <span>Blue: component</span>
-        <span>Green: developer</span>
-        <span>Amber: commit</span>
-        <span>Violet: external</span>
-        <span>Red: changed</span>
-        <span>Node and edge details</span>
-      </div>
-    </main>
-    <aside class="detail-panel">
-      <div class="stats" id="stats"></div>
-      <div class="section-title">Selection</div>
-      <h2 id="selectionTitle">Nothing selected</h2>
-      <div id="selectionMeta" class="details"></div>
-      <div class="section-title">Ask</div>
-      <div class="chat-box">
-        <textarea id="chatQuestion" placeholder="Ask about code or commits"></textarea>
-        <div class="chat-actions">
-          <button id="askBtn">Ask</button>
-          <span id="chatStatus" class="chat-status"></span>
-        </div>
-        <div id="chatAnswer" class="chat-answer"></div>
-        <div id="chatSources" class="chat-section"></div>
-      </div>
-      <div class="section-title">Top Connections</div>
-      <div id="topEdges"></div>
-    </aside>
-  </div>
-  <script>
-    const canvas = document.getElementById('graphCanvas');
-    const ctx = canvas.getContext('2d');
-    const COMMON_NODE_IDS = new Set([
-      '.gitignore', '__init__.py', 'abc', 'ast', 'collections', 'dataclasses',
-      'datetime', 'dateutil', 'docs', 'enum', 'hashlib', 'http', 'json', 'mcp',
-      'networkx', 'operator', 'os', 'pathlib', 'pyproject.toml', 're', 'readme.md',
-      'rich', 'shutil', 'socket', 'sqlite3', 'subprocess', 'tempfile', 'textwrap', 'threading',
-      'time', 'tree_sitter', 'tree_sitter_language_pack', 'typer', 'typing',
-      'unittest', 'urllib', 'watchdog', 'webbrowser'
-    ]);
-    const state = {
-      raw: null,
-      view: 'architecture',
-      compare: null,
-      commitOptions: [],
-      zoom: 1,
-      panX: 0,
-      panY: 0,
-      isPanning: false,
-      panStartX: 0,
-      panStartY: 0,
-      panBaseX: 0,
-      panBaseY: 0,
-      suppressClick: false,
-      allNodes: [],
-      allEdges: [],
-      nodes: [],
-      edges: [],
-      selected: null,
-      search: '',
-      componentFilter: '',
-      hiddenNodeIds: new Set(),
-      showCommon: false
-    };
+def load_visualization_asset(name: str) -> str:
+    return (ASSET_DIR / name).read_text(encoding="utf-8")
 
-    function setActiveViewButton() {
-      document.getElementById('architectureBtn').classList.toggle('active', state.view === 'architecture');
-      document.getElementById('commitsBtn').classList.toggle('active', state.view === 'commits');
-      document.getElementById('compareViewBtn').classList.toggle('active', state.view === 'compare');
-      document.getElementById('topCompareControls').classList.toggle('active', state.view === 'compare');
-    }
 
-    loadGraph();
+def render_visualization_app() -> str:
+    css = load_visualization_asset("visualization.css").rstrip()
+    js = load_visualization_asset("visualization.js").replace("{{ UI_VERSION }}", UI_VERSION).rstrip()
+    template = load_visualization_asset("visualization.html")
+    return template.replace("{{ CODEATLAS_CSS }}", css).replace("{{ CODEATLAS_JS }}", js)
 
-    document.getElementById('refreshBtn').onclick = () => refreshGraph();
-    document.getElementById('architectureBtn').onclick = () => setGraph('architecture');
-    document.getElementById('commitsBtn').onclick = () => setGraph('commits');
-    document.getElementById('compareViewBtn').onclick = () => setGraph('compare');
-    document.getElementById('runCompareBtn').onclick = () => runCompare();
-    document.getElementById('runTopCompareBtn').onclick = () => runCompare();
-    document.getElementById('baseCommitSelect').onchange = event => syncCommitSelectToInput(event.target, 'baseRefInput');
-    document.getElementById('headCommitSelect').onchange = event => syncCommitSelectToInput(event.target, 'headRefInput');
-    document.getElementById('askBtn').onclick = () => askQuestion();
-    document.getElementById('chatQuestion').addEventListener('keydown', event => {
-      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') askQuestion();
-    });
-    document.getElementById('zoomOutBtn').onclick = () => setZoom(state.zoom / 1.2);
-    document.getElementById('zoomInBtn').onclick = () => setZoom(state.zoom * 1.2);
-    canvas.addEventListener('wheel', handleGraphWheel, { passive: false });
-    canvas.addEventListener('gesturestart', handleGraphGestureStart, { passive: false });
-    canvas.addEventListener('gesturechange', handleGraphGestureChange, { passive: false });
-    canvas.addEventListener('pointerdown', handleGraphPointerDown);
-    window.addEventListener('pointermove', handleGraphPointerMove);
-    window.addEventListener('pointerup', handleGraphPointerEnd);
-    window.addEventListener('pointercancel', handleGraphPointerEnd);
-    document.getElementById('searchInput').oninput = event => {
-      state.search = event.target.value.toLowerCase();
-    };
-    document.getElementById('showCommonInput').onchange = event => {
-      state.showCommon = event.target.checked;
-      applyFilters();
-      renderFilterControls();
-    };
-    document.getElementById('componentFilterInput').oninput = event => {
-      state.componentFilter = event.target.value.toLowerCase();
-      renderFilterControls();
-    };
-    document.getElementById('showAllBtn').onclick = () => {
-      state.hiddenNodeIds.clear();
-      applyFilters();
-      renderFilterControls();
-    };
-    document.getElementById('hideAllBtn').onclick = () => {
-      for (const node of state.allNodes) {
-        if (!isCommonNode(node)) state.hiddenNodeIds.add(node.id);
-      }
-      applyFilters();
-      renderFilterControls();
-    };
-    canvas.addEventListener('click', event => {
-      if (state.suppressClick) {
-        state.suppressClick = false;
-        return;
-      }
-      if (!state.nodes.length) {
-        state.selected = null;
-        renderSelection(null);
-        return;
-      }
-      const rect = canvas.getBoundingClientRect();
-      const x = event.clientX - rect.left;
-      const y = event.clientY - rect.top;
-      if (state.view === 'compare' && state.compare) {
-        handleCompareClick(x, y);
-        return;
-      }
-      const transform = graphTransform();
-      const nodesById = new Map(state.nodes.map(node => [node.id, node]));
-      let bestNode = null;
-      let bestNodeDist = Infinity;
-      for (const node of state.nodes) {
-        const p = project(node, transform);
-        const dx = p.x - x;
-        const dy = p.y - y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < p.r + 8 && dist < bestNodeDist) {
-          bestNode = node;
-          bestNodeDist = dist;
-        }
-      }
-      if (bestNode) {
-        state.selected = { kind: 'node', node: bestNode };
-        renderSelection(state.selected);
-        return;
-      }
-      let bestEdge = null;
-      let bestEdgeDist = Infinity;
-      for (const edge of state.edges) {
-        const a = nodesById.get(edge.source);
-        const b = nodesById.get(edge.target);
-        if (!a || !b) continue;
-        const pa = project(a, transform);
-        const pb = project(b, transform);
-        const dist = distanceToSegment(x, y, pa.x, pa.y, pb.x, pb.y);
-        if (dist < 11 && dist < bestEdgeDist) {
-          bestEdge = edge;
-          bestEdgeDist = dist;
-        }
-      }
-      state.selected = bestEdge ? { kind: 'edge', edge: bestEdge } : null;
-      renderSelection(state.selected);
-    });
 
-    function handleCompareClick(x, y) {
-      const rects = compareRects(canvas.clientWidth, canvas.clientHeight);
-      const baseHit = hitGraphPanel(x, y, state.compare.base, rects.base, 'base');
-      const headHit = hitGraphPanel(x, y, state.compare.head, rects.head, 'head');
-      const hits = [baseHit, headHit].filter(Boolean).sort((a, b) => a.distance - b.distance);
-      state.selected = hits.length ? hits[0].selection : null;
-      renderSelection(state.selected);
-    }
-
-    function hitGraphPanel(x, y, side, rect, sideName) {
-      if (x < rect.x || x > rect.x + rect.w || y < rect.y || y > rect.y + rect.h) return null;
-      if (!side.nodes.length) return null;
-      const transform = graphTransformFor(side.nodes, rect);
-      const nodesById = new Map(side.nodes.map(node => [node.id, node]));
-      let bestNode = null;
-      let bestNodeDist = Infinity;
-      for (const node of side.nodes) {
-        const p = projectInRect(node, transform, rect);
-        const dist = Math.hypot(p.x - x, p.y - y);
-        if (dist < p.r + 8 && dist < bestNodeDist) {
-          bestNode = node;
-          bestNodeDist = dist;
-        }
-      }
-      if (bestNode) {
-        return { distance: bestNodeDist, selection: { kind: 'node', node: bestNode, side: sideName } };
-      }
-      let bestEdge = null;
-      let bestEdgeDist = Infinity;
-      for (const edge of side.edges) {
-        const a = nodesById.get(edge.source);
-        const b = nodesById.get(edge.target);
-        if (!a || !b) continue;
-        const pa = projectInRect(a, transform, rect);
-        const pb = projectInRect(b, transform, rect);
-        const dist = distanceToSegment(x, y, pa.x, pa.y, pb.x, pb.y);
-        if (dist < 11 && dist < bestEdgeDist) {
-          bestEdge = edge;
-          bestEdgeDist = dist;
-        }
-      }
-      return bestEdge
-        ? { distance: bestEdgeDist, selection: { kind: 'edge', edge: bestEdge, side: sideName } }
-        : null;
-    }
-
-    function loadGraph() {
-      fetch('/api/graph')
-        .then(r => r.json())
-        .then(data => {
-          applyGraphPayload(data, 'architecture');
-          requestAnimationFrame(tick);
-        })
-        .catch(err => {
-          document.getElementById('repoMeta').textContent = 'Failed to load graph: ' + err.message;
-        });
-    }
-
-    function refreshGraph() {
-      const button = document.getElementById('refreshBtn');
-      const previousText = button.textContent;
-      const nextView = state.view === 'commits' ? 'commits' : 'architecture';
-      button.disabled = true;
-      button.textContent = 'Refreshing...';
-      setRepoStatus('Refreshing index and graph...');
-      fetch('/api/refresh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ max_commits: 1000 })
-      })
-        .then(async response => {
-          const payload = await response.json();
-          if (!response.ok || !payload.ok) throw new Error(payload.error || 'Refresh failed');
-          return payload;
-        })
-        .then(payload => {
-          state.compare = null;
-          document.getElementById('compareStatus').textContent = '';
-          applyGraphPayload(payload, nextView);
-        })
-        .catch(err => {
-          setRepoStatus('Refresh failed: ' + err.message);
-        })
-        .finally(() => {
-          button.disabled = false;
-          button.textContent = previousText;
-        });
-    }
-
-    function applyGraphPayload(payload, view) {
-      state.raw = payload;
-      populateCommitSelectors(payload);
-      setRepoStatus(payload.repo.name + ' - ' + payload.repo.path);
-      renderStats(payload.stats);
-      setGraph(view || state.view || 'architecture');
-    }
-
-    function setRepoStatus(text) {
-      document.getElementById('repoMeta').textContent = text;
-    }
-
-    function populateCommitSelectors(payload) {
-      const commits = commitOptionsFromPayload(payload);
-      state.commitOptions = commits;
-      const baseSelect = document.getElementById('baseCommitSelect');
-      const headSelect = document.getElementById('headCommitSelect');
-      fillCommitSelect(baseSelect, commits);
-      fillCommitSelect(headSelect, commits);
-
-      const baseInput = document.getElementById('baseRefInput');
-      const headInput = document.getElementById('headRefInput');
-      const defaultBase = commits[1] ? commits[1].ref : commits[0] ? commits[0].ref : 'HEAD~1';
-      const defaultHead = commits[0] ? commits[0].ref : 'HEAD';
-      baseSelect.value = matchingCommitRef(baseInput.value, commits) || defaultBase;
-      headSelect.value = matchingCommitRef(headInput.value, commits) || defaultHead;
-      syncCommitSelectToInput(baseSelect, 'baseRefInput');
-      syncCommitSelectToInput(headSelect, 'headRefInput');
-    }
-
-    function commitOptionsFromPayload(payload) {
-      return (payload.commit_graph.nodes || [])
-        .filter(node => node.type === 'commit')
-        .map(node => ({
-          ref: node.id.replace(/^commit:/, ''),
-          title: node.label || 'Untitled commit',
-          timestamp: node.timestamp || '',
-          files: node.metrics ? node.metrics.files || 0 : 0
-        }))
-        .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
-    }
-
-    function fillCommitSelect(select, commits) {
-      select.innerHTML = '';
-      for (const commit of commits) {
-        const option = document.createElement('option');
-        option.value = commit.ref;
-        option.textContent = commitOptionLabel(commit);
-        select.appendChild(option);
-      }
-      select.disabled = commits.length === 0;
-    }
-
-    function commitOptionLabel(commit) {
-      const date = commit.timestamp ? commit.timestamp.slice(0, 10) + ' ' : '';
-      return date + commit.ref + ' ' + truncateText(commit.title, 54);
-    }
-
-    function matchingCommitRef(value, commits) {
-      const clean = String(value || '').trim();
-      if (!clean) return '';
-      const match = commits.find(commit => clean === commit.ref || clean.startsWith(commit.ref) || commit.ref.startsWith(clean));
-      return match ? match.ref : '';
-    }
-
-    function syncCommitSelectToInput(select, inputId) {
-      const input = document.getElementById(inputId);
-      if (!select.disabled && select.value) input.value = select.value;
-    }
-
-    function truncateText(value, length) {
-      const text = String(value || '');
-      return text.length > length ? text.slice(0, length - 1) + '...' : text;
-    }
-
-    function runCompare() {
-      const base = document.getElementById('baseRefInput').value.trim() || 'HEAD~1';
-      const head = document.getElementById('headRefInput').value.trim() || 'HEAD';
-      const status = document.getElementById('compareStatus');
-      status.textContent = 'Building snapshots...';
-      status.classList.remove('error-text');
-      fetch('/api/compare?base=' + encodeURIComponent(base) + '&head=' + encodeURIComponent(head))
-        .then(async response => {
-          const payload = await response.json();
-          if (!response.ok) throw new Error(payload.error || 'Compare failed');
-          return payload;
-        })
-        .then(payload => {
-          state.compare = normalizeComparePayload(payload);
-          status.textContent = compareSummaryText(payload.summary);
-          setGraph('compare');
-        })
-        .catch(err => {
-          status.textContent = err.message;
-          status.classList.add('error-text');
-        });
-    }
-
-    function askQuestion() {
-      const question = document.getElementById('chatQuestion').value.trim();
-      const status = document.getElementById('chatStatus');
-      const answerRoot = document.getElementById('chatAnswer');
-      const sourcesRoot = document.getElementById('chatSources');
-      if (!question) return;
-      status.textContent = 'Thinking...';
-      status.classList.remove('error-text');
-      answerRoot.textContent = '';
-      sourcesRoot.innerHTML = '';
-      fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, max_tokens: 3000 })
-      })
-        .then(async response => {
-          const payload = await response.json();
-          if (!response.ok || !payload.ok) throw new Error(payload.error || 'Ask failed');
-          return payload;
-        })
-        .then(payload => {
-          status.textContent = payload.estimated_context_tokens + ' context tokens';
-          answerRoot.textContent = payload.answer;
-          renderChatSources(payload);
-        })
-        .catch(err => {
-          status.textContent = err.message;
-          status.classList.add('error-text');
-        });
-    }
-
-    function renderChatSources(payload) {
-      const root = document.getElementById('chatSources');
-      root.innerHTML = '';
-      appendChatGroup(root, 'Code', payload.code || [], item =>
-        '<strong>' + escapeHtml(item.symbol) + '</strong><br>' +
-        escapeHtml(item.file_path + ':' + item.lines + ' - ' + item.reason)
-      );
-      appendChatGroup(root, 'Commits / Docs', payload.evidence || [], item =>
-        '<strong>' + escapeHtml(item.title || item.source_id || 'Evidence') + '</strong><br>' +
-        escapeHtml((item.source_type || 'evidence') + ' ' + (item.path || item.source_id || '')) + '<br>' +
-        escapeHtml(item.snippet || '')
-      );
-      appendChatGroup(root, 'Owners', payload.ownership || [], item =>
-        '<strong>' + escapeHtml(item.developer || 'Unknown') + '</strong><br>' +
-        escapeHtml((item.commits || 0) + ' commits, ' + (item.files_touched || 0) + ' files')
-      );
-    }
-
-    function appendChatGroup(root, title, items, renderItem) {
-      if (!items.length) return;
-      const label = document.createElement('div');
-      label.className = 'section-title';
-      label.textContent = title;
-      root.appendChild(label);
-      for (const item of items.slice(0, 5)) {
-        const div = document.createElement('div');
-        div.className = 'chat-item';
-        div.innerHTML = renderItem(item);
-        root.appendChild(div);
-      }
-    }
-
-    function escapeHtml(value) {
-      return String(value || '').replace(/[&<>"']/g, char => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;'
-      }[char]));
-    }
-
-    function setZoom(value, anchor) {
-      const previous = state.zoom;
-      const next = clamp(value, 0.35, 3.2);
-      if (anchor && previous > 0 && next !== previous) {
-        const center = zoomAnchorCenter(anchor);
-        const localX = anchor.x - center.x;
-        const localY = anchor.y - center.y;
-        const ratio = next / previous;
-        state.panX = localX - (localX - state.panX) * ratio;
-        state.panY = localY - (localY - state.panY) * ratio;
-      }
-      state.zoom = next;
-    }
-
-    function handleGraphWheel(event) {
-      event.preventDefault();
-      event.stopPropagation();
-      const intensity = event.ctrlKey || event.metaKey ? 0.01 : 0.0025;
-      const delta = clamp(event.deltaY, -140, 140);
-      setZoom(state.zoom * Math.exp(-delta * intensity), canvasPoint(event));
-    }
-
-    let gestureStartZoom = 1;
-    let gestureStartPoint = null;
-
-    function handleGraphGestureStart(event) {
-      event.preventDefault();
-      event.stopPropagation();
-      gestureStartZoom = state.zoom;
-      gestureStartPoint = canvasPoint(event);
-    }
-
-    function handleGraphGestureChange(event) {
-      event.preventDefault();
-      event.stopPropagation();
-      setZoom(gestureStartZoom * event.scale, gestureStartPoint || canvasPoint(event));
-    }
-
-    function handleGraphPointerDown(event) {
-      if (event.button !== 0) return;
-      state.isPanning = true;
-      state.panStartX = event.clientX;
-      state.panStartY = event.clientY;
-      state.panBaseX = state.panX;
-      state.panBaseY = state.panY;
-      state.suppressClick = false;
-      canvas.classList.add('panning');
-      try {
-        canvas.setPointerCapture(event.pointerId);
-      } catch (err) {
-        // Some browsers skip pointer capture for synthetic events.
-      }
-    }
-
-    function handleGraphPointerMove(event) {
-      if (!state.isPanning) return;
-      event.preventDefault();
-      const dx = event.clientX - state.panStartX;
-      const dy = event.clientY - state.panStartY;
-      if (Math.hypot(dx, dy) > 3) state.suppressClick = true;
-      state.panX = state.panBaseX + dx;
-      state.panY = state.panBaseY + dy;
-    }
-
-    function handleGraphPointerEnd(event) {
-      if (!state.isPanning) return;
-      state.isPanning = false;
-      canvas.classList.remove('panning');
-      try {
-        canvas.releasePointerCapture(event.pointerId);
-      } catch (err) {
-        // Pointer capture may already be released.
-      }
-    }
-
-    function canvasPoint(event) {
-      const rect = canvas.getBoundingClientRect();
-      return {
-        x: event.clientX - rect.left,
-        y: event.clientY - rect.top
-      };
-    }
-
-    function zoomAnchorCenter(anchor) {
-      if (state.view === 'compare' && state.compare) {
-        const rects = compareRects(canvas.clientWidth, canvas.clientHeight);
-        for (const rect of [rects.base, rects.head]) {
-          if (anchor.x >= rect.x && anchor.x <= rect.x + rect.w && anchor.y >= rect.y && anchor.y <= rect.y + rect.h) {
-            return { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
-          }
-        }
-      }
-      return { x: canvas.clientWidth / 2, y: canvas.clientHeight / 2 };
-    }
-
-    function setGraph(view) {
-      state.view = view;
-      setActiveViewButton();
-      if (view === 'compare') {
-        if (!state.compare) {
-          runCompare();
-          return;
-        }
-        setCompareGraph();
-        return;
-      }
-      const source = view === 'architecture' ? state.raw.component_graph : state.raw.commit_graph;
-      state.allNodes = source.nodes.map((node, index) => positionedNode(node, index));
-      state.allEdges = source.edges;
-      state.hiddenNodeIds = new Set();
-      state.showCommon = false;
-      document.getElementById('showCommonInput').checked = state.showCommon;
-      state.selected = null;
-      renderStats(state.raw.stats);
-      applyFilters();
-      renderFilterControls();
-    }
-
-    function normalizeComparePayload(payload) {
-      const baseNodes = payload.base.graph.nodes.map((node, index) => positionedNode(node, index));
-      const headNodes = payload.head.graph.nodes.map((node, index) => positionedNode(node, index));
-      return {
-        raw: payload,
-        base: {
-          ref: payload.base.ref,
-          sha: payload.base.sha,
-          allNodes: baseNodes,
-          allEdges: payload.base.graph.edges,
-          nodes: [],
-          edges: []
-        },
-        head: {
-          ref: payload.head.ref,
-          sha: payload.head.sha,
-          allNodes: headNodes,
-          allEdges: payload.head.graph.edges,
-          nodes: [],
-          edges: []
-        },
-        summary: payload.summary
-      };
-    }
-
-    function positionedNode(node, index) {
-      return {
-        ...node,
-        x: Math.cos(index * 2.399) * (140 + (index % 7) * 28),
-        y: Math.sin(index * 2.399) * (140 + (index % 7) * 28),
-        vx: 0,
-        vy: 0
-      };
-    }
-
-    function setCompareGraph() {
-      state.allNodes = mergeCompareNodes();
-      state.allEdges = [];
-      state.hiddenNodeIds = new Set();
-      state.showCommon = false;
-      document.getElementById('showCommonInput').checked = state.showCommon;
-      state.selected = null;
-      renderCompareStats();
-      applyFilters();
-      renderFilterControls();
-    }
-
-    function mergeCompareNodes() {
-      const merged = new Map();
-      for (const node of [...state.compare.base.allNodes, ...state.compare.head.allNodes]) {
-        const existing = merged.get(node.id);
-        if (!existing || changeRank(node.change) > changeRank(existing.change)) {
-          merged.set(node.id, node);
-        }
-      }
-      return [...merged.values()].sort((a, b) => a.label.localeCompare(b.label));
-    }
-
-    function applyFilters() {
-      if (state.view === 'compare') {
-        applyCompareFilters();
-        return;
-      }
-      const visibleIds = new Set();
-      state.nodes = [];
-      for (const node of state.allNodes) {
-        if (!state.showCommon && isCommonNode(node)) continue;
-        if (state.hiddenNodeIds.has(node.id)) continue;
-        visibleIds.add(node.id);
-        state.nodes.push(node);
-      }
-      state.edges = state.allEdges.filter(
-        edge => visibleIds.has(edge.source) && visibleIds.has(edge.target)
-      );
-      if (state.selected && state.selected.kind === 'node' && !visibleIds.has(state.selected.node.id)) {
-        state.selected = null;
-      }
-      if (
-        state.selected &&
-        state.selected.kind === 'edge' &&
-        (!visibleIds.has(state.selected.edge.source) || !visibleIds.has(state.selected.edge.target))
-      ) {
-        state.selected = null;
-      }
-      renderFilterSummary();
-      renderSelection(state.selected);
-      renderTopEdges();
-    }
-
-    function applyCompareFilters() {
-      filterCompareSide(state.compare.base);
-      filterCompareSide(state.compare.head);
-      if (state.selected && state.selected.kind === 'node') {
-        const side = state.compare[state.selected.side];
-        if (!side || !side.nodes.some(node => node.id === state.selected.node.id)) state.selected = null;
-      }
-      if (state.selected && state.selected.kind === 'edge') {
-        const side = state.compare[state.selected.side];
-        if (!side || !side.edges.some(edge => edge.id === state.selected.edge.id)) state.selected = null;
-      }
-      state.nodes = [...state.compare.base.nodes, ...state.compare.head.nodes];
-      state.edges = [...state.compare.base.edges, ...state.compare.head.edges];
-      renderFilterSummary();
-      renderSelection(state.selected);
-      renderTopEdges();
-    }
-
-    function filterCompareSide(side) {
-      const visibleIds = new Set();
-      side.nodes = [];
-      for (const node of side.allNodes) {
-        if (!state.showCommon && isCommonNode(node)) continue;
-        if (state.hiddenNodeIds.has(node.id)) continue;
-        visibleIds.add(node.id);
-        side.nodes.push(node);
-      }
-      side.edges = side.allEdges.filter(
-        edge => visibleIds.has(edge.source) && visibleIds.has(edge.target)
-      );
-    }
-
-    function renderFilterControls() {
-      const root = document.getElementById('componentFilters');
-      root.innerHTML = '';
-      const nodes = [...state.allNodes]
-        .sort((a, b) => a.label.localeCompare(b.label))
-        .filter(node => !state.componentFilter || node.label.toLowerCase().includes(state.componentFilter));
-      for (const node of nodes) {
-        const common = isCommonNode(node);
-        const disabled = common && !state.showCommon;
-        const row = document.createElement('label');
-        row.className = 'filter-row' + (disabled ? ' disabled' : '');
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.checked = !state.hiddenNodeIds.has(node.id) && !disabled;
-        checkbox.disabled = disabled;
-        checkbox.onchange = () => {
-          if (checkbox.checked) state.hiddenNodeIds.delete(node.id);
-          else state.hiddenNodeIds.add(node.id);
-          applyFilters();
-          renderFilterSummary();
-        };
-        const swatch = document.createElement('span');
-        swatch.className = 'swatch';
-        swatch.style.background = nodeColor(node);
-        const name = document.createElement('span');
-        name.className = 'filter-name';
-        name.textContent = node.label;
-        const kind = document.createElement('span');
-        kind.className = 'filter-kind';
-        kind.textContent = common ? 'common' : node.type;
-        row.append(checkbox, swatch, name, kind);
-        root.appendChild(row);
-      }
-      renderFilterSummary();
-    }
-
-    function renderFilterSummary() {
-      const visibleCount = state.view === 'compare'
-        ? new Set(state.nodes.map(node => node.id)).size
-        : state.nodes.length;
-      document.getElementById('filterSummary').textContent =
-        visibleCount + ' of ' + state.allNodes.length + ' visible';
-    }
-
-    function isCommonNode(node) {
-      const id = node.id.replace(/^component:/, '').toLowerCase();
-      const label = node.label.toLowerCase();
-      return COMMON_NODE_IDS.has(id) || COMMON_NODE_IDS.has(label);
-    }
-
-    function renderStats(stats) {
-      const root = document.getElementById('stats');
-      root.innerHTML = '';
-      for (const [label, value] of Object.entries({
-        Files: stats.files,
-        Symbols: stats.symbols,
-        Components: stats.components,
-        Edges: stats.component_edges,
-        Commits: stats.commits
-      })) {
-        const div = document.createElement('div');
-        div.className = 'stat';
-        div.innerHTML = '<span>' + label + '</span><strong>' + value + '</strong>';
-        root.appendChild(div);
-      }
-    }
-
-    function renderCompareStats() {
-      const summary = state.compare.summary;
-      const root = document.getElementById('stats');
-      root.innerHTML = '';
-      for (const [label, value] of Object.entries({
-        Added: summary.added_nodes + summary.added_edges,
-        Removed: summary.removed_nodes + summary.removed_edges,
-        Changed: summary.changed_nodes + summary.changed_edges,
-        Nodes: summary.added_nodes + summary.removed_nodes + summary.changed_nodes,
-        Edges: summary.added_edges + summary.removed_edges + summary.changed_edges
-      })) {
-        const div = document.createElement('div');
-        div.className = 'stat';
-        div.innerHTML = '<span>' + label + '</span><strong>' + value + '</strong>';
-        root.appendChild(div);
-      }
-    }
-
-    function compareSummaryText(summary) {
-      return [
-        summary.added_nodes + summary.added_edges + ' added',
-        summary.removed_nodes + summary.removed_edges + ' removed',
-        summary.changed_nodes + summary.changed_edges + ' changed'
-      ].join(' / ');
-    }
-
-    function tick() {
-      resize();
-      simulate();
-      draw();
-      requestAnimationFrame(tick);
-    }
-
-    function resize() {
-      const dpr = window.devicePixelRatio || 1;
-      const w = canvas.clientWidth;
-      const h = canvas.clientHeight;
-      if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(h * dpr)) {
-        canvas.width = Math.floor(w * dpr);
-        canvas.height = Math.floor(h * dpr);
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      }
-    }
-
-    function simulate() {
-      if (state.view === 'compare' && state.compare) {
-        simulateGraph(state.compare.base.nodes, state.compare.base.edges, 165);
-        simulateGraph(state.compare.head.nodes, state.compare.head.edges, 165);
-        return;
-      }
-      simulateGraph(state.nodes, state.edges, state.view === 'commits' ? 115 : 165);
-    }
-
-    function simulateGraph(nodes, edges, desiredDistance) {
-      const nodesById = new Map(nodes.map(node => [node.id, node]));
-      for (const node of nodes) {
-        node.vx += -node.x * 0.0008;
-        node.vy += -node.y * 0.0008;
-      }
-      for (let i = 0; i < nodes.length; i++) {
-        for (let j = i + 1; j < nodes.length; j++) {
-          const a = nodes[i], b = nodes[j];
-          const dx = a.x - b.x, dy = a.y - b.y;
-          const distSq = Math.max(120, dx * dx + dy * dy);
-          const dist = Math.sqrt(distSq);
-          const force = 2400 / distSq;
-          a.vx += dx / dist * force; a.vy += dy / dist * force;
-          b.vx -= dx / dist * force; b.vy -= dy / dist * force;
-        }
-      }
-      for (const edge of edges) {
-        const a = nodesById.get(edge.source), b = nodesById.get(edge.target);
-        if (!a || !b) continue;
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-        const weight = Math.min(3, Math.log2((edge.weight || 1) + 1));
-        const force = clamp((dist - desiredDistance) * 0.014 * weight, -4, 4);
-        a.vx += dx / dist * force; a.vy += dy / dist * force;
-        b.vx -= dx / dist * force; b.vy -= dy / dist * force;
-      }
-      for (const node of nodes) {
-        node.vx = clamp(node.vx * 0.82, -10, 10);
-        node.vy = clamp(node.vy * 0.82, -10, 10);
-        node.x = clamp(node.x + node.vx, -1200, 1200);
-        node.y = clamp(node.y + node.vy, -1200, 1200);
-      }
-    }
-
-    function draw() {
-      const w = canvas.clientWidth, h = canvas.clientHeight;
-      ctx.clearRect(0, 0, w, h);
-      if (state.view === 'compare' && state.compare) {
-        drawCompare(w, h);
-        return;
-      }
-      if (!state.nodes.length) {
-        ctx.fillStyle = '#9ba7b6';
-        ctx.font = '14px system-ui';
-        ctx.textAlign = 'center';
-        ctx.fillText('No graph nodes found. Try refreshing the repository index.', w / 2, h / 2);
-        return;
-      }
-      drawGraphPanel(state.nodes, state.edges, { x: 0, y: 0, w, h }, null);
-      ctx.globalAlpha = 1;
-    }
-
-    function drawCompare(w, h) {
-      const rects = compareRects(w, h);
-      const left = rects.base;
-      const right = rects.head;
-      ctx.fillStyle = 'rgba(239, 123, 123, .09)';
-      ctx.fillRect(0, 0, w, 46);
-      ctx.strokeStyle = '#343a46';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(rects.dividerX, 0);
-      ctx.lineTo(rects.dividerX, h);
-      ctx.stroke();
-      drawGraphPanel(state.compare.base.nodes, state.compare.base.edges, left, state.compare.base.ref + ' ' + shortSha(state.compare.base.sha), 'base');
-      drawGraphPanel(state.compare.head.nodes, state.compare.head.edges, right, state.compare.head.ref + ' ' + shortSha(state.compare.head.sha), 'head');
-    }
-
-    function compareRects(w, h) {
-      const gap = 18;
-      const leftWidth = Math.floor((w - gap) / 2);
-      return {
-        base: { x: 0, y: 0, w: leftWidth, h },
-        head: { x: leftWidth + gap, y: 0, w: w - leftWidth - gap, h },
-        dividerX: leftWidth + gap / 2
-      };
-    }
-
-    function drawGraphPanel(nodes, edges, rect, label, side) {
-      if (!nodes.length) {
-        ctx.fillStyle = '#9ba7b6';
-        ctx.font = '14px system-ui';
-        ctx.textAlign = 'center';
-        ctx.fillText('No visible nodes', rect.x + rect.w / 2, rect.y + rect.h / 2);
-        return;
-      }
-      if (label) {
-        ctx.fillStyle = '#eef1f5';
-        ctx.font = '13px system-ui';
-        ctx.textAlign = 'left';
-        ctx.fillText(label, rect.x + 16, rect.y + 26);
-      }
-      const nodesById = new Map(nodes.map(node => [node.id, node]));
-      const transform = graphTransformFor(nodes, rect);
-      ctx.lineCap = 'round';
-      for (const edge of edges) {
-        const a = nodesById.get(edge.source), b = nodesById.get(edge.target);
-        if (!a || !b) continue;
-        const pa = projectInRect(a, transform, rect), pb = projectInRect(b, transform, rect);
-        ctx.globalAlpha = edgeAlpha(edge, side);
-        ctx.strokeStyle = edgeColor(edge.type, edge);
-        ctx.lineWidth = isSelectedEdge(edge, side)
-          ? 5
-          : Math.min(4, 0.7 + Math.log2((edge.weight || 1) + 1) * 0.55);
-        ctx.beginPath();
-        ctx.moveTo(pa.x, pa.y);
-        ctx.lineTo(pb.x, pb.y);
-        ctx.stroke();
-      }
-      const sorted = [...nodes].sort(
-        (a, b) => projectInRect(a, transform, rect).scale - projectInRect(b, transform, rect).scale
-      );
-      for (const node of sorted) {
-        const p = projectInRect(node, transform, rect);
-        const dim = state.search && !node.label.toLowerCase().includes(state.search);
-        ctx.globalAlpha = dim ? 0.18 : 1;
-        ctx.fillStyle = nodeColor(node);
-        const selected = isSelectedNode(node, side) || isSelectedEdgeEndpoint(node, side);
-        ctx.strokeStyle = selected ? '#eef1f5' : '#0f1115';
-        ctx.lineWidth = selected ? 3 : 1.5;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-        if (p.r > 9 && !dim) {
-          ctx.fillStyle = '#eef1f5';
-          ctx.font = '12px system-ui';
-          ctx.textAlign = 'center';
-          ctx.fillText(shortLabel(node.label), p.x, p.y + p.r + 14);
-        }
-      }
-      ctx.globalAlpha = 1;
-    }
-
-    function graphTransform() {
-      const w = canvas.clientWidth, h = canvas.clientHeight;
-      return graphTransformFor(state.nodes, { x: 0, y: 0, w, h });
-    }
-
-    function graphTransformFor(nodes, rect) {
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      for (const node of nodes) {
-        minX = Math.min(minX, node.x);
-        minY = Math.min(minY, node.y);
-        maxX = Math.max(maxX, node.x);
-        maxY = Math.max(maxY, node.y);
-      }
-      const spanX = Math.max(1, maxX - minX);
-      const spanY = Math.max(1, maxY - minY);
-      const pad = state.view === 'commits' ? 80 : 110;
-      const fitZoom = Math.min(
-        1.7,
-        Math.max(
-          0.22,
-          Math.min(
-            Math.max(220, rect.w - pad * 2) / spanX,
-            Math.max(220, rect.h - pad * 2) / spanY
-          )
-        )
-      );
-      return {
-        centerX: (minX + maxX) / 2,
-        centerY: (minY + maxY) / 2,
-        zoom: fitZoom * state.zoom
-      };
-    }
-
-    function project(node, transform) {
-      const w = canvas.clientWidth, h = canvas.clientHeight;
-      return projectInRect(node, transform || graphTransform(), { x: 0, y: 0, w, h });
-    }
-
-    function projectInRect(node, transform, rect) {
-      const fit = transform || graphTransformFor([node], rect);
-      const radiusScale = clamp(Math.sqrt(fit.zoom), 0.75, 1.35);
-      return {
-        x: rect.x + rect.w / 2 + state.panX + (node.x - fit.centerX) * fit.zoom,
-        y: rect.y + rect.h / 2 + state.panY + (node.y - fit.centerY) * fit.zoom,
-        scale: 1,
-        r: Math.max(5, Math.min(34, (node.size || 14) * radiusScale))
-      };
-    }
-
-    function clamp(value, min, max) {
-      return Math.max(min, Math.min(max, value));
-    }
-
-    function edgeAlpha(edge, side) {
-      if (!state.selected) return 0.38;
-      if (isSelectedEdge(edge, side)) return 1;
-      if (state.selected.kind === 'node') {
-        const id = state.selected.node.id;
-        if (side && state.selected.side && side !== state.selected.side) return 0.08;
-        return edge.source === id || edge.target === id ? 0.9 : 0.08;
-      }
-      if (state.selected.kind === 'edge') {
-        if (side && state.selected.side && side !== state.selected.side) return 0.08;
-        const selected = state.selected.edge;
-        return edge.source === selected.source || edge.target === selected.target ||
-          edge.source === selected.target || edge.target === selected.source ? 0.35 : 0.08;
-      }
-      return 0.38;
-    }
-
-    function isSelectedNode(node, side) {
-      return state.selected && state.selected.kind === 'node' &&
-        state.selected.node.id === node.id &&
-        (!side || !state.selected.side || state.selected.side === side);
-    }
-
-    function isSelectedEdge(edge, side) {
-      return state.selected && state.selected.kind === 'edge' &&
-        state.selected.edge.id === edge.id &&
-        (!side || !state.selected.side || state.selected.side === side);
-    }
-
-    function isSelectedEdgeEndpoint(node, side) {
-      return state.selected && state.selected.kind === 'edge' &&
-        (!side || !state.selected.side || state.selected.side === side) &&
-        (state.selected.edge.source === node.id || state.selected.edge.target === node.id);
-    }
-
-    function edgeColor(type, edge) {
-      if (edge && edge.change && edge.change !== 'unchanged') return '#ef7b7b';
-      return {
-        calls: '#77a7ff',
-        imports: '#b69cff',
-        cochange: '#e4b363',
-        authored: '#71d49b',
-        touched: '#e4b363'
-      }[type] || '#596274';
-    }
-
-    function nodeColor(node) {
-      if (node.change && node.change !== 'unchanged') return '#ef7b7b';
-      if (node.type === 'developer') return '#71d49b';
-      if (node.type === 'commit') return '#e4b363';
-      if (node.type === 'external') return '#b69cff';
-      if (node.risk === 'high') return '#ef7b7b';
-      if (node.risk === 'medium') return '#e4b363';
-      return '#77a7ff';
-    }
-
-    function renderSelection(selection) {
-      const title = document.getElementById('selectionTitle');
-      const meta = document.getElementById('selectionMeta');
-      if (!selection) {
-        title.textContent = 'Nothing selected';
-        meta.innerHTML = '';
-        return;
-      }
-      if (selection.kind === 'edge') {
-        renderEdgeSelection(selection.edge, title, meta, selection.side);
-        return;
-      }
-      renderNodeSelection(selection, title, meta);
-    }
-
-    function renderNodeSelection(selection, title, meta) {
-      const node = selection.node;
-      title.textContent = node.label;
-      const stack = detailStack(meta);
-      const overview = ['type: ' + node.type];
-      if (selection.side) overview.push('side: ' + selection.side);
-      if (node.change) overview.push('change: ' + node.change);
-      if (node.risk) overview.push('risk: ' + node.risk);
-      if (node.timestamp) overview.push('time: ' + node.timestamp);
-      if (node.metrics) {
-        for (const [key, value] of Object.entries(node.metrics)) overview.push(key + ': ' + value);
-      }
-      if (node.tags && node.tags.length) overview.push('tags: ' + node.tags.join(', '));
-      if (node.details) overview.push('', node.details);
-      appendDetailSection(stack, 'Overview', overview, true);
-      renderNodeConnections(stack, node, selection.side);
-    }
-
-    function renderNodeConnections(stack, node, side) {
-      const edges = nodeEdgesForSelection(node, side)
-        .sort((a, b) => edgeDetailRank(b) - edgeDetailRank(a) || (b.weight || 1) - (a.weight || 1));
-      if (!edges.length) {
-        appendDetailSection(stack, 'Connections', ['connections: none visible with current filters'], true);
-        return;
-      }
-      const codeEdges = edges.filter(edge => !['cochange', 'authored', 'touched'].includes(edge.type));
-      const historyEdges = edges.filter(edge => ['cochange', 'authored', 'touched'].includes(edge.type));
-      appendEdgeGroupSection(stack, 'Functions / APIs', codeEdges, true);
-      appendComponentEdgeSummary(stack, 'Components / Edges', edges, false);
-      if (historyEdges.length) {
-        appendEdgeGroupSection(stack, 'Commit / Co-change Evidence', historyEdges, false);
-      }
-    }
-
-    function nodeEdgesForSelection(node, side) {
-      let edges = state.edges;
-      if (side && state.compare && state.compare[side]) edges = state.compare[side].edges;
-      return edges.filter(edge => edge.source === node.id || edge.target === node.id);
-    }
-
-    function edgeDetailRank(edge) {
-      const typeRank = { calls: 4, references: 3, imports: 2, inherits: 2, cochange: 1 };
-      return (typeRank[edge.type] || 0) * 1000 + Math.min(edge.examples ? edge.examples.length : 0, 50);
-    }
-
-    function renderEdgeSelection(edge, title, meta, side) {
-      const source = labelForNode(edge.source);
-      const target = labelForNode(edge.target);
-      title.textContent = source + ' -> ' + target;
-      const stack = detailStack(meta);
-      const overview = [
-        'connection: ' + edge.type,
-        side ? 'side: ' + side : '',
-        edge.change ? 'change: ' + edge.change : '',
-        'source: ' + source,
-        'target: ' + target,
-        'weight: ' + (edge.weight || 1)
-      ].filter(Boolean);
-      if (edge.file) overview.push('file: ' + edge.file);
-      appendDetailSection(stack, 'Overview', overview, true);
-      appendExampleSection(stack, 'Function / API Examples', edge.examples || [], true);
-      if (edge.reasons && edge.reasons.length) {
-        const evidence = [];
-        for (const reason of edge.reasons.slice(0, 8)) {
-          if (reason) evidence.push('- ' + reason);
-        }
-        appendDetailSection(stack, 'Summary Evidence', evidence, false);
-      }
-    }
-
-    function detailStack(root) {
-      root.innerHTML = '';
-      const stack = document.createElement('div');
-      stack.className = 'detail-stack';
-      root.appendChild(stack);
-      return stack;
-    }
-
-    function appendDetailSection(stack, title, lines, open) {
-      const section = document.createElement('details');
-      section.className = 'detail-card';
-      section.open = Boolean(open);
-      const summary = document.createElement('summary');
-      summary.textContent = title;
-      const body = document.createElement('div');
-      body.className = 'detail-body';
-      if (lines.length) renderDetailLines(body, lines);
-      section.append(summary, body);
-      stack.appendChild(section);
-      return body;
-    }
-
-    function appendEdgeGroupSection(stack, title, edges, open) {
-      const body = appendDetailSection(
-        stack,
-        title + ' (' + edges.length + ')',
-        edges.length ? [] : ['No visible connections in this group.'],
-        open
-      );
-      if (!edges.length) return;
-      for (const edge of edges.slice(0, 10)) {
-        appendEdgeDetails(body, edge, false);
-      }
-      if (edges.length > 10) appendPlainLine(body, '... ' + (edges.length - 10) + ' more visible connections');
-    }
-
-    function appendComponentEdgeSummary(stack, title, edges, open) {
-      const lines = edges.slice(0, 16).map(edge =>
-        '- ' + labelForNode(edge.source) + ' -> ' + labelForNode(edge.target) +
-        ' (' + edge.type + ', weight ' + (edge.weight || 1) + ')'
-      );
-      if (edges.length > 16) lines.push('... ' + (edges.length - 16) + ' more visible edges');
-      appendDetailSection(stack, title + ' (' + edges.length + ')', lines, open);
-    }
-
-    function appendEdgeDetails(parent, edge, open) {
-      const section = document.createElement('details');
-      section.className = 'detail-card detail-nested';
-      section.open = Boolean(open);
-      const summary = document.createElement('summary');
-      summary.textContent = edgeSummary(edge);
-      const body = document.createElement('div');
-      body.className = 'detail-body';
-      renderDetailLines(body, [
-        'type: ' + edge.type,
-        'source component: ' + labelForNode(edge.source),
-        'target component: ' + labelForNode(edge.target),
-        'weight: ' + (edge.weight || 1)
-      ]);
-      appendExampleSection(body, 'Examples', edge.examples || [], false);
-      section.append(summary, body);
-      parent.appendChild(section);
-    }
-
-    function appendExampleSection(parent, title, examples, open) {
-      const wrapper = document.createElement('details');
-      wrapper.className = 'detail-card' + (parent.classList.contains('detail-body') ? ' detail-nested' : '');
-      wrapper.open = Boolean(open);
-      const wrapperSummary = document.createElement('summary');
-      wrapperSummary.textContent = title + ' (' + examples.length + ')';
-      const wrapperBody = document.createElement('div');
-      wrapperBody.className = 'detail-body';
-      wrapper.append(wrapperSummary, wrapperBody);
-      parent.appendChild(wrapper);
-      if (!examples.length) {
-        appendPlainLine(wrapperBody, 'No function/API examples available for this connection.');
-        return;
-      }
-      for (const [index, example] of examples.slice(0, 8).entries()) {
-        const section = document.createElement('details');
-        section.className = 'detail-card detail-nested';
-        section.open = Boolean(open && index === 0);
-        const summary = document.createElement('summary');
-        summary.textContent = title + ' ' + (index + 1) + ': ' + edgeExampleTitle(example);
-        const body = document.createElement('div');
-        body.className = 'detail-body';
-        renderDetailLines(body, renderEdgeExample(example));
-        section.append(summary, body);
-        wrapperBody.appendChild(section);
-      }
-      if (examples.length > 8) appendPlainLine(wrapperBody, '... ' + (examples.length - 8) + ' more examples');
-    }
-
-    function appendPlainLine(parent, line) {
-      const div = document.createElement('div');
-      div.className = 'detail-lines detail-empty';
-      div.innerHTML = colorizeDetailLine(line);
-      parent.appendChild(div);
-    }
-
-    function edgeSummary(edge) {
-      return labelForNode(edge.source) + ' -> ' + labelForNode(edge.target) +
-        ' (' + edge.type + ', weight ' + (edge.weight || 1) + ')';
-    }
-
-    function edgeExampleTitle(example) {
-      return formatCall(example) || (formatEndpoint(example.source) + ' -> ' + formatEndpoint(example.target));
-    }
-
-    function renderDetailLines(root, lines) {
-      root.innerHTML = lines.map(colorizeDetailLine).join('\n');
-    }
-
-    function colorizeDetailLine(line) {
-      if (!line) return '';
-      const trimmed = line.trim();
-      if (!trimmed) return '';
-      const leading = line.match(/^\s*/)[0];
-      const clean = line.slice(leading.length);
-      const prefix = escapeHtml(leading);
-      if (clean.startsWith('- ')) {
-        return prefix + '<span class="detail-edge">' + escapeHtml(clean) + '</span>';
-      }
-      if (clean.startsWith('... ')) {
-        return prefix + '<span class="detail-value">' + escapeHtml(clean) + '</span>';
-      }
-      if (/connections( \(|:)/.test(clean) || clean === 'summary evidence:') {
-        return prefix + '<span class="detail-section">' + escapeHtml(clean) + '</span>';
-      }
-      const keyMatch = clean.match(/^([^:]{1,40}):\s?(.*)$/);
-      if (keyMatch) {
-        const key = keyMatch[1];
-        const value = keyMatch[2] || '';
-        const valueClass = detailValueClass(key);
-        return prefix +
-          '<span class="detail-key">' + escapeHtml(key) + ':</span>' +
-          (value ? ' <span class="' + valueClass + '">' + escapeHtml(value) + '</span>' : '');
-      }
-      return prefix + '<span class="detail-value">' + escapeHtml(clean) + '</span>';
-    }
-
-    function detailValueClass(key) {
-      const lower = key.toLowerCase();
-      if (lower === 'call') return 'detail-call';
-      if (lower === 'parameters') return 'detail-call';
-      if (lower.includes('signature')) return 'detail-signature';
-      if (lower === 'location' || lower === 'file') return 'detail-path';
-      if (lower === 'change') return 'detail-change';
-      return 'detail-value';
-    }
-
-    function renderEdgeExample(example) {
-      const source = formatEndpoint(example.source);
-      const target = formatEndpoint(example.target);
-      const lines = ['- ' + source + ' -> ' + target + ' (' + example.type + ')'];
-      const call = formatCall(example);
-      if (call) lines.push('  call: ' + call);
-      if (example.arguments && example.arguments.length) lines.push('  parameters: ' + example.arguments.join(', '));
-      if (example.source && example.source.signature) lines.push('  source signature: ' + example.source.signature);
-      if (example.target && example.target.signature) lines.push('  target signature: ' + example.target.signature);
-      const location = formatLocation(example);
-      if (location) lines.push('  location: ' + location);
-      if (example.commit) lines.push('  commit: ' + example.commit);
-      return lines;
-    }
-
-    function formatEndpoint(endpoint) {
-      if (!endpoint) return 'unknown';
-      return endpoint.qualified_name || endpoint.label || endpoint.name || endpoint.key || 'unknown';
-    }
-
-    function formatCall(example) {
-      if (!example.display) return '';
-      const args = example.arguments && example.arguments.length ? '(' + example.arguments.join(', ') + ')' : '';
-      return example.display + args;
-    }
-
-    function formatLocation(example) {
-      const file = example.file_path || (example.source && example.source.path) || '';
-      if (!file) return '';
-      return example.line ? file + ':' + example.line : file;
-    }
-
-    function renderTopEdges() {
-      const root = document.getElementById('topEdges');
-      root.innerHTML = '';
-      const entries = state.view === 'compare' && state.compare
-        ? [
-            ...state.compare.base.edges.map(edge => ({ edge, side: 'base' })),
-            ...state.compare.head.edges.map(edge => ({ edge, side: 'head' }))
-          ]
-        : state.edges.map(edge => ({ edge, side: null }));
-      const top = entries
-        .sort((a, b) => {
-          const changeDelta = changeRank(b.edge.change) - changeRank(a.edge.change);
-          return changeDelta || (b.edge.weight || 1) - (a.edge.weight || 1);
-        })
-        .slice(0, 10);
-      for (const { edge, side } of top) {
-        const div = document.createElement('div');
-        div.className = 'pill';
-        const prefix = side ? side + ': ' : '';
-        const change = edge.change && edge.change !== 'unchanged' ? ', ' + edge.change : '';
-        div.textContent = prefix + labelForNode(edge.source) + ' -> ' + labelForNode(edge.target) + ' (' + edge.type + change + ')';
-        div.onclick = () => {
-          state.selected = { kind: 'edge', edge, side };
-          renderSelection(state.selected);
-        };
-        root.appendChild(div);
-      }
-    }
-
-    function labelForNode(id) {
-      const node = state.allNodes.find(item => item.id === id);
-      return node ? node.label : id;
-    }
-
-    function changeRank(change) {
-      return change && change !== 'unchanged' ? 1 : 0;
-    }
-
-    function shortSha(sha) {
-      return sha ? sha.slice(0, 8) : '';
-    }
-
-    function distanceToSegment(px, py, x1, y1, x2, y2) {
-      const dx = x2 - x1;
-      const dy = y2 - y1;
-      if (dx === 0 && dy === 0) return Math.hypot(px - x1, py - y1);
-      const t = clamp(((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy), 0, 1);
-      const x = x1 + t * dx;
-      const y = y1 + t * dy;
-      return Math.hypot(px - x, py - y);
-    }
-
-    function shortLabel(label) {
-      return label.length > 24 ? label.slice(0, 21) + '...' : label;
-    }
-  </script>
-</body>
-</html>
-"""
+HTML_APP = render_visualization_app()

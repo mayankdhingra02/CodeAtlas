@@ -26,12 +26,17 @@ DEFAULT_IGNORE_DIRS = frozenset(
 
 SUPPORTED_EXTENSIONS = {
     ".py": "python",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".ts": "javascript",
+    ".tsx": "javascript",
 }
 
 ARTIFACT_DIR = ".codeatlas"
 DATABASE_NAME = "index.db"
 METADATA_NAME = "metadata.json"
 STATS_NAME = "stats.json"
+GRAPH_ARTIFACT_NAME = "graph.db.gz"
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,10 @@ class CodeAtlasPaths:
     @property
     def stats_path(self) -> Path:
         return self.artifact_dir / STATS_NAME
+
+    @property
+    def graph_artifact_path(self) -> Path:
+        return self.artifact_dir / GRAPH_ARTIFACT_NAME
 
     @property
     def cache_dir(self) -> Path:

@@ -6,16 +6,18 @@ The goal is to reduce repeated repository reads, improve warm-start retrieval sp
 
 ## Status
 
-This repository contains a working Python-first implementation:
+This repository contains a working Python-first implementation with early JavaScript and TypeScript support:
 
 - Tree-sitter parser plugin for Python
+- Regex-backed JavaScript and TypeScript parser plugin for components, functions, imports, tests, and route-like handlers
 - SQLite graph store under `.codeatlas/index.db`
 - Incremental indexing by file hash
 - Graph-aware context retrieval with token estimates
 - Repository Memory Engine for git history, README/docs, ADRs, RFCs, release notes, and design docs
 - Commit intelligence heuristics for purpose, motivation, impacted components, risk, and architectural impact
 - Repository Time Machine, ownership intelligence, decision lookup, architecture findings, and compressed repository context
-- Local browser visualization for 2D/3D architecture and commit-history maps
+- Local browser visualization for evidence-first architecture, commit-history, compare, diagnostics, and workflow maps
+- Agent context packs, verification plans, built-in rule checks, source outlines, graph artifacts, and external index import
 - Typer CLI with Rich output
 - Watchdog-based watch mode
 - MCP tool handlers and optional FastMCP server
@@ -55,9 +57,19 @@ src/codeatlas/
   watcher.py          # watchdog integration
   mcp_server.py       # MCP tools and FastMCP adapter
   semantic.py         # optional Pyright/BasedPyright hook
+  packs.py            # redacted AI context pack generation
+  rules.py            # built-in local static rule checks
+  verification.py     # changed-file verification plans
+  source.py           # source-outline explorer
+  external_index.py   # generic/SCIP-style JSON import
+  assets/
+    visualization.html
+    visualization.css
+    visualization.js
   parsers/
     base.py
     python.py         # Tree-sitter Python extractor
+    javascript.py     # JavaScript/TypeScript extractor
     registry.py
 tests/
 docs/
@@ -78,6 +90,63 @@ pip install -e .
 ```
 
 Runtime analysis is local. The package dependencies are installed once into your environment; CodeAtlas itself does not need network access to index or query repositories.
+
+## Project Configuration
+
+CodeAtlas reads an optional `.codeatlas.yml` from the repository root. If the file is missing, built-in defaults preserve current behavior.
+
+```yaml
+version: 1
+
+languages:
+  python: true
+  javascript: true
+
+ignore:
+  dirs:
+    - .tox
+  paths:
+    - generated/**
+    - vendor/**
+
+rules:
+  enabled: true
+  tests_lower_severity: true
+  suppressions:
+    - rule: possible-secret
+      path: tests/fixtures/**
+      reason: fixture data
+  severity_overrides:
+    fetch-without-abort: low
+
+ui:
+  default_lens: overview
+  node_budget: 180
+  min_edge_weight: 1
+  connected_only: true
+  edge_contrast: 64
+
+classification:
+  owned_prefixes:
+    - my_product
+  team_prefixes:
+    - company_
+  company_prefixes:
+    - "@company/"
+  third_party_packages:
+    - requests
+  hide_packages:
+    - docutils
+    - sphinx
+  show_packages:
+    - company_sdk
+
+cache:
+  enabled: true
+  ttl_seconds: 300
+```
+
+The config controls language indexing, ignored paths, rule suppressions, severity overrides, test-file severity lowering, default map lens/budget, edge contrast, connected-only graph defaults, package classification, and workflow-cache TTL. Classification lets the UI separate owned code, team/company dependencies, third-party packages, docs/config, tests, and generated files. The browser UI shows the active config fingerprint and stale-server warnings in the header so stale-build or stale-config confusion is easier to spot.
 
 ## Indexing Workflow
 
@@ -175,6 +244,56 @@ Summarize a component or path from git memory:
 codeatlas nexus auth --repo-path /path/to/repo
 ```
 
+## Agent Workflows
+
+CodeAtlas includes first-class workflows for AI coding assistants and human review.
+
+Generate a redacted context pack for Codex, Claude, or another local agent:
+
+```bash
+codeatlas context-pack "fix checkout timeout handling" --repo-path /path/to/repo
+codeatlas context-pack --task-file issue.md --repo-path /path/to/repo --format json
+codeatlas context-pack "explain auth retries" --repo-path /path/to/repo --format xml --output context.xml
+```
+
+The pack includes relevant files, exact snippets, evidence, likely owners, built-in rule findings, a source outline, and suggested verification commands. Secret-like assignments are redacted before rendering.
+
+Build a verification plan from local git changes:
+
+```bash
+codeatlas verify-plan /path/to/repo --base-ref HEAD --task "edit auth retry logic"
+```
+
+Run built-in static checks:
+
+```bash
+codeatlas rules /path/to/repo
+codeatlas rules /path/to/repo --severity high
+```
+
+The built-in checks are intentionally conservative and local. They currently flag common review smells such as hard-coded secret-like assignments, `requests` calls without timeouts, `shell=True`, dynamic code execution, interpolated SQL, and uncancelled `fetch` calls.
+
+Explore source outlines by symbol or path:
+
+```bash
+codeatlas outline /path/to/repo --query "PaymentService"
+```
+
+Share or hydrate an index artifact:
+
+```bash
+codeatlas export-graph /path/to/repo
+codeatlas import-graph /path/to/repo --overwrite
+```
+
+Import an external code-intelligence JSON index:
+
+```bash
+codeatlas import-index scip-index.json --repo-path /path/to/repo --format scip-json
+```
+
+The importer accepts a simple generic JSON shape with `symbols` and `edges`, plus SCIP-style JSON with `documents`, document-level `symbols`, relationships, and definition occurrences.
+
 ## Local Architecture And Commit Map
 
 Open a repository map in your browser:
@@ -187,13 +306,17 @@ The command refreshes the code graph and repository memory, starts a local serve
 
 - Architecture view: major components, internal imports/calls, external modules/services, service-like nodes, and git co-change links.
 - Commit view: developers, commits, and the components each commit touched.
-- Compare view: two git refs or commits are archived into temporary snapshots, indexed side by side, and annotated with red nodes/edges for added, removed, or changed architecture.
+- Compare view: two git refs or commits are archived into temporary snapshots, indexed side by side, and annotated with added, removed, or changed architecture. Compare defaults to a change-first view, can reveal unchanged context on demand, can sync or unlock before/after pan and zoom, and includes before/after evidence cards plus a ranked Compare Impact queue.
 
 Use the 2D/3D toggle to switch between a flat force map and a lightweight depth view. Use the left filter rail to hide/show components, common library nodes, and compare specific commit refs. For terminal-only workflows:
 
 ```bash
 codeatlas serve /path/to/repo --no-open --port 8765
 ```
+
+The right rail exposes product workflows for "Where start?", recent changes, risky code, API/data flow, routes, dead code, owners, context packs, rule checks, source outlines, and verification plans. Workflow results render as compact evidence cards so the graph stays a navigation layer instead of the only source of truth. Selecting a node, edge, saved path, or compare impact item centers the camera on that evidence. In compare mode, the Explain action writes a concise diff brief with the most important changed nodes/edges and suggested verification focus. Right-click classification changes show an Undo toast before the config edit becomes old news. Dense maps use level-of-detail rendering: noisy import/reference/dependency edges are bundled with x-count labels while exact edges remain available from the bundle detail panel.
+
+Workflow results include export buttons for JSON and rendered text/Markdown. Slow workflows are cached under `.codeatlas/cache/workflows/`; the cache is invalidated when the index DB mtime or `.codeatlas.yml` fingerprint changes.
 
 ## Retrieval Flow
 
@@ -268,6 +391,20 @@ codeatlas ownership "topic" --repo-path /path/to/repo
 codeatlas decisions "question" --repo-path /path/to/repo
 codeatlas architecture "topic" --repo-path /path/to/repo
 codeatlas repo-context "query" --repo-path /path/to/repo
+codeatlas agent-context "task" --repo-path /path/to/repo
+codeatlas context-pack "task" --repo-path /path/to/repo --format markdown
+codeatlas export-graph /path/to/repo
+codeatlas import-graph /path/to/repo
+codeatlas index-status /path/to/repo
+codeatlas query "callers:symbol" --repo-path /path/to/repo
+codeatlas dead-code /path/to/repo
+codeatlas routes /path/to/repo
+codeatlas http-confidence /path/to/repo
+codeatlas install-agent /path/to/repo
+codeatlas rules /path/to/repo
+codeatlas verify-plan /path/to/repo --base-ref HEAD
+codeatlas outline /path/to/repo --query "query"
+codeatlas import-index scip-index.json --repo-path /path/to/repo
 codeatlas impact /path/to/repo --base-ref HEAD
 codeatlas hotspots /path/to/repo
 codeatlas nexus "topic" --repo-path /path/to/repo
@@ -301,6 +438,18 @@ Exposed tools:
 - `get_hotspots(limit)`
 - `get_nexus(topic)`
 - `get_visual_map()`
+- `get_index_status()`
+- `query_code_graph(expression, limit)`
+- `find_dead_code(limit)`
+- `get_routes(limit)`
+- `get_http_confidence(limit)`
+- `export_graph()`
+- `import_graph(overwrite)`
+- `get_context_pack(task, max_tokens, output_format)`
+- `get_verification_plan(base_ref, task)`
+- `run_rules(limit, severity)`
+- `get_source_outline(query, limit)`
+- `import_code_index(input_path, index_format)`
 - `get_code_context(query, max_tokens, depth)`
 - `find_symbol(symbol_name)`
 - `explain_dependencies(symbol_name)`
@@ -346,7 +495,7 @@ The implementation is organized in layers:
 
 ## Limitations
 
-- Python is the only implemented parser plugin today.
+- Python has the strongest parser support today. JavaScript and TypeScript support exists, but it is currently regex-backed and less precise than a full Tree-sitter/LSP implementation.
 - Pyright/BasedPyright integration is currently an optional diagnostics hook; deeper type-aware reference resolution is a future extension.
 - Retrieval reads selected snippets from disk. It does not re-parse the repository, but it expects files to remain present after indexing.
 - Call resolution is name-based and prefers same-module matches before shortest qualified names.
@@ -355,12 +504,17 @@ The implementation is organized in layers:
 - Commit intelligence uses deterministic local heuristics, not an LLM. It cites evidence but should be treated as an initial signal.
 - API-flow and infrastructure intelligence have conservative MCP surfaces, but deep endpoint/runtime topology extraction is still roadmap work.
 - Impact radius is conservative and based on local git diff, file names, ownership, co-change history, and indexed evidence. It is not a substitute for test execution.
+- Built-in rule checks are review aids, not a full security scanner or CodeQL/Semgrep replacement.
+- External index import currently supports generic JSON and SCIP-like JSON shapes; exact SCIP protobuf ingestion is not implemented yet.
 
 ## Roadmap
 
-- Add JavaScript and TypeScript parser plugins.
+- Replace regex-backed JavaScript and TypeScript extraction with Tree-sitter/LSP-backed symbol import.
 - Add Go and Java parser plugins.
 - Deepen Pyright/BasedPyright semantic integration for exact cross-file references.
+- Add exact SCIP protobuf import and richer external index validation.
+- Add configurable rule packs and project-owned suppressions.
+- Render issue/PR context directly into context packs when GitHub/GitLab ingestion is enabled.
 - Store optional snippet cache for fully DB-backed retrieval.
 - Add graph export formats such as GraphML and JSON.
 - Add richer benchmark suites with labeled expected contexts.
@@ -383,3 +537,13 @@ Run with Pytest after installing dev dependencies:
 ```bash
 pytest
 ```
+
+Optional browser smoke test:
+
+```bash
+pip install -e '.[ui]'
+python -m playwright install chromium
+codeatlas ui-smoke http://127.0.0.1:8852/ --screenshot-dir /tmp/codeatlas-ui
+```
+
+This requires Playwright and a running CodeAtlas server. Restart the server after frontend asset edits so stale browser/server UI warnings clear. The smoke wrapper sets `CODEATLAS_UI_URL`; `--screenshot-dir` keeps map and command-palette screenshots from the visual smoke. It verifies that the graph canvas, build badge, edge contrast and bundling controls, compare mode controls, fit/undo controls, workflow buttons, workflow result cards, export buttons, and visual-regression surfaces render.

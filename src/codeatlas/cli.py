@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
@@ -10,12 +13,21 @@ from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
 
+from .agent_install import install_agent
+from .analysis import dead_code, http_confidence_summary, route_summary, structural_query
+from .artifacts import export_graph_artifact, import_graph_artifact
 from .benchmark import Benchmarker
+from .external_index import import_external_index
 from .graph import GraphService
 from .indexer import RepositoryIndexer
 from .memory import MemoryQueryEngine
 from .mcp_server import run_mcp_server
+from .packs import context_pack, render_context_pack
 from .retrieval import RetrievalEngine
+from .rules import run_rule_checks
+from .source import source_outline
+from .status import index_status
+from .verification import verification_plan
 from .visualization import VisualizationService
 from .watcher import watch_repository
 
@@ -220,6 +232,218 @@ def repo_context_cmd(
     console.print_json(json.dumps(asdict(context), default=str))
 
 
+@app.command("agent-context")
+def agent_context_cmd(
+    task: Annotated[str, typer.Argument(help="Coding task to package context for.")],
+    repo_path: Annotated[
+        Path,
+        typer.Option("--repo-path", "-r", help="Repository containing .codeatlas/index.db."),
+    ] = Path("."),
+    max_tokens: Annotated[int, typer.Option("--max-tokens", "-m", min=1)] = 5000,
+) -> None:
+    payload = visualization_service.agent_context(repo_path, task, max_tokens=max_tokens)
+    console.print(payload["markdown"])
+
+
+@app.command("context-pack")
+def context_pack_cmd(
+    task: Annotated[
+        str | None,
+        typer.Argument(help="Coding task, issue text, or PR summary to package."),
+    ] = None,
+    repo_path: Annotated[
+        Path,
+        typer.Option("--repo-path", "-r", help="Repository containing .codeatlas/index.db."),
+    ] = Path("."),
+    task_file: Annotated[
+        Path | None,
+        typer.Option("--task-file", help="Read task text from a local issue/PR brief file."),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Output format: markdown, json, or xml."),
+    ] = "markdown",
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional output file."),
+    ] = None,
+    max_tokens: Annotated[int, typer.Option("--max-tokens", "-m", min=1)] = 6000,
+) -> None:
+    task_text = task_file.read_text(encoding="utf-8") if task_file else (task or "")
+    pack = context_pack(repo_path, task_text, max_tokens=max_tokens)
+    rendered = render_context_pack(pack, output_format=output_format)
+    if output:
+        output.write_text(rendered, encoding="utf-8")
+        console.print(f"Wrote context pack to {output}.")
+    else:
+        console.print(rendered)
+
+
+@app.command("export-graph")
+def export_graph_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository containing .codeatlas/index.db.")] = Path("."),
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional artifact path. Defaults to .codeatlas/graph.db.gz."),
+    ] = None,
+) -> None:
+    report = export_graph_artifact(repo_path, output)
+    console.print(
+        f"Exported CodeAtlas graph to {report.artifact_path} "
+        f"({report.size_bytes:,} bytes)."
+    )
+
+
+@app.command("import-graph")
+def import_graph_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository to receive the imported graph.")] = Path("."),
+    artifact: Annotated[
+        Path | None,
+        typer.Option("--artifact", "-a", help="Artifact path. Defaults to .codeatlas/graph.db.gz."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Replace an existing .codeatlas/index.db."),
+    ] = False,
+) -> None:
+    report = import_graph_artifact(repo_path, artifact, overwrite=overwrite)
+    console.print(f"Imported CodeAtlas graph from {report.artifact_path} into {report.database_path}.")
+
+
+@app.command("index-status")
+def index_status_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository containing .codeatlas/index.db.")] = Path("."),
+) -> None:
+    status = index_status(repo_path)
+    table = Table(title="CodeAtlas Index Status")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    for key in (
+        "repo_root",
+        "indexed",
+        "last_indexed_at",
+        "files_indexed",
+        "symbols",
+        "graph_nodes",
+        "graph_edges",
+        "dirty_files",
+        "new_files",
+        "deleted_files",
+        "stale",
+        "parser_errors",
+        "artifact_exists",
+    ):
+        if key in status:
+            table.add_row(key.replace("_", " ").title(), str(status[key]))
+    console.print(table)
+
+
+@app.command("query")
+def query_cmd(
+    expression: Annotated[
+        str,
+        typer.Argument(help="Mini structural query, e.g. callers:login, calls:main, imports:sqlalchemy, route:/api, dead:functions."),
+    ],
+    repo_path: Annotated[
+        Path,
+        typer.Option("--repo-path", "-r", help="Repository containing .codeatlas/index.db."),
+    ] = Path("."),
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 25,
+) -> None:
+    console.print_json(json.dumps(structural_query(repo_path, expression, limit=limit), default=str))
+
+
+@app.command("dead-code")
+def dead_code_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository containing .codeatlas/index.db.")] = Path("."),
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 50,
+) -> None:
+    payload = dead_code(repo_path, limit=limit)
+    table = Table(title="Potential Dead Code")
+    table.add_column("Symbol")
+    table.add_column("File")
+    table.add_column("Confidence", justify="right")
+    for item in payload["items"]:
+        table.add_row(
+            item["qualified_name"],
+            f"{item['file_path']}:{item['line_start']}",
+            f"{item['confidence']:.2f}",
+        )
+    console.print(table)
+
+
+@app.command("routes")
+def routes_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository containing .codeatlas/index.db.")] = Path("."),
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 100,
+) -> None:
+    console.print_json(json.dumps(route_summary(repo_path, limit=limit), default=str))
+
+
+@app.command("http-confidence")
+def http_confidence_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository containing .codeatlas/index.db.")] = Path("."),
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 100,
+) -> None:
+    console.print_json(json.dumps(http_confidence_summary(repo_path, limit=limit), default=str))
+
+
+@app.command("install-agent")
+def install_agent_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository to configure for an AI coding agent.")] = Path("."),
+    agent: Annotated[str, typer.Option("--agent", help="Agent to configure. Currently: codex.")] = "codex",
+) -> None:
+    payload = install_agent(repo_path, agent)
+    console.print_json(json.dumps(payload, default=str))
+
+
+@app.command("rules")
+def rules_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository to scan with built-in rule checks.")] = Path("."),
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 100,
+    severity: Annotated[
+        str | None,
+        typer.Option("--severity", help="Optional severity filter: high, medium, or low."),
+    ] = None,
+) -> None:
+    console.print_json(json.dumps(run_rule_checks(repo_path, limit=limit, severity=severity), default=str))
+
+
+@app.command("verify-plan")
+def verify_plan_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository to inspect for local changes.")] = Path("."),
+    base_ref: Annotated[str, typer.Option("--base-ref", "-b", help="Git ref to diff against.")] = "HEAD",
+    task: Annotated[str, typer.Option("--task", help="Optional task summary for the plan.")] = "",
+) -> None:
+    console.print_json(json.dumps(verification_plan(repo_path, base_ref=base_ref, task=task), default=str))
+
+
+@app.command("outline")
+def outline_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository containing .codeatlas/index.db.")] = Path("."),
+    query: Annotated[str, typer.Option("--query", "-q", help="Optional file/symbol filter.")] = "",
+    limit: Annotated[int, typer.Option("--limit", "-n", min=1)] = 80,
+) -> None:
+    console.print_json(json.dumps(source_outline(repo_path, query, limit=limit), default=str))
+
+
+@app.command("import-index")
+def import_index_cmd(
+    input_path: Annotated[Path, typer.Argument(help="External code-intelligence JSON, such as SCIP JSON.")],
+    repo_path: Annotated[
+        Path,
+        typer.Option("--repo-path", "-r", help="Repository to augment with the external index."),
+    ] = Path("."),
+    index_format: Annotated[
+        str,
+        typer.Option("--format", "-f", help="Index format: auto, scip-json, or generic-json."),
+    ] = "auto",
+) -> None:
+    console.print_json(
+        json.dumps(import_external_index(repo_path, input_path, index_format=index_format), default=str)
+    )
+
+
 @app.command("impact")
 def impact_cmd(
     repo_path: Annotated[
@@ -354,14 +578,41 @@ def serve_cmd(
         typer.Option("--max-commits", min=1, help="Maximum commits to mine for the commit map."),
     ] = 1000,
 ) -> None:
-    visualization_service.serve(
-        repo_path,
-        host=host,
-        port=port,
-        open_browser=open_browser,
-        refresh=refresh,
-        max_commits=max_commits,
-    )
+    try:
+        visualization_service.serve(
+            repo_path,
+            host=host,
+            port=port,
+            open_browser=open_browser,
+            refresh=refresh,
+            max_commits=max_commits,
+        )
+    except RuntimeError as exc:
+        console.print(f"[bold red]Serve failed:[/bold red] {exc}")
+        raise typer.Exit(1) from None
+
+
+@app.command("ui-smoke")
+def ui_smoke_cmd(
+    url: Annotated[
+        str,
+        typer.Argument(help="Running CodeAtlas UI URL, for example http://127.0.0.1:8852/."),
+    ] = "http://127.0.0.1:8765/",
+    screenshot_dir: Annotated[
+        Path | None,
+        typer.Option("--screenshot-dir", help="Directory for optional Playwright screenshots."),
+    ] = None,
+) -> None:
+    env = os.environ.copy()
+    env["CODEATLAS_UI_URL"] = url
+    if screenshot_dir:
+        screenshot_dir.mkdir(parents=True, exist_ok=True)
+        env["CODEATLAS_UI_SCREENSHOT_DIR"] = str(screenshot_dir)
+    cmd = [sys.executable, "-m", "unittest", "tests.test_ui_smoke", "-v"]
+    console.print(f"Running UI smoke against {url}")
+    result = subprocess.run(cmd, env=env, check=False)
+    if result.returncode:
+        raise typer.Exit(result.returncode)
 
 
 @app.command("benchmark")

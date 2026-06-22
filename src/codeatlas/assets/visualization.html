@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CodeAtlas Map</title>
+  <style>
+{{ CODEATLAS_CSS }}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>CodeAtlas Map</h1>
+      <div id="repoMeta" class="meta">Loading repository graph...</div>
+      <div id="buildBadge" class="build-badge">index unknown</div>
+      <div class="toolbar">
+        <div class="toolbar-group">
+          <button id="refreshBtn">Refresh</button>
+        </div>
+        <div class="toolbar-group view-switch" aria-label="Map view">
+          <button id="architectureBtn" class="active">Architecture</button>
+          <button id="commitsBtn">Commits</button>
+          <button id="compareViewBtn">Compare</button>
+        </div>
+        <button id="addConnectionBtn" class="icon-btn" aria-label="Add architecture connection">+</button>
+        <input id="searchInput" placeholder="Filter nodes">
+      </div>
+    </header>
+    <div id="staleBanner" class="stale-banner" hidden></div>
+    <div id="uiErrorPanel" class="ui-error-panel" role="alert" hidden>
+      <div class="ui-error-title">UI error</div>
+      <div id="uiErrorBody" class="ui-error-body"></div>
+      <button id="uiErrorDismissBtn" type="button">Dismiss</button>
+    </div>
+    <div id="undoToast" class="undo-toast" role="status" aria-live="polite" hidden>
+      <span id="undoToastMessage"></span>
+      <button id="undoToastButton" class="toast-undo" type="button">Undo</button>
+      <button id="undoToastDismiss" type="button">Dismiss</button>
+    </div>
+    <aside class="filter-panel">
+      <div class="filter-header">
+        <div class="section-title filter-heading">Filters</div>
+        <button id="filterPanelToggle" class="panel-toggle" aria-label="Hide filters" aria-expanded="true">&lt;</button>
+      </div>
+      <div class="filter-panel-body">
+        <div class="filter-sticky">
+          <div class="filter-sticky-row">
+            <span id="stickyLensLabel" class="filter-sticky-label">Overview</span>
+            <span id="filterSummary" class="filter-summary compact">0 of 0 visible</span>
+          </div>
+          <div class="filter-sticky-actions">
+            <input id="componentFilterInput" class="filter-search" placeholder="Find component">
+            <button id="resetViewBtn">Reset</button>
+          </div>
+        </div>
+        <details class="filter-section" open>
+          <summary>Filters</summary>
+          <div id="categoryFilters" class="filter-list category-filters"></div>
+          <div class="filter-tools">
+            <button id="showAllBtn">All</button>
+            <button id="hideAllBtn">None</button>
+          </div>
+        </details>
+        <details class="filter-section" open>
+          <summary>Lens</summary>
+          <select id="mapLensSelect" class="filter-search" aria-label="Map lens">
+            <option value="overview">Overview</option>
+            <option value="subway">Subway</option>
+            <option value="apis">APIs</option>
+            <option value="data">Data</option>
+            <option value="tests">Tests</option>
+            <option value="external">External</option>
+            <option value="git">Git</option>
+            <option value="full">Full</option>
+          </select>
+          <div class="filter-tools">
+            <button id="applyLensBtn">Apply lens</button>
+            <button id="smartSimplifyBtn">Simplify</button>
+          </div>
+          <div class="preset-row">
+            <select id="viewPresetSelect" aria-label="Saved view preset"></select>
+            <button id="applyViewPresetBtn">Apply</button>
+            <button id="saveViewPresetBtn">Save</button>
+          </div>
+          <input id="viewPresetNameInput" class="filter-search" placeholder="Preset name">
+          <div class="filter-tools">
+            <button id="exportViewPresetsBtn">Export presets</button>
+            <button id="importViewPresetsBtn">Import presets</button>
+          </div>
+          <input id="viewPresetImportInput" type="file" accept="application/json" hidden>
+        </details>
+        <details class="filter-section" open>
+          <summary>Scale</summary>
+          <label class="filter-control">
+            <span>Min edge weight <strong id="minWeightLabel">1</strong></span>
+            <input id="minWeightInput" type="range" min="1" max="120" value="1">
+          </label>
+          <label class="filter-control">
+            <span>Edge contrast <strong id="edgeContrastLabel">64%</strong></span>
+            <input id="edgeContrastInput" type="range" min="25" max="100" value="64">
+          </label>
+          <label class="filter-control">
+            <span>Node budget</span>
+            <select id="nodeBudgetSelect" aria-label="Node budget">
+              <option value="0">All nodes</option>
+              <option value="12">Top 12</option>
+              <option value="80">Top 80</option>
+              <option value="150">Top 150</option>
+              <option value="180">Top 180</option>
+              <option value="220">Top 220</option>
+              <option value="260">Top 260</option>
+              <option value="300">Top 300</option>
+              <option value="600">Top 600</option>
+            </select>
+          </label>
+          <label class="filter-control inline">
+            <input id="connectedOnlyInput" type="checkbox">
+            <span>Connected only</span>
+          </label>
+          <label class="filter-control inline">
+            <input id="edgeBundlingInput" type="checkbox">
+            <span>Bundle edges</span>
+          </label>
+          <label class="filter-control inline">
+            <input id="focusSelectionInput" type="checkbox">
+            <span>Focus selected</span>
+          </label>
+          <label class="filter-control">
+            <span>Focus hops</span>
+            <select id="focusHopsSelect" aria-label="Focus hops">
+              <option value="1">1 hop</option>
+              <option value="2">2 hops</option>
+              <option value="3">3 hops</option>
+            </select>
+          </label>
+        </details>
+        <details class="filter-section" open>
+          <summary>Connections</summary>
+          <div id="connectionFilters" class="filter-list category-filters"></div>
+          <div class="filter-tools">
+            <button id="showAllConnectionsBtn">All links</button>
+            <button id="onlyApiConnectionsBtn">Only APIs</button>
+          </div>
+        </details>
+        <details class="filter-section status-section" open>
+          <summary>Status</summary>
+          <div id="mapStatusPanel" class="map-status" aria-live="polite"></div>
+          <div class="map-status-actions">
+            <button id="fitSelectionBtn">Fit selection</button>
+            <button id="showEveryNodeBtn">Show all nodes</button>
+          </div>
+        </details>
+        <details class="filter-section components-section" open>
+          <summary>Components</summary>
+          <div id="componentFilters" class="filter-list"></div>
+        </details>
+      </div>
+    </aside>
+    <main>
+      <div id="compareMapControls" class="compare-map-controls">
+        <select id="baseCommitSelect" aria-label="Base commit"></select>
+        <select id="headCommitSelect" aria-label="Head commit"></select>
+        <button id="runCompareBtn">Compare</button>
+        <button id="diffToggleBtn" class="active" aria-pressed="true">Diff</button>
+        <button id="compareChangesOnlyBtn" class="active" aria-pressed="true">Changes</button>
+        <button id="compareSyncBtn" class="active" aria-pressed="true" aria-label="Sync compare camera">Sync</button>
+        <button id="compareExplainBtn">Explain</button>
+        <div id="compareStatus" class="compare-status"></div>
+      </div>
+      <div id="focusBreadcrumb" class="focus-breadcrumb" hidden>
+        <span id="focusBreadcrumbText"></span>
+        <button id="focusBreadcrumbClearBtn" type="button" aria-label="Clear focus">x</button>
+      </div>
+      <canvas id="graphCanvas"></canvas>
+      <div id="edgeHoverTooltip" class="edge-hover-tooltip" hidden></div>
+      <div id="mapLegend" class="legend">
+        <button id="legendToggleBtn" class="legend-toggle" type="button" aria-expanded="true">Legend</button>
+        <span class="legend-item"><span class="legend-dot legend-owned" aria-hidden="true"></span>Owned</span>
+        <span class="legend-item"><span class="legend-dot legend-team" aria-hidden="true"></span>Team deps</span>
+        <span class="legend-item"><span class="legend-dot legend-docs" aria-hidden="true"></span>Docs/config</span>
+        <span class="legend-item"><span class="legend-dot legend-developer" aria-hidden="true"></span>Developer</span>
+        <span class="legend-item"><span class="legend-dot legend-commit" aria-hidden="true"></span>Commit</span>
+        <span class="legend-item"><span class="legend-dot legend-third-party" aria-hidden="true"></span>Third-party</span>
+        <span class="legend-item legend-diff"><span class="legend-dot legend-changed" aria-hidden="true"></span>Changed</span>
+        <span class="legend-item legend-note">Bundled edges show x-counts</span>
+        <span class="legend-item legend-note">Node and edge details</span>
+      </div>
+      <div id="emptyMapOverlay" class="empty-map-overlay" hidden>
+        <div class="empty-map-card">
+          <div id="emptyMapTitle" class="empty-map-title">No visible nodes</div>
+          <div id="emptyMapBody" class="empty-map-body"></div>
+          <div id="emptyMapReasons" class="empty-map-reasons"></div>
+          <div class="empty-map-actions">
+            <button id="emptyMapResetBtn" type="button">Reset view</button>
+            <button id="emptyMapShowAllBtn" type="button">Show all nodes</button>
+            <button id="emptyMapRefreshBtn" type="button">Refresh index</button>
+          </div>
+        </div>
+      </div>
+    </main>
+    <aside class="detail-panel">
+      <div id="detailPanelResizer" class="detail-resizer" role="separator" aria-orientation="vertical" aria-label="Resize details panel"></div>
+      <div class="stats" id="stats"></div>
+      <div class="section-title">Selection</div>
+      <h2 id="selectionTitle">Nothing selected</h2>
+      <input id="detailSearchInput" class="detail-search" placeholder="Search evidence" hidden>
+      <div id="detailTabs" class="detail-tabs" role="tablist" aria-label="Selection detail sections" hidden>
+        <button type="button" class="active" role="tab" aria-selected="true" data-detail-tab="evidence">Evidence</button>
+        <button type="button" role="tab" aria-selected="false" data-detail-tab="flow">Flow</button>
+        <button type="button" role="tab" aria-selected="false" data-detail-tab="files">Files</button>
+        <button type="button" role="tab" aria-selected="false" data-detail-tab="history">History</button>
+      </div>
+      <div id="detailTabEmpty" class="detail-tab-empty" hidden></div>
+      <div id="selectionMeta" class="details"></div>
+      <div class="section-title">Paths</div>
+      <div id="savedPaths" class="path-list"></div>
+      <div class="section-title">Architectures</div>
+      <div class="architecture-actions">
+        <input id="architectureNameInput" placeholder="Architecture name">
+        <button id="saveArchitectureBtn">Save</button>
+      </div>
+      <div id="savedArchitectures" class="path-list"></div>
+      <div class="section-title">Repo Questions</div>
+      <div id="repoQuestions" class="workflow-grid"></div>
+      <div class="section-title">Diagnostics</div>
+      <div id="classificationWizard" class="wizard-panel"></div>
+      <div id="perfPanel" class="perf-panel"></div>
+      <div id="diagnosticsPanel" class="diagnostics-panel"></div>
+      <div class="section-title">Ask</div>
+      <div class="chat-box">
+        <textarea id="chatQuestion" placeholder="Ask about code or commits"></textarea>
+        <div class="chat-actions">
+          <button id="askBtn">Ask</button>
+          <button id="agentContextBtn">Agent Pack</button>
+          <span id="chatStatus" class="chat-status"></span>
+        </div>
+        <div id="chatAnswer" class="chat-answer"></div>
+        <div id="chatSources" class="chat-section"></div>
+      </div>
+      <div id="topEdgesTitle" class="section-title">Top Connections</div>
+      <div id="topEdges"></div>
+      <div class="section-title">Help</div>
+      <details class="detail-card">
+        <summary>Color guide</summary>
+        <div class="detail-body help-grid">
+          <div class="help-row"><span class="color-dot component"></span><span><strong>Blue</strong> owned components and core project modules</span></div>
+          <div class="help-row"><span class="color-dot api"></span><span><strong>Cyan</strong> function/API calls and team dependencies</span></div>
+          <div class="help-row"><span class="color-dot common"></span><span><strong>Gray</strong> docs, config, generated files, and standard utilities</span></div>
+          <div class="help-row"><span class="color-dot import"></span><span><strong>Violet</strong> third-party dependencies, imports, and inheritance</span></div>
+          <div class="help-row"><span class="color-dot test"></span><span><strong>Pink</strong> tests and validation paths</span></div>
+          <div class="help-row"><span class="color-dot db"></span><span><strong>Green</strong> data, database, and ownership nodes</span></div>
+          <div class="help-row"><span class="color-dot commit"></span><span><strong>Amber</strong> commits, config, and co-change history</span></div>
+          <div class="help-row"><span class="color-dot changed"></span><span><strong>Red</strong> diff-highlighted changes and high-risk architecture</span></div>
+        </div>
+      </details>
+    </aside>
+    <div id="nodeContextMenu" class="context-menu" role="menu" hidden>
+      <div id="nodeContextLabel" class="context-menu-label"></div>
+      <button id="contextEditNodeBtn" type="button" role="menuitem">Edit node</button>
+      <button id="contextServiceNodeBtn" type="button" role="menuitem">Mark as service</button>
+      <button id="contextOwnedNodeBtn" type="button" role="menuitem">Classify owned</button>
+      <button id="contextTeamNodeBtn" type="button" role="menuitem">Classify team</button>
+      <button id="contextThirdPartyNodeBtn" type="button" role="menuitem">Classify third-party</button>
+      <button id="contextHideNodeBtn" type="button" role="menuitem">Hide by default</button>
+    </div>
+    <div id="commandPalette" class="command-palette-shell" hidden>
+      <div id="commandPaletteBackdrop" class="command-palette-backdrop"></div>
+      <div class="command-palette" role="dialog" aria-modal="true" aria-labelledby="commandPaletteTitle">
+        <div id="commandPaletteTitle" class="command-palette-title">Command Palette</div>
+        <input id="commandPaletteInput" placeholder="Search actions" autocomplete="off">
+        <div id="commandPaletteResults" class="command-palette-results"></div>
+      </div>
+    </div>
+    <div id="helpTooltip" class="help-tooltip" role="tooltip" hidden></div>
+  </div>
+  <script>
+{{ CODEATLAS_JS }}
+  </script>
+</body>
+</html>
