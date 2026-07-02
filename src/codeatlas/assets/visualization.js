@@ -65,6 +65,7 @@
     ];
     const REPO_QUESTIONS = [
       { label: 'Where start?', lens: 'subway', question: 'Where should I start understanding this repository?' },
+      { label: 'First-time brief', lens: 'subway', action: 'briefing', question: 'Open the first-time reader briefing.' },
       { label: 'Recent changes', lens: 'git', question: 'What changed recently and why does it matter?' },
       { label: 'Risk areas', lens: 'overview', question: 'Which parts of this repository look risky or high churn?' },
       { label: 'API/data flow', lens: 'apis', question: 'Show the important API and data flow paths.' },
@@ -91,14 +92,26 @@
     const CANVAS_ZOOM_MIN = 0.12;
     const CANVAS_ZOOM_MAX = 18;
     const URL_STATE_KEYS = [
-      'state', 'view', 'lens', 'cat', 'conn', 'hidden', 'selected', 'side', 'detailTab', 'trace', 'pin', 'focus',
+      'state', 'view', 'brief', 'file', 'filePath', 'fileDepth', 'lens', 'cat', 'conn', 'hidden', 'selected', 'side', 'detailTab', 'trace', 'flow', 'flowStep', 'pin', 'focus',
       'hops', 'budget', 'min', 'connected', 'contrast', 'bundles', 'z', 'pan',
       'base', 'head', 'baseVp', 'headVp', 'changes', 'sync'
     ];
+    const VIEW_CHOICES = ['briefing', 'architecture'];
+    const BRIEFING_SECTION_IDS = ['start', 'concepts', 'runtime', 'core', 'data', 'tests', 'risk', 'agent', 'chapters', 'flows', 'ignore'];
     const state = {
       raw: null,
       view: 'architecture',
       compare: null,
+      briefing: null,
+      briefingLoading: false,
+      briefingError: '',
+      activeBriefingSection: 'start',
+      fileFlowStartId: '',
+      fileFlowDepth: 3,
+      fileFlowPathIds: [],
+      fileFlowLayers: [],
+      fileFlowControlsSignature: '',
+      fileFlowSelectedExampleIndex: 0,
       commitOptions: [],
       zoom: 1,
       panX: 0,
@@ -168,6 +181,8 @@
       focusHops: 1,
       traceMode: null,
       pinnedTrace: null,
+      flowPlayback: null,
+      pendingFlowPlaybackUrl: null,
       performanceGuardActive: false,
       pendingUrlState: null,
       urlStateApplied: false,
@@ -183,6 +198,7 @@
       autoReloadStaleUi: loadAutoReloadPreference(),
       staleReloadTimer: null,
       staleReloadSeconds: 0,
+      loadingTasks: {},
       graphWorker: null,
       graphWorkerRequestId: 0,
       graphWorkerInFlight: false,
@@ -240,13 +256,112 @@
     };
 
     function setActiveViewButton() {
+      document.getElementById('briefingViewBtn').classList.toggle('active', state.view === 'briefing');
       document.getElementById('architectureBtn').classList.toggle('active', state.view === 'architecture');
-      document.getElementById('commitsBtn').classList.toggle('active', state.view === 'commits');
-      document.getElementById('compareViewBtn').classList.toggle('active', state.view === 'compare');
-      document.getElementById('compareMapControls').classList.toggle('active', state.view === 'compare');
+      const compareControls = document.getElementById('compareMapControls');
+      if (compareControls) {
+        compareControls.classList.remove('active');
+        compareControls.hidden = true;
+        compareControls.setAttribute('aria-hidden', 'true');
+      }
       document.getElementById('app').classList.toggle('compare-mode', state.view === 'compare');
+      document.getElementById('app').classList.toggle('briefing-mode', state.view === 'briefing');
+      const briefingOverlay = document.getElementById('briefingOverlay');
+      if (briefingOverlay) briefingOverlay.hidden = state.view !== 'briefing';
+      const fileFlowControls = document.getElementById('fileFlowLayerControls');
+      if (fileFlowControls) fileFlowControls.hidden = state.view !== 'fileflow';
+      renderFlowPlaybackHud();
       updateDiffToggle();
       updateCompareModeControls();
+      renderLoadingIndicators();
+    }
+
+    function setLoadingTask(id, title, body, options) {
+      if (!id) return;
+      state.loadingTasks[id] = {
+        id,
+        title: title || 'Loading',
+        body: body || 'Preparing CodeAtlas view...',
+        blocking: !(options && options.blocking === false),
+        surface: options && options.surface ? options.surface : ''
+      };
+      renderLoadingIndicators();
+    }
+
+    function clearLoadingTask(id) {
+      if (!id || !state.loadingTasks[id]) return;
+      delete state.loadingTasks[id];
+      renderLoadingIndicators();
+    }
+
+    function activeLoadingTasks() {
+      const tasks = Object.values(state.loadingTasks || {});
+      const order = ['graph', 'refresh', 'compare', 'briefing', 'filters', 'workflow', 'query', 'agent', 'compareWarm'];
+      return tasks.sort((a, b) => {
+        const ai = order.indexOf(a.id);
+        const bi = order.indexOf(b.id);
+        return (ai === -1 ? order.length : ai) - (bi === -1 ? order.length : bi);
+      });
+    }
+
+    function primaryLoadingTask() {
+      const tasks = activeLoadingTasks();
+      return tasks.find(task => task.blocking) || tasks[0] || null;
+    }
+
+    function renderLoadingIndicators() {
+      const tasks = activeLoadingTasks();
+      const primary = primaryLoadingTask();
+      const globalBadge = document.getElementById('globalLoadingBadge');
+      const globalText = document.getElementById('globalLoadingText');
+      if (globalBadge && globalText) {
+        globalBadge.hidden = !primary;
+        if (primary) globalText.textContent = primary.title;
+      }
+      const overlay = document.getElementById('loadingOverlay');
+      if (overlay) {
+        const showOverlay = Boolean(primary && state.view !== 'briefing');
+        overlay.hidden = !showOverlay;
+        if (showOverlay) {
+          document.getElementById('loadingOverlayTitle').textContent = primary.title;
+          document.getElementById('loadingOverlayBody').textContent = primary.body;
+        }
+      }
+      const filterBadge = document.getElementById('filterLoadingBadge');
+      if (filterBadge) filterBadge.hidden = !tasks.some(task => task.id === 'filters');
+    }
+
+    function setInlineStatusLoading(elementOrId, text, loading) {
+      const element = typeof elementOrId === 'string' ? document.getElementById(elementOrId) : elementOrId;
+      if (!element) return;
+      element.innerHTML = '';
+      if (!loading) {
+        element.textContent = text || '';
+        return;
+      }
+      const wrapper = document.createElement('span');
+      wrapper.className = 'inline-loading';
+      const spinner = document.createElement('span');
+      spinner.className = 'loading-spinner';
+      spinner.setAttribute('aria-hidden', 'true');
+      const label = document.createElement('span');
+      label.textContent = text || 'Loading...';
+      wrapper.append(spinner, label);
+      element.appendChild(wrapper);
+    }
+
+    function setButtonLoading(elementOrId, loading, loadingText, idleText) {
+      const button = typeof elementOrId === 'string' ? document.getElementById(elementOrId) : elementOrId;
+      if (!button) return;
+      if (idleText !== undefined) button.dataset.idleText = idleText;
+      button.classList.toggle('is-loading', Boolean(loading));
+      if (loading) {
+        button.disabled = true;
+        if (loadingText) button.textContent = loadingText;
+      } else {
+        button.disabled = false;
+        if (button.dataset.idleText) button.textContent = button.dataset.idleText;
+      }
     }
 
     loadSavedPaths();
@@ -262,13 +377,21 @@
     loadGraph();
 
     document.getElementById('refreshBtn').onclick = () => refreshGraph();
+    document.getElementById('briefingViewBtn').onclick = () => setGraph('briefing');
     document.getElementById('filterPanelToggle').onclick = () => toggleFilterPanel();
     document.getElementById('legendToggleBtn').onclick = () => toggleLegendCollapsed();
     document.getElementById('architectureBtn').onclick = () => setGraph('architecture');
     document.getElementById('addConnectionBtn').onclick = () => openAddConnectionForm();
     document.getElementById('saveArchitectureBtn').onclick = () => saveCurrentArchitecture();
-    document.getElementById('commitsBtn').onclick = () => setGraph('commits');
-    document.getElementById('compareViewBtn').onclick = () => setGraph('compare');
+    document.getElementById('briefingRefreshBtn').onclick = () => loadBriefing(true);
+    document.getElementById('briefingCopyBtn').onclick = () => copyBriefingAgentBrief();
+    document.getElementById('briefingMapBtn').onclick = () => openBriefingMapPath();
+    document.getElementById('flowPlaybackCloseBtn').onclick = () => stopFlowPlayback();
+    document.getElementById('flowPlaybackPrevBtn').onclick = () => stepFlowPlayback(-1);
+    document.getElementById('flowPlaybackPlayBtn').onclick = () => toggleFlowPlayback();
+    document.getElementById('flowPlaybackNextBtn').onclick = () => stepFlowPlayback(1);
+    document.getElementById('flowPlaybackSpeedSelect').onchange = event => setFlowPlaybackSpeed(Number(event.target.value || 1600));
+    document.getElementById('flowPlaybackScrubber').oninput = event => setFlowPlaybackStep(Number(event.target.value || 0), true);
     document.getElementById('runCompareBtn').onclick = () => runCompare();
     document.getElementById('diffToggleBtn').onclick = () => toggleDiffHighlight();
     document.getElementById('compareChangesOnlyBtn').onclick = () => toggleCompareChangesOnly();
@@ -599,8 +722,6 @@
       setHelp(document.getElementById('refreshBtn'), 'Refresh re-indexes the repository and redraws the current architecture from the latest files and commits.');
       setHelp(document.getElementById('architectureBtn'), 'Architecture shows the current component graph: owned code, team dependencies, important tests, custom edges, and how they connect.');
       setHelp(document.getElementById('addConnectionBtn'), 'Add a manual architecture edge or vertex. Use this when you know about an API, database, service, or dependency relationship CodeAtlas cannot infer automatically.');
-      setHelp(document.getElementById('commitsBtn'), 'Commits switches to the git-history map, where commits, authors, files, and co-change evidence explain how the repo evolved.');
-      setHelp(document.getElementById('compareViewBtn'), 'Compare opens two commit snapshots side by side so you can inspect architecture changes between revisions.');
       setHelp(document.getElementById('legendToggleBtn'), 'Collapses or expands the map legend. CodeAtlas auto-compacts the legend when it would overlap the minimap or take too much canvas space.');
       setHelp(document.getElementById('compareMapControls'), 'These are the only compare controls. They sit inside the compare map header so the selected base/head commits are changed in one place.');
       setHelp(document.getElementById('runCompareBtn'), 'Runs the selected base/head commit comparison and redraws both snapshots. Use Diff to highlight what changed.');
@@ -614,6 +735,10 @@
       setHelp(document.getElementById('detailPanelResizer'), 'Drag this edge left or right to resize the detail panel. CodeAtlas remembers the width locally for this browser.');
       setHelp(document.getElementById('detailTabs'), 'Switches the selection panel between evidence, flow, file/location, and history sections without changing the map.');
       setHelp(document.getElementById('mapLensSelect'), 'Lens presets reconfigure categories, connection types, node budget, and edge weight for common repo-understanding tasks such as APIs, data flow, tests, external services, and git history.');
+      setHelp(document.getElementById('briefingViewBtn'), 'Opens the First-Time Reader briefing: a guided repo overview backed by files, symbols, edges, routes, and commits.');
+      setHelp(document.getElementById('briefingRefreshBtn'), 'Rebuilds the briefing from the current local CodeAtlas index.');
+      setHelp(document.getElementById('briefingCopyBtn'), 'Copies a deterministic orientation brief for Codex, Claude, or another coding agent.');
+      setHelp(document.getElementById('briefingMapBtn'), 'Switches from briefing back to the simplified architecture map.');
       setHelp(document.getElementById('applyLensBtn'), 'Applies the selected lens to the map. This is the fastest way to turn a huge repo into a focused question.');
       setHelp(document.getElementById('smartSimplifyBtn'), 'Simplify hides docs/config, third-party, generated, isolated, and git-history noise, then keeps the strongest connected nodes so large repositories stay readable.');
       setHelp(document.getElementById('resetViewBtn'), 'Resets search, component filtering, lens, node budget, and connection filters back to the standard overview.');
@@ -1702,6 +1827,7 @@
     }
 
     function loadGraph() {
+      setLoadingTask('graph', 'Loading architecture', 'Reading the indexed graph and repository memory from the local CodeAtlas server.');
       fetch('/api/graph')
         .then(r => r.json())
         .then(data => {
@@ -1713,6 +1839,9 @@
           state.graphLoadError = err.message || 'Graph request failed';
           document.getElementById('repoMeta').textContent = 'Failed to load graph: ' + err.message;
           updateEmptyMapOverlay(true);
+        })
+        .finally(() => {
+          clearLoadingTask('graph');
         });
     }
 
@@ -1720,8 +1849,8 @@
       const button = document.getElementById('refreshBtn');
       const previousText = button.textContent;
       const nextView = state.view === 'commits' ? 'commits' : 'architecture';
-      button.disabled = true;
-      button.textContent = 'Refreshing...';
+      setLoadingTask('refresh', 'Refreshing index', 'Re-indexing the repository, rebuilding graph evidence, and refreshing the current view.');
+      setButtonLoading(button, true, 'Refreshing', previousText);
       setRepoStatus('Refreshing index and graph...');
       fetch('/api/refresh', {
         method: 'POST',
@@ -1745,8 +1874,8 @@
           setRepoStatus('Refresh failed: ' + err.message);
         })
         .finally(() => {
-          button.disabled = false;
-          button.textContent = previousText;
+          clearLoadingTask('refresh');
+          setButtonLoading(button, false, '', previousText);
         });
     }
 
@@ -1948,7 +2077,11 @@
       }
       if (!URL_STATE_KEYS.some(key => key !== 'state' && params.has(key))) return null;
       return {
-        view: cleanUrlChoice(params.get('view'), ['architecture', 'commits', 'compare']),
+        view: cleanUrlChoice(params.get('view'), VIEW_CHOICES),
+        brief: cleanUrlChoice(params.get('brief'), BRIEFING_SECTION_IDS),
+        fileStart: params.get('file') || '',
+        filePath: csvParam(params, 'filePath'),
+        fileDepth: numberUrlParam(params.get('fileDepth'), null),
         lens: cleanUrlChoice(params.get('lens'), Object.keys(LENS_LABELS)),
         categories: csvParam(params, 'cat'),
         connections: csvParam(params, 'conn'),
@@ -1957,6 +2090,8 @@
         side: cleanUrlChoice(params.get('side'), ['base', 'head']),
         detailTab: cleanUrlChoice(params.get('detailTab'), DETAIL_TABS),
         trace: cleanUrlChoice(params.get('trace'), ['neighbors', 'callers', 'callees', 'api', 'tests', 'git']),
+        flowId: params.get('flow') || '',
+        flowStep: numberUrlParam(params.get('flowStep'), null),
         pin: pinnedTraceFromUrlParam(params.get('pin')),
         focus: boolUrlParam(params.get('focus')),
         hops: numberUrlParam(params.get('hops'), 1),
@@ -1978,7 +2113,11 @@
     function urlStateFromCompactPayload(payload) {
       if (!payload || typeof payload !== 'object') return null;
       return {
-        view: cleanUrlChoice(payload.view || payload.v, ['architecture', 'commits', 'compare']),
+        view: cleanUrlChoice(payload.view || payload.v, VIEW_CHOICES),
+        brief: cleanUrlChoice(payload.brief || payload.br, BRIEFING_SECTION_IDS),
+        fileStart: String(payload.fileStart || payload.file || payload.ff || ''),
+        filePath: arrayUrlPayload(payload.filePath || payload.fp),
+        fileDepth: numberUrlParam(payload.fileDepth !== undefined ? payload.fileDepth : payload.fd, null),
         lens: cleanUrlChoice(payload.lens || payload.l, Object.keys(LENS_LABELS)),
         categories: arrayUrlPayload(payload.categories || payload.cat || payload.c),
         connections: arrayUrlPayload(payload.connections || payload.conn || payload.k),
@@ -1987,6 +2126,8 @@
         side: cleanUrlChoice(payload.side, ['base', 'head']),
         detailTab: cleanUrlChoice(payload.detailTab || payload.dt, DETAIL_TABS),
         trace: cleanUrlChoice(payload.trace || payload.t, ['neighbors', 'callers', 'callees', 'api', 'tests', 'git']),
+        flowId: String(payload.flowId || payload.flow || payload.fl || ''),
+        flowStep: numberUrlParam(payload.flowStep !== undefined ? payload.flowStep : payload.fs, null),
         pin: pinnedTraceFromUrlParam(payload.pin || payload.p),
         focus: boolUrlParam(payload.focus !== undefined ? payload.focus : payload.f),
         hops: numberUrlParam(payload.hops !== undefined ? payload.hops : payload.hp, 1),
@@ -2120,6 +2261,10 @@
       if (urlState.view === 'compare' && !state.compare) return false;
       state.isRestoringUrlState = true;
       try {
+        if (urlState.brief) state.activeBriefingSection = urlState.brief;
+        if (urlState.fileStart) state.fileFlowStartId = urlState.fileStart;
+        if (urlState.filePath && urlState.filePath.length) state.fileFlowPathIds = urlState.filePath;
+        if (urlState.fileDepth !== null) state.fileFlowDepth = clamp(Math.round(urlState.fileDepth), 1, 5);
         if (urlState.lens) applyMapLens(urlState.lens);
         if (urlState.categories.length) setCategoryVisibilitySet(urlState.categories);
         if (urlState.connections.length) setConnectionVisibilitySet(urlState.connections);
@@ -2141,6 +2286,7 @@
         updateCompareModeControls();
         applyFilters();
         applyUrlViewport(urlState);
+        restoreUrlFlowPlayback(urlState);
         renderFilterControls();
         renderSelection(state.selected);
         state.pendingUrlState = null;
@@ -2205,6 +2351,7 @@
       const selected = selectedNodeForUrl();
       const payload = {
         v: state.view,
+        br: state.activeBriefingSection || 'start',
         l: state.activeLens || 'overview',
         c: visibleCategoryIds(),
         k: visibleConnectionIds(),
@@ -2224,6 +2371,10 @@
         if (selected.side) payload.side = selected.side;
       }
       if (state.traceMode) payload.t = state.traceMode;
+      if (state.flowPlayback && state.flowPlayback.flowId) {
+        payload.fl = state.flowPlayback.flowId;
+        payload.fs = state.flowPlayback.stepIndex || 0;
+      }
       if (state.pinnedTrace) payload.p = pinnedTraceToUrlValue(state.pinnedTrace);
       if (state.view === 'compare') {
         const refs = selectedCompareRefs();
@@ -2233,6 +2384,11 @@
         payload.hvp = viewportToUrlTriplet(state.compareViewports.head);
         payload.ch = state.compareChangesOnly ? 1 : 0;
         payload.sy = state.compareSyncViewports ? 1 : 0;
+      }
+      if (state.view === 'fileflow') {
+        payload.ff = state.fileFlowStartId || '';
+        payload.fp = (state.fileFlowPathIds || []).filter(Boolean);
+        payload.fd = state.fileFlowDepth || 3;
       }
       return payload;
     }
@@ -2249,7 +2405,17 @@
         if (payload.side) params.set('side', payload.side);
       }
       if (payload.t) params.set('trace', payload.t);
+      if (payload.fl) {
+        params.set('flow', payload.fl);
+        params.set('flowStep', String(payload.fs || 0));
+      }
       if (payload.p) params.set('pin', payload.p);
+      if (payload.v === 'briefing' && payload.br) params.set('brief', payload.br);
+      if (payload.v === 'fileflow' && payload.ff) {
+        params.set('file', payload.ff);
+        if (payload.fp && payload.fp.length) params.set('filePath', payload.fp.join(','));
+        params.set('fileDepth', String(payload.fd || 3));
+      }
       if (payload.dt) params.set('detailTab', payload.dt);
       params.set('focus', payload.f ? '1' : '0');
       params.set('hops', String(payload.hp || 1));
@@ -2319,9 +2485,10 @@
       state.compareWarmKey = key;
       const status = document.getElementById('compareStatus');
       if (!state.compareInFlight) {
+        setLoadingTask('compareWarm', 'Preparing compare', 'Warming the selected compare snapshots so the diff opens faster.', { blocking: false });
         status.dataset.mode = 'warm';
         status.classList.remove('error-text');
-        status.textContent = 'Preparing compare cache...';
+        setInlineStatusLoading(status, 'Preparing compare cache...', true);
       }
       fetch('/api/compare/warm', {
         method: 'POST',
@@ -2337,10 +2504,12 @@
           if (state.compareWarmKey !== key || state.compareInFlight || status.dataset.mode === 'compare') return;
           const misses = (payload.warmed || []).filter(item => item.cache === 'miss').length;
           status.dataset.mode = 'warm';
+          clearLoadingTask('compareWarm');
           status.textContent = misses ? 'Compare cache ready' : 'Compare cache already ready';
         })
         .catch(err => {
           if (state.compareWarmKey !== key || state.compareInFlight || status.dataset.mode === 'compare') return;
+          clearLoadingTask('compareWarm');
           status.textContent = 'Compare cache failed: ' + err.message;
           status.classList.add('error-text');
         });
@@ -2350,8 +2519,11 @@
       const { base, head } = selectedCompareRefs();
       const status = document.getElementById('compareStatus');
       state.compareInFlight = true;
+      clearLoadingTask('compareWarm');
+      setLoadingTask('compare', 'Loading compare', 'Building before/after snapshots, indexing both refs, and ranking changed evidence.');
+      setButtonLoading('runCompareBtn', true, 'Comparing', 'Compare');
       status.dataset.mode = 'compare';
-      status.textContent = 'Loading compare graph...';
+      setInlineStatusLoading(status, 'Loading compare graph...', true);
       status.classList.remove('error-text');
       fetch('/api/compare?base=' + encodeURIComponent(base) + '&head=' + encodeURIComponent(head))
         .then(async response => {
@@ -2371,6 +2543,8 @@
         })
         .finally(() => {
           state.compareInFlight = false;
+          clearLoadingTask('compare');
+          setButtonLoading('runCompareBtn', false, '', 'Compare');
         });
     }
 
@@ -2380,7 +2554,8 @@
       const answerRoot = document.getElementById('chatAnswer');
       const sourcesRoot = document.getElementById('chatSources');
       if (!question) return;
-      status.textContent = 'Thinking...';
+      setLoadingTask('query', 'Thinking', 'Retrieving relevant graph evidence and composing an answer.', { blocking: false });
+      setInlineStatusLoading(status, 'Thinking...', true);
       status.classList.remove('error-text');
       answerRoot.classList.remove('workflow-mode');
       answerRoot.textContent = '';
@@ -2403,6 +2578,9 @@
         .catch(err => {
           status.textContent = err.message;
           status.classList.add('error-text');
+        })
+        .finally(() => {
+          clearLoadingTask('query');
         });
     }
 
@@ -2422,6 +2600,10 @@
     function runRepoQuestion(item) {
       if (item.lens) applyMapLens(item.lens);
       document.getElementById('chatQuestion').value = item.question;
+      if (item.action === 'briefing') {
+        setGraph('briefing');
+        return;
+      }
       if (item.action) {
         runToolWorkflow(item.action, item);
       } else if (item.label.toLowerCase().includes('agent')) {
@@ -2433,11 +2615,1391 @@
       }
     }
 
+    function loadBriefing(force) {
+      if (state.briefing && !force) {
+        renderBriefing();
+        restorePendingFlowPlayback();
+        return;
+      }
+      state.briefingLoading = true;
+      state.briefingError = '';
+      setLoadingTask('briefing', 'Building briefing', 'Ranking docs, components, symbols, flows, and commits into a first-time reader guide.');
+      setButtonLoading('briefingRefreshBtn', true, 'Refreshing', 'Refresh briefing');
+      renderBriefing();
+      fetch('/api/briefing')
+        .then(async response => {
+          const payload = await response.json();
+          if (!response.ok || !payload.ok) throw new Error(payload.error || 'Briefing failed');
+          return payload;
+        })
+        .then(payload => {
+          state.briefing = payload;
+          state.briefingLoading = false;
+          state.briefingError = '';
+          if (!state.activeBriefingSection) state.activeBriefingSection = 'start';
+          renderBriefing();
+          restorePendingFlowPlayback();
+        })
+        .catch(err => {
+          state.briefingLoading = false;
+          state.briefingError = err.message || 'Briefing request failed';
+          renderBriefing();
+        })
+        .finally(() => {
+          clearLoadingTask('briefing');
+          setButtonLoading('briefingRefreshBtn', false, '', 'Refresh briefing');
+        });
+    }
+
+    function renderBriefing() {
+      const payload = state.briefing || {};
+      const title = document.getElementById('briefingTitle');
+      const summary = document.getElementById('briefingSummary');
+      const status = document.getElementById('briefingStatus');
+      if (!title || !summary || !status) return;
+      title.textContent = payload.repo ? payload.repo.name + ' briefing' : 'Repository briefing';
+      summary.textContent = payload.summary && payload.summary.headline
+        ? payload.summary.headline
+        : 'A guided, evidence-backed reading path for a new contributor.';
+      const briefingStatusText = state.briefingLoading
+        ? 'Building briefing from the local index...'
+        : state.briefingError
+          ? state.briefingError
+          : payload.cache && payload.cache.hit
+            ? 'Loaded from workflow cache, age ' + Math.round(payload.cache.age_seconds || 0) + 's'
+            : payload.repo
+              ? 'Briefing ready from indexed files, symbols, edges, and commits.'
+              : '';
+      setInlineStatusLoading(status, briefingStatusText, state.briefingLoading);
+      status.classList.toggle('error-text', Boolean(state.briefingError));
+      renderBriefingDashboard(payload.dashboard || {});
+      renderBriefingSteps(payload);
+      renderBriefingContent(payload);
+    }
+
+    function renderBriefingDashboard(dashboard) {
+      const root = document.getElementById('briefingDashboard');
+      if (!root) return;
+      root.innerHTML = '';
+      const stats = dashboard.stats || {};
+      const coverage = dashboard.coverage || {};
+      const cards = [
+        ['Files', stats.files],
+        ['Symbols', stats.symbols],
+        ['Components', stats.components],
+        ['Edges', stats.edges],
+        ['Commits', stats.commits],
+        ['Tests', coverage.test_files],
+        ['Docs/config', coverage.docs_config_files],
+        ['Unresolved calls', coverage.unresolved_calls]
+      ];
+      for (const [label, value] of cards) {
+        const card = document.createElement('div');
+        card.className = 'briefing-metric';
+        card.innerHTML = '<span></span><strong></strong>';
+        card.querySelector('span').textContent = label;
+        card.querySelector('strong').textContent = value === undefined || value === null ? '0' : String(value);
+        root.appendChild(card);
+      }
+    }
+
+    function renderBriefingSteps(payload) {
+      const root = document.getElementById('briefingSteps');
+      if (!root) return;
+      const sections = briefingSections(payload);
+      const active = normalizeBriefingSection(state.activeBriefingSection, payload);
+      state.activeBriefingSection = active;
+      root.innerHTML = '';
+      for (const [index, section] of sections.entries()) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'briefing-step' + (active === section.id ? ' active' : '');
+        button.innerHTML = '<span></span><strong></strong><em></em>';
+        button.querySelector('span').textContent = String(index + 1).padStart(2, '0');
+        button.querySelector('strong').textContent = section.label;
+        button.querySelector('em').textContent = section.kicker;
+        button.onclick = () => activateBriefingSection(section.id);
+        root.appendChild(button);
+      }
+    }
+
+    function activateBriefingSection(section) {
+      state.activeBriefingSection = normalizeBriefingSection(section, state.briefing || {});
+      renderBriefing();
+      scheduleUrlStateUpdate();
+    }
+
+    function briefingSections(payload) {
+      const conceptCount = (payload.concepts || []).length;
+      return [
+        { id: 'start', label: 'Start here', kicker: (payload.start_here || []).length + ' read first' },
+        { id: 'concepts', label: 'Main concepts', kicker: conceptCount + ' terms' },
+        { id: 'runtime', label: 'Main runtime flow', kicker: briefingFlowCount(payload, ['request-flow', 'startup-config-flow', 'dependency-flow']) + ' flows' },
+        { id: 'core', label: 'Core components', kicker: briefingChapterComponentCount(payload, architectureChapterIds()) + ' components' },
+        { id: 'data', label: 'Data/state', kicker: briefingFlowCount(payload, ['data-model-flow']) + ' flow' },
+        { id: 'tests', label: 'Tests', kicker: briefingFlowCount(payload, ['test-flow']) + ' flow' },
+        { id: 'risk', label: 'Risk/recent change', kicker: briefingChapterComponentCount(payload, ['change-risk']) + ' areas' },
+        { id: 'agent', label: 'Agent context', kicker: 'copyable' }
+      ];
+    }
+
+    function normalizeBriefingSection(section, payload) {
+      const ids = new Set(briefingSections(payload).map(item => item.id));
+      const aliases = {
+        chapters: 'core',
+        flows: 'runtime',
+        ignore: 'start',
+        agentBrief: 'agent'
+      };
+      const mapped = aliases[section] || section || 'start';
+      return ids.has(mapped) ? mapped : 'start';
+    }
+
+    function renderBriefingContent(payload) {
+      const root = document.getElementById('briefingContent');
+      if (!root) return;
+      root.innerHTML = '';
+      if (state.briefingLoading && !payload.repo) {
+        root.appendChild(briefingEmptyCard('Loading briefing', 'CodeAtlas is ranking components and collecting evidence from the local index.', true));
+        return;
+      }
+      if (state.briefingError) {
+        root.appendChild(briefingEmptyCard('Briefing failed', state.briefingError));
+        return;
+      }
+      if (!payload.repo) {
+        root.appendChild(briefingEmptyCard('No briefing yet', 'Open the Briefing view after the repository graph loads.'));
+        return;
+      }
+      const section = normalizeBriefingSection(state.activeBriefingSection, payload);
+      state.activeBriefingSection = section;
+      if (section === 'start') renderBriefingStart(root, payload);
+      else if (section === 'concepts') renderBriefingConcepts(root, payload);
+      else if (section === 'runtime') renderBriefingRuntime(root, payload);
+      else if (section === 'core') renderBriefingCore(root, payload);
+      else if (section === 'data') renderBriefingData(root, payload);
+      else if (section === 'tests') renderBriefingTests(root, payload);
+      else if (section === 'risk') renderBriefingRisk(root, payload);
+      else renderBriefingAgent(root, payload);
+    }
+
+    function renderBriefingStart(root, payload) {
+      appendNewEngineerDashboard(root, payload);
+      appendBriefingSummary(root, payload);
+      appendBriefingActions(root, payload.dashboard && payload.dashboard.recommended_next_actions);
+    }
+
+    function appendNewEngineerDashboard(root, payload) {
+      const dashboard = newEngineerDashboard(payload);
+      const section = document.createElement('section');
+      section.className = 'new-engineer-dashboard';
+      section.innerHTML = '<div class="new-engineer-head"><div><div class="briefing-kicker"></div><h3></h3><p></p></div></div><div class="new-engineer-panels"></div>';
+      section.querySelector('.briefing-kicker').textContent = 'New Engineer Dashboard';
+      section.querySelector('h3').textContent = dashboard.title || 'First read dashboard';
+      section.querySelector('p').textContent = dashboard.summary || 'Read the repo from evidence, not from a full graph dump.';
+      const panels = section.querySelector('.new-engineer-panels');
+      for (const item of dashboard.sections || []) {
+        panels.appendChild(newEngineerPanel(item));
+      }
+      root.appendChild(section);
+    }
+
+    function newEngineerDashboard(payload) {
+      if (payload.new_engineer_dashboard && (payload.new_engineer_dashboard.sections || []).length) {
+        return payload.new_engineer_dashboard;
+      }
+      return {
+        title: 'First read dashboard',
+        summary: payload.summary && payload.summary.headline ? payload.summary.headline : 'Read the repo from evidence, not from a full graph dump.',
+        sections: newEngineerFallbackSections(payload)
+      };
+    }
+
+    function newEngineerFallbackSections(payload) {
+      const flows = payload.flows || [];
+      const flowIds = new Set(['request-flow', 'startup-config-flow', 'data-model-flow', 'test-flow', 'git-change-flow']);
+      const risk = briefingChapters(payload, ['change-risk'])[0] || {};
+      return [
+        {
+          id: 'read-first',
+          title: 'Read these first',
+          summary: 'The shortest evidence-backed reading queue before opening the full graph.',
+          target_section: 'start',
+          items: (payload.start_here || []).slice(0, 4)
+        },
+        {
+          id: 'understand-flows',
+          title: 'Understand these flows',
+          summary: 'Runtime, startup/config, data/model, tests, and git/change paths that explain how the repo moves.',
+          target_section: 'runtime',
+          items: flows.filter(flow => flowIds.has(flow.id)).slice(0, 5).map(flow => newEngineerFlowItem(flow))
+        },
+        {
+          id: 'avoid-noise',
+          title: 'Avoid this noise',
+          summary: 'Third-party imports and setup/docs paths that can overwhelm a first read.',
+          target_section: 'start',
+          items: (payload.ignore_for_now || []).slice(0, 4).map(item => ({
+            title: item.name,
+            kind: item.kind,
+            reason: item.reason,
+            evidence: item.evidence || []
+          }))
+        },
+        {
+          id: 'high-risk',
+          title: 'High-risk areas',
+          summary: 'High-churn, high-degree, or recently touched areas that deserve careful verification.',
+          target_section: 'risk',
+          items: (risk.components || []).slice(0, 4).map(component => ({
+            title: component,
+            kind: 'component',
+            reason: risk.why || 'High-risk component from churn, size, or relationship evidence.',
+            component,
+            confidence: risk.confidence,
+            evidence: (risk.evidence || []).filter(item => item.title === component).slice(0, 1)
+          }))
+        }
+      ];
+    }
+
+    function newEngineerFlowItem(flow) {
+      const steps = flow.steps || [];
+      const evidence = [];
+      let component = '';
+      for (const step of steps.slice(0, 4)) {
+        if (!component) component = step.component || '';
+        evidence.push(...(step.evidence || []));
+      }
+      return {
+        title: flow.title || '',
+        kind: 'flow',
+        reason: flow.intent || '',
+        component,
+        target_section: newEngineerFlowSection(flow.id),
+        target_id: flow.id,
+        evidence: evidence.slice(0, 3)
+      };
+    }
+
+    function newEngineerFlowSection(flowId) {
+      if (flowId === 'data-model-flow') return 'data';
+      if (flowId === 'test-flow') return 'tests';
+      if (flowId === 'git-change-flow') return 'risk';
+      return 'runtime';
+    }
+
+    function newEngineerPanel(section) {
+      const panel = document.createElement('section');
+      panel.className = 'new-engineer-panel';
+      panel.innerHTML = '<div class="new-engineer-panel-head"><div><h4></h4><p></p></div><button type="button"></button></div><div class="new-engineer-items"></div>';
+      panel.querySelector('h4').textContent = section.title || '';
+      panel.querySelector('p').textContent = section.summary || '';
+      const button = panel.querySelector('button');
+      button.textContent = section.target_section === 'start' ? 'Open start' : 'Open section';
+      button.onclick = () => activateBriefingSection(section.target_section || 'start');
+      const items = panel.querySelector('.new-engineer-items');
+      const visibleItems = (section.items || []).slice(0, 3);
+      if (!visibleItems.length) {
+        const empty = document.createElement('div');
+        empty.className = 'new-engineer-empty';
+        empty.textContent = 'No strong evidence yet.';
+        items.appendChild(empty);
+      }
+      for (const item of visibleItems) {
+        items.appendChild(newEngineerItem(item, section));
+      }
+      return panel;
+    }
+
+    function newEngineerItem(item, section) {
+      const row = document.createElement('div');
+      row.className = 'new-engineer-item';
+      row.innerHTML = '<div class="new-engineer-item-head"><div><div class="new-engineer-item-title"></div><div class="new-engineer-item-meta"></div></div></div><div class="briefing-card-copy"></div>';
+      row.querySelector('.new-engineer-item-title').textContent = item.title || '';
+      row.querySelector('.new-engineer-item-meta').textContent = [item.kind, briefingConfidenceLabel(item.confidence)].filter(Boolean).join(' / ');
+      row.querySelector('.briefing-card-copy').textContent = item.reason || '';
+      const head = row.querySelector('.new-engineer-item-head');
+      const actions = document.createElement('div');
+      actions.className = 'briefing-inline-actions';
+      if (item.component) actions.appendChild(briefingComponentButton(item.component, item.kind === 'flow' ? 'apis' : 'subway'));
+      if (item.target_section || section.target_section) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = 'View';
+        button.onclick = () => activateBriefingSection(item.target_section || section.target_section || 'start');
+        actions.appendChild(button);
+      }
+      if (actions.childElementCount) head.appendChild(actions);
+      row.appendChild(briefingEvidenceBlock(item.reason || 'New engineer dashboard evidence.', item.evidence || []));
+      return row;
+    }
+
+    function briefingConfidenceLabel(confidence) {
+      if (confidence === undefined || confidence === null || confidence === '') return '';
+      const value = Number(confidence);
+      if (!Number.isFinite(value)) return '';
+      return Math.round(value * 100) + '%';
+    }
+
+    function appendBriefingSummary(root, payload) {
+      const card = document.createElement('section');
+      card.className = 'briefing-card wide';
+      const summary = payload.summary || {};
+      card.innerHTML = '<div class="briefing-card-title"></div><div class="briefing-card-copy"></div><div class="briefing-bullet-list"></div>';
+      card.querySelector('.briefing-card-title').textContent = 'What this repo looks like';
+      card.querySelector('.briefing-card-copy').textContent = summary.headline || '';
+      const list = card.querySelector('.briefing-bullet-list');
+      for (const bullet of summary.bullets || []) {
+        const row = document.createElement('div');
+        row.className = 'briefing-bullet';
+        row.textContent = bullet;
+        list.appendChild(row);
+      }
+      card.appendChild(briefingEvidenceBlock(summary.headline || 'Repository summary generated from indexed docs, graph stats, and memory evidence.', summary.evidence || []));
+      root.appendChild(card);
+    }
+
+    function renderBriefingChapters(root, payload, ids) {
+      for (const chapter of briefingChapters(payload, ids)) {
+        const card = document.createElement('section');
+        card.className = 'briefing-card wide';
+        card.innerHTML = '<div class="briefing-card-head"><div><div class="briefing-card-title"></div><div class="briefing-card-copy"></div></div><span class="briefing-confidence"></span></div><div class="briefing-action-line"></div><div class="briefing-chip-row"></div>';
+        card.querySelector('.briefing-card-title').textContent = chapter.title || '';
+        card.querySelector('.briefing-card-copy').textContent = chapter.why || '';
+        card.querySelector('.briefing-confidence').textContent = Math.round((chapter.confidence || 0) * 100) + '%';
+        card.querySelector('.briefing-action-line').textContent = chapter.action || '';
+        const chipRow = card.querySelector('.briefing-chip-row');
+        for (const component of chapter.components || []) {
+          chipRow.appendChild(briefingComponentButton(component, 'subway'));
+        }
+        card.appendChild(briefingEvidenceBlock(chapter.why || chapter.action || 'Architecture chapter evidence.', chapter.evidence || []));
+        root.appendChild(card);
+      }
+    }
+
+    function renderBriefingFlows(root, payload, ids) {
+      for (const flow of briefingFlows(payload, ids)) {
+        const card = document.createElement('section');
+        card.className = 'briefing-card wide';
+        card.innerHTML = '<div class="briefing-card-head"><div><div class="briefing-card-title"></div><div class="briefing-card-copy"></div></div></div><div class="briefing-flow-actions"></div><div class="briefing-flow-steps"></div>';
+        card.querySelector('.briefing-card-title').textContent = flow.title || '';
+        card.querySelector('.briefing-card-copy').textContent = flow.intent || '';
+        const actions = card.querySelector('.briefing-flow-actions');
+        const play = document.createElement('button');
+        play.type = 'button';
+        play.className = 'briefing-chip';
+        play.textContent = 'Play flow';
+        setHelp(play, 'Animates this flow on the architecture map and syncs each step with evidence in the details panel.');
+        play.onclick = () => startFlowPlayback(flow, { playing: true });
+        actions.appendChild(play);
+        const steps = card.querySelector('.briefing-flow-steps');
+        for (const [index, step] of (flow.steps || []).entries()) {
+          const row = document.createElement('div');
+          row.className = 'briefing-flow-step';
+          row.innerHTML = '<div class="briefing-step-index"></div><div class="briefing-step-body"><div class="briefing-step-title"></div><div class="briefing-step-copy"></div></div>';
+          row.querySelector('.briefing-step-index').textContent = String(index + 1);
+          row.querySelector('.briefing-step-title').textContent = step.title || '';
+          row.querySelector('.briefing-step-copy').textContent = step.detail || '';
+          if (step.component) row.querySelector('.briefing-step-body').appendChild(briefingComponentButton(step.component, flow.lens || 'overview'));
+          row.querySelector('.briefing-step-body').appendChild(briefingEvidenceBlock(step.detail || flow.intent || 'Flow step evidence.', step.evidence || []));
+          steps.appendChild(row);
+        }
+        root.appendChild(card);
+      }
+    }
+
+    function renderBriefingRuntime(root, payload) {
+      appendBriefingJourneyIntro(root, 'Main runtime flow', 'Follow how work enters the repo and moves through service or dependency boundaries.');
+      renderBriefingFlows(root, payload, ['request-flow', 'startup-config-flow', 'dependency-flow']);
+      renderBriefingChapters(root, payload, ['api', 'services', 'scheduler-orchestration']);
+    }
+
+    function renderBriefingCore(root, payload) {
+      appendBriefingJourneyIntro(root, 'Architecture chapters', 'Read components by role: API, services, orchestration, data/state, integrations, tests, and docs/config.');
+      renderBriefingChapters(root, payload, architectureChapterIds());
+    }
+
+    function renderBriefingData(root, payload) {
+      appendBriefingJourneyIntro(root, 'Data/state', 'Look for model, object, database, schema, and state boundaries before editing behavior that crosses components.');
+      renderBriefingFlows(root, payload, ['data-model-flow']);
+      renderBriefingChapters(root, payload, ['data-model']);
+    }
+
+    function renderBriefingTests(root, payload) {
+      appendBriefingJourneyIntro(root, 'Tests', 'Use indexed tests and fixtures to validate the mental model before making edits.');
+      renderBriefingChapters(root, payload, ['tests']);
+      renderBriefingFlows(root, payload, ['test-flow']);
+    }
+
+    function renderBriefingRisk(root, payload) {
+      appendBriefingJourneyIntro(root, 'Risk/recent change', 'Check churn, high-degree components, and recent commits before touching broad areas.');
+      renderBriefingChapters(root, payload, ['change-risk']);
+      renderBriefingFlows(root, payload, ['git-change-flow']);
+    }
+
+    function appendBriefingJourneyIntro(root, title, body) {
+      const card = document.createElement('section');
+      card.className = 'briefing-card wide briefing-journey-intro';
+      card.innerHTML = '<div class="briefing-card-title"></div><div class="briefing-card-copy"></div>';
+      card.querySelector('.briefing-card-title').textContent = title;
+      card.querySelector('.briefing-card-copy').textContent = body;
+      root.appendChild(card);
+    }
+
+    function briefingChapters(payload, ids) {
+      const chapters = payload.chapters || [];
+      if (!ids || !ids.length) return chapters;
+      const wanted = new Set(ids);
+      return chapters.filter(chapter => wanted.has(chapter.id));
+    }
+
+    function architectureChapterIds() {
+      return ['api', 'services', 'scheduler-orchestration', 'data-model', 'integrations', 'tests', 'docs-config'];
+    }
+
+    function briefingFlows(payload, ids) {
+      const flows = payload.flows || [];
+      if (!ids || !ids.length) return flows;
+      const wanted = new Set(ids);
+      return flows.filter(flow => wanted.has(flow.id));
+    }
+
+    function briefingFlowCount(payload, ids) {
+      return briefingFlows(payload, ids).length;
+    }
+
+    function briefingChapterComponentCount(payload, ids) {
+      const seen = new Set();
+      for (const chapter of briefingChapters(payload, ids)) {
+        for (const component of chapter.components || []) seen.add(component);
+      }
+      return seen.size;
+    }
+
+    function renderBriefingConcepts(root, payload) {
+      appendBriefingJourneyIntro(root, 'Main concepts', 'These terms are the quickest vocabulary map for reading unfamiliar code and docs.');
+      const grid = document.createElement('div');
+      grid.className = 'briefing-card-grid';
+      for (const concept of payload.concepts || []) {
+        const card = document.createElement('section');
+        card.className = 'briefing-card';
+        card.innerHTML = '<div class="briefing-card-title"></div><div class="briefing-card-copy"></div>';
+        card.querySelector('.briefing-card-title').textContent = concept.term || '';
+        card.querySelector('.briefing-card-copy').textContent = concept.why || '';
+        card.appendChild(briefingEvidenceBlock(concept.why || 'Concept evidence from repository terms.', concept.evidence || []));
+        grid.appendChild(card);
+      }
+      root.appendChild(grid);
+    }
+
+    function renderBriefingIgnore(root, payload, limit) {
+      if (!(payload.ignore_for_now || []).length) return;
+      appendBriefingJourneyIntro(root, limit ? 'Avoid this noise first' : 'Ignore first', 'These dependencies or docs/config paths are useful later, but they should not dominate the first read.');
+      const grid = document.createElement('div');
+      grid.className = 'briefing-card-grid';
+      for (const item of (payload.ignore_for_now || []).slice(0, limit || undefined)) {
+        const card = document.createElement('section');
+        card.className = 'briefing-card quiet';
+        card.innerHTML = '<div class="briefing-card-title"></div><div class="briefing-card-copy"></div><div class="briefing-muted-line"></div>';
+        card.querySelector('.briefing-card-title').textContent = item.name || '';
+        card.querySelector('.briefing-card-copy').textContent = item.reason || '';
+        card.querySelector('.briefing-muted-line').textContent = item.kind + (item.count ? ' / ' + item.count + ' reference(s)' : '');
+        card.appendChild(briefingEvidenceBlock(item.reason || 'Noise item evidence.', item.evidence || []));
+        grid.appendChild(card);
+      }
+      root.appendChild(grid);
+    }
+
+    function renderBriefingAgent(root, payload) {
+      appendBriefingJourneyIntro(root, 'Agent context', 'Copy this when you want another coding agent to start from the same repo understanding.');
+      const card = document.createElement('section');
+      card.className = 'briefing-card wide';
+      card.innerHTML = '<div class="briefing-card-title">Agent-ready brief</div><div class="briefing-card-copy">Use this as the orientation prelude before generating a task-specific context pack.</div>';
+      const pre = document.createElement('pre');
+      pre.className = 'briefing-agent-code';
+      pre.textContent = payload.agent_brief || '';
+      const actions = document.createElement('div');
+      actions.className = 'briefing-inline-actions';
+      const copyButton = document.createElement('button');
+      copyButton.type = 'button';
+      copyButton.textContent = 'Copy agent brief';
+      copyButton.onclick = () => copyWorkflowText(copyButton, payload.agent_brief || '');
+      const packButton = document.createElement('button');
+      packButton.type = 'button';
+      packButton.textContent = 'Generate task pack';
+      packButton.onclick = () => createAgentContext();
+      actions.append(copyButton, packButton);
+      card.append(actions, pre);
+      root.appendChild(card);
+    }
+
+    function appendBriefingActions(root, actions) {
+      const card = document.createElement('section');
+      card.className = 'briefing-card wide';
+      card.innerHTML = '<div class="briefing-card-title">Recommended next actions</div><div class="briefing-bullet-list"></div>';
+      const list = card.querySelector('.briefing-bullet-list');
+      for (const action of actions || []) {
+        const row = document.createElement('div');
+        row.className = 'briefing-bullet';
+        row.textContent = action;
+        list.appendChild(row);
+      }
+      root.appendChild(card);
+    }
+
+    function briefingItemCard(item) {
+      const card = document.createElement('section');
+      card.className = 'briefing-card';
+      card.innerHTML = '<div class="briefing-card-head"><div><div class="briefing-card-title"></div><div class="briefing-card-copy"></div></div><span class="briefing-confidence"></span></div><div class="briefing-muted-line"></div>';
+      card.querySelector('.briefing-card-title').textContent = item.title || '';
+      card.querySelector('.briefing-card-copy').textContent = item.reason || '';
+      card.querySelector('.briefing-confidence').textContent = Math.round((item.confidence || 0) * 100) + '%';
+      card.querySelector('.briefing-muted-line').textContent = [item.kind, item.component].filter(Boolean).join(' / ');
+      const actions = document.createElement('div');
+      actions.className = 'briefing-inline-actions';
+      if (item.component) actions.appendChild(briefingComponentButton(item.component, item.kind === 'flow' ? 'apis' : 'subway'));
+      card.append(actions, briefingEvidenceBlock(item.reason || 'Start-here evidence.', item.evidence || []));
+      return card;
+    }
+
+    function briefingEvidenceBlock(why, evidence) {
+      const root = document.createElement('div');
+      root.className = 'briefing-evidence-block';
+      root.appendChild(briefingEvidenceSection('Why?', briefingEvidenceWhy(why)));
+      const evidenceSection = briefingEvidenceSection('Evidence');
+      evidenceSection.appendChild(briefingEvidenceList(evidence));
+      root.appendChild(evidenceSection);
+      const filesSection = briefingEvidenceSection('Open files');
+      filesSection.appendChild(briefingOpenFiles(evidence));
+      root.appendChild(filesSection);
+      return root;
+    }
+
+    function briefingEvidenceWhy(why) {
+      const text = document.createElement('div');
+      text.className = 'briefing-evidence-why';
+      text.textContent = why || 'CodeAtlas found supporting evidence for the claim above.';
+      return text;
+    }
+
+    function briefingEvidenceSection(label, child) {
+      const section = document.createElement('div');
+      section.className = 'briefing-evidence-section';
+      const heading = document.createElement('div');
+      heading.className = 'briefing-evidence-label';
+      heading.textContent = label;
+      section.appendChild(heading);
+      if (child) section.appendChild(child);
+      return section;
+    }
+
+    function briefingEvidenceList(evidence) {
+      const root = document.createElement('div');
+      root.className = 'briefing-evidence-list';
+      for (const proof of (evidence || []).slice(0, 6)) {
+        const row = document.createElement('div');
+        row.className = 'briefing-evidence';
+        const title = document.createElement('div');
+        title.className = 'briefing-evidence-title';
+        title.textContent = proof.title || proof.kind || 'Evidence';
+        const meta = document.createElement('div');
+        meta.className = 'briefing-evidence-meta';
+        const location = proof.path ? proof.path + (proof.line ? ':' + proof.line : '') : '';
+        meta.textContent = [proof.kind, location, proof.detail].filter(Boolean).join(' / ');
+        row.append(title, meta);
+        root.appendChild(row);
+      }
+      if (!root.children.length) {
+        const empty = document.createElement('div');
+        empty.className = 'briefing-evidence empty';
+        empty.textContent = 'No exact evidence was available for this section.';
+        root.appendChild(empty);
+      }
+      return root;
+    }
+
+    function briefingOpenFiles(evidence) {
+      const root = document.createElement('div');
+      root.className = 'briefing-open-files';
+      const files = briefingEvidenceFiles(evidence);
+      for (const file of files.slice(0, 6)) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'briefing-file-action';
+        button.textContent = file.label;
+        setHelp(button, 'Copies this file path and opens the owning component on the map when CodeAtlas can match it.');
+        button.onclick = () => openBriefingEvidenceFile(file);
+        root.appendChild(button);
+      }
+      if (!root.children.length) {
+        const empty = document.createElement('div');
+        empty.className = 'briefing-evidence empty';
+        empty.textContent = 'No file path evidence available.';
+        root.appendChild(empty);
+      }
+      return root;
+    }
+
+    function briefingEvidenceFiles(evidence) {
+      const seen = new Set();
+      const files = [];
+      for (const proof of evidence || []) {
+        const rawPath = String(proof.path || proof.file_path || '').trim();
+        if (!rawPath) continue;
+        for (const part of rawPath.split(',').map(item => item.trim()).filter(Boolean)) {
+          const line = rawPath === part && proof.line ? proof.line : '';
+          const location = part + (line ? ':' + line : '');
+          if (seen.has(location)) continue;
+          seen.add(location);
+          files.push({
+            path: part,
+            line,
+            location,
+            label: location,
+            component: proof.component || briefingComponentFromPath(part)
+          });
+        }
+      }
+      return files;
+    }
+
+    function briefingComponentFromPath(path) {
+      const parts = String(path || '').split(/[\\/]+/).filter(Boolean);
+      if (!parts.length) return '';
+      if (['src', 'app', 'lib', 'services'].includes(parts[0]) && parts.length > 1) return parts[1];
+      return parts[0];
+    }
+
+    function openBriefingEvidenceFile(file) {
+      if (!file || !file.path) return;
+      const component = file.component || briefingComponentFromPath(file.path);
+      copyTextToClipboard(file.location || file.path);
+      if (component) {
+        focusBriefingComponent(component, 'subway');
+      } else {
+        setGraph('architecture');
+      }
+    }
+
+    function briefingComponentButton(component, lens) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'briefing-chip';
+      button.textContent = component || 'Open map';
+      button.onclick = () => focusBriefingComponent(component, lens || 'overview');
+      return button;
+    }
+
+    function briefingEmptyCard(title, body, loading) {
+      const card = document.createElement('section');
+      card.className = 'briefing-card wide';
+      card.innerHTML = '<div class="briefing-card-title"></div><div class="briefing-card-copy"></div>';
+      const heading = card.querySelector('.briefing-card-title');
+      if (loading) {
+        heading.classList.add('inline-loading');
+        const spinner = document.createElement('span');
+        spinner.className = 'loading-spinner';
+        spinner.setAttribute('aria-hidden', 'true');
+        const label = document.createElement('span');
+        label.textContent = title;
+        heading.append(spinner, label);
+      } else {
+        heading.textContent = title;
+      }
+      card.querySelector('.briefing-card-copy').textContent = body;
+      return card;
+    }
+
+    function copyBriefingAgentBrief() {
+      const button = document.getElementById('briefingCopyBtn');
+      const text = state.briefing && state.briefing.agent_brief ? state.briefing.agent_brief : '';
+      if (!text) {
+        loadBriefing(false);
+        return;
+      }
+      copyWorkflowText(button, text);
+    }
+
+    function openBriefingMapPath() {
+      setGraph('architecture');
+      applyMapLens('subway');
+      fitCameraToNodes(state.nodes || []);
+    }
+
+    function focusBriefingComponent(component, lens) {
+      if (!component) return;
+      setGraph('architecture');
+      applyMapLens(lens || 'overview');
+      const node = (state.allNodes || []).find(item => item.id === component || item.label === component);
+      if (!node) return;
+      state.selected = { kind: 'node', node };
+      state.focusSelection = true;
+      state.traceMode = 'neighbors';
+      updateScaleControls();
+      applyFilters();
+      renderSelection(state.selected);
+      window.requestAnimationFrame(() => focusCameraOnSelection(state.selected));
+    }
+
+    function briefingFlowById(flowId) {
+      const flows = state.briefing && Array.isArray(state.briefing.flows) ? state.briefing.flows : [];
+      return flows.find(flow => String(flow.id || '') === String(flowId || '')) || null;
+    }
+
+    function firstBriefingFlow() {
+      const flows = state.briefing && Array.isArray(state.briefing.flows) ? state.briefing.flows : [];
+      return flows.find(flow => flow.id === 'first-read') || flows[0] || null;
+    }
+
+    function restoreUrlFlowPlayback(urlState) {
+      if (!urlState || !urlState.flowId) return;
+      state.pendingFlowPlaybackUrl = {
+        flowId: urlState.flowId,
+        stepIndex: Math.max(0, Math.round(Number(urlState.flowStep || 0)))
+      };
+      if (state.briefing) {
+        restorePendingFlowPlayback();
+      } else {
+        loadBriefing(false);
+      }
+    }
+
+    function restorePendingFlowPlayback() {
+      const pending = state.pendingFlowPlaybackUrl;
+      if (!pending || !state.briefing) return;
+      const flow = briefingFlowById(pending.flowId);
+      if (!flow) {
+        state.pendingFlowPlaybackUrl = null;
+        return;
+      }
+      state.pendingFlowPlaybackUrl = null;
+      startFlowPlayback(flow, { playing: false, stepIndex: pending.stepIndex, fromUrl: true });
+    }
+
+    function startFlowPlayback(flow, options) {
+      options = options || {};
+      if (!flow) return;
+      if (state.view !== 'architecture') setGraph('architecture');
+      applyMapLens(flowPlaybackLensForFlow(flow));
+      const playback = buildFlowPlayback(flow, options);
+      if (!playback.steps.length) return;
+      state.flowPlayback = playback;
+      state.selected = { kind: 'flowPlayback', playback };
+      ensureFlowPlaybackVisibility(playback);
+      applyFilters();
+      setFlowPlaybackStep(options.stepIndex || 0, false);
+      playback.playing = Boolean(options.playing);
+      playback.lastAdvanceAt = performance.now();
+      renderFlowPlaybackHud();
+      renderSelection(state.selected);
+      window.requestAnimationFrame(() => focusCameraOnFlowStep());
+      scheduleUrlStateUpdate();
+    }
+
+    function flowPlaybackLensForFlow(flow) {
+      const requested = String(flow && flow.lens || '').trim();
+      if (requested && LENS_LABELS[requested]) return requested;
+      const id = String(flow && flow.id || '').toLowerCase();
+      if (id.includes('data')) return 'data';
+      if (id.includes('test')) return 'tests';
+      if (id.includes('git') || id.includes('change')) return 'git';
+      if (id.includes('request') || id.includes('api') || id.includes('startup')) return 'apis';
+      return 'subway';
+    }
+
+    function buildFlowPlayback(flow, options) {
+      let steps = normalizeFlowPlaybackSteps(flow, flow.steps || []);
+      if (flowPlaybackVisualStepCount(steps) < 2) {
+        const fallback = normalizeFlowPlaybackSteps(flow, flowPlaybackFallbackSteps(flow));
+        if (flowPlaybackVisualStepCount(fallback) >= flowPlaybackVisualStepCount(steps)) steps = fallback;
+      }
+      steps.forEach((step, index) => {
+        step.index = index;
+      });
+      const nodeIds = new Set();
+      const edgeKeys = new Set();
+      for (const step of steps) {
+        for (const id of step.nodeIds) nodeIds.add(id);
+        if (step.edgeKey) edgeKeys.add(step.edgeKey);
+      }
+      return {
+        flowId: String(flow.id || 'flow'),
+        title: String(flow.title || 'Repository flow'),
+        intent: String(flow.intent || ''),
+        lens: flowPlaybackLensForFlow(flow),
+        steps,
+        stepIndex: clamp(Math.round(Number(options.stepIndex || 0)), 0, Math.max(0, steps.length - 1)),
+        playing: Boolean(options.playing),
+        speedMs: Number(options.speedMs || 1600),
+        lastAdvanceAt: performance.now(),
+        nodeIds,
+        edgeKeys
+      };
+    }
+
+    function normalizeFlowPlaybackSteps(flow, rawSteps) {
+      const steps = [];
+      let previousTarget = '';
+      for (const [index, rawStep] of (rawSteps || []).entries()) {
+        const step = normalizeFlowPlaybackStep(flow, rawStep || {}, index, previousTarget);
+        if (step.targetId) previousTarget = step.targetId;
+        else if (step.nodeIds.length) previousTarget = step.nodeIds[step.nodeIds.length - 1];
+        steps.push(step);
+      }
+      return steps;
+    }
+
+    function flowPlaybackVisualStepCount(steps) {
+      return (steps || []).filter(step => step && step.nodeIds && step.nodeIds.length).length;
+    }
+
+    function flowPlaybackFallbackSteps(flow) {
+      const candidates = flowPlaybackFallbackNodes(flow).slice(0, 6);
+      return candidates.map((node, index) => ({
+        title: (index === 0 ? 'Start at ' : 'Continue to ') + (node.label || node.id),
+        detail: flowPlaybackFallbackDetail(flow, node),
+        component: node.id,
+        evidence: [{
+          kind: 'component',
+          title: node.label || node.id,
+          path: flowPlaybackNodeEvidencePath(node),
+          detail: 'Fallback visual anchor from component name, type, category, and graph importance.',
+          confidence: 0.55
+        }],
+        confidence: 0.55
+      }));
+    }
+
+    function flowPlaybackFallbackNodes(flow) {
+      const nodes = allKnownNodes().filter(node => node && node.id);
+      const preferredIds = flowPlaybackPreferredComponentIds(flow);
+      const scored = [];
+      for (const node of nodes) {
+        const category = nodeCategory(node);
+        if (category === 'third_party' || category === 'generated') continue;
+        const score = flowPlaybackFallbackNodeScore(flow, node, preferredIds);
+        if (score <= 0) continue;
+        scored.push({ node, score });
+      }
+      if (!scored.length) {
+        for (const node of nodes) {
+          const category = nodeCategory(node);
+          if (category === 'third_party' || category === 'generated') continue;
+          scored.push({ node, score: nodeImportanceScore(node) });
+        }
+      }
+      return scored
+        .sort((a, b) => b.score - a.score || String(a.node.label || a.node.id).localeCompare(String(b.node.label || b.node.id)))
+        .map(item => item.node)
+        .filter(uniqueNodeById());
+    }
+
+    function uniqueNodeById() {
+      const seen = new Set();
+      return node => {
+        if (!node || seen.has(node.id)) return false;
+        seen.add(node.id);
+        return true;
+      };
+    }
+
+    function flowPlaybackPreferredComponentIds(flow) {
+      const ids = new Set();
+      const add = value => {
+        const id = flowPlaybackNodeId(value);
+        if (id) ids.add(id);
+      };
+      for (const step of (flow.steps || [])) {
+        add(step.component);
+        for (const proof of step.evidence || []) {
+          add(proof.component);
+          add(proof.path || proof.file_path);
+          add(proof.title);
+        }
+      }
+      const briefing = state.briefing || {};
+      for (const item of briefing.start_here || []) add(item.component || item.title);
+      for (const flowItem of briefing.flows || []) {
+        if (flowItem.id === 'first-read' || flowItem.id === flow.id) {
+          for (const step of flowItem.steps || []) add(step.component || step.title);
+        }
+      }
+      for (const chapter of briefing.chapters || []) {
+        if (flowPlaybackChapterMatchesFlow(flow, chapter)) {
+          for (const component of chapter.components || []) add(component);
+        }
+      }
+      return ids;
+    }
+
+    function flowPlaybackChapterMatchesFlow(flow, chapter) {
+      const id = String(flow && flow.id || '').toLowerCase();
+      const chapterId = String(chapter && chapter.id || '').toLowerCase();
+      if (id.includes('data')) return chapterId.includes('data');
+      if (id.includes('test')) return chapterId.includes('test');
+      if (id.includes('git') || id.includes('change')) return chapterId.includes('risk') || chapterId.includes('change');
+      if (id.includes('request') || id.includes('api')) return chapterId.includes('api') || chapterId.includes('service');
+      if (id.includes('startup')) return chapterId.includes('service') || chapterId.includes('scheduler') || chapterId.includes('docs');
+      return ['api', 'services', 'scheduler-orchestration', 'data-model'].includes(chapterId);
+    }
+
+    function flowPlaybackFallbackNodeScore(flow, node, preferredIds) {
+      const text = String([node.id, node.label, node.type, nodeCategory(node)].join(' ')).toLowerCase();
+      const keywords = flowPlaybackKeywords(flow);
+      let score = preferredIds.has(node.id) ? 180 : 0;
+      for (const keyword of keywords) {
+        if (text.includes(keyword)) score += 70;
+      }
+      const category = nodeCategory(node);
+      if (category === 'owned') score += 42;
+      if (category === 'team') score += 32;
+      if (category === 'tests' && keywords.includes('test')) score += 80;
+      if (category === 'docs_config' && keywords.includes('config')) score += 46;
+      score += Math.min(90, nodeImportanceScore(node));
+      return score;
+    }
+
+    function flowPlaybackKeywords(flow) {
+      const id = String(flow && flow.id || '').toLowerCase();
+      if (id.includes('request') || id.includes('api')) return ['api', 'route', 'wsgi', 'rest', 'service', 'manager', 'compute', 'conductor'];
+      if (id.includes('startup')) return ['config', 'setup', 'requirements', 'cmd', 'main', 'wsgi', 'scheduler', 'conductor', 'service'];
+      if (id.includes('data')) return ['model', 'object', 'db', 'database', 'schema', 'migration', 'state', 'store'];
+      if (id.includes('test')) return ['test', 'tests', 'spec', 'fixture', 'mock'];
+      if (id.includes('git') || id.includes('change')) return ['api', 'service', 'manager', 'test', 'config'];
+      return ['api', 'service', 'manager', 'model', 'test'];
+    }
+
+    function flowPlaybackFallbackDetail(flow, node) {
+      const title = flow && flow.title ? flow.title : 'flow';
+      const category = nodeCategory(node).replace(/_/g, '/');
+      return 'Visual anchor for ' + title + ' using the ' + category + ' component ' + (node.label || node.id) + '.';
+    }
+
+    function flowPlaybackNodeEvidencePath(node) {
+      if (!node) return '';
+      const metrics = node.metrics || {};
+      return metrics.path || metrics.file || node.file || '';
+    }
+
+    function nodeImportanceScore(node) {
+      const metrics = node.metrics || {};
+      return Number(node.size || 0) * 0.2 +
+        Number(metrics.files || 0) * 4 +
+        Number(metrics.symbols || 0) * 0.2 +
+        Number(metrics.functions || 0) * 0.25 +
+        Number(metrics.classes || 0) * 0.35 +
+        Number(metrics.commits || 0) * 1.5;
+    }
+
+    function normalizeFlowPlaybackStep(flow, step, index, previousTarget) {
+      const title = String(step.title || 'Step ' + (index + 1)).trim();
+      const detail = String(step.detail || flow.intent || '').trim();
+      const endpoints = parseFlowStepEndpoints(title);
+      let sourceId = flowPlaybackNodeId(step.source || endpoints.source);
+      let targetId = flowPlaybackNodeId(step.target || step.component || endpoints.target);
+      if (!targetId) targetId = flowPlaybackNodeFromEvidence(step.evidence || []);
+      if (!targetId && step.component) targetId = flowPlaybackNodeId(step.component);
+      if (!sourceId && previousTarget && targetId && previousTarget !== targetId) sourceId = previousTarget;
+      if (!sourceId && endpoints.source) sourceId = flowPlaybackNodeId(endpoints.source);
+      let edge = sourceId && targetId ? flowPlaybackEdgeForStep(sourceId, targetId) : null;
+      if (!edge && previousTarget && targetId && previousTarget !== targetId) {
+        edge = flowPlaybackEdgeForStep(previousTarget, targetId);
+        if (edge) sourceId = previousTarget;
+      }
+      if (edge) {
+        sourceId = edge.source;
+        targetId = edge.target;
+      }
+      const nodeIds = new Set();
+      if (sourceId) nodeIds.add(sourceId);
+      if (targetId) nodeIds.add(targetId);
+      if (edge) {
+        nodeIds.add(edge.source);
+        nodeIds.add(edge.target);
+      }
+      const evidenceNode = flowPlaybackNodeFromEvidence(step.evidence || []);
+      if (evidenceNode) nodeIds.add(evidenceNode);
+      return {
+        index,
+        title,
+        detail,
+        component: String(step.component || ''),
+        confidence: Number(step.confidence || 0),
+        evidence: Array.isArray(step.evidence) ? step.evidence : [],
+        sourceId: sourceId || '',
+        targetId: targetId || sourceId || evidenceNode || '',
+        nodeIds: [...nodeIds],
+        edge,
+        edgeKey: edge ? edgeKeyForSide(edge, null) : '',
+        edgeType: edge ? edge.type : ''
+      };
+    }
+
+    function parseFlowStepEndpoints(title) {
+      const match = String(title || '').match(/^\s*(.+?)\s*(?:->|=>|→|↦)\s*(.+?)\s*$/);
+      return match ? { source: match[1], target: match[2] } : { source: '', target: '' };
+    }
+
+    function flowPlaybackNodeId(value) {
+      const clean = String(value || '').trim();
+      if (!clean) return '';
+      const direct = state.nodeIndex.get(clean);
+      if (direct) return direct.id;
+      const component = clean.includes('/') || clean.includes('\\') ? briefingComponentFromPath(clean) : clean;
+      if (component && state.nodeIndex.has(component)) return component;
+      const lower = clean.toLowerCase();
+      const componentLower = component.toLowerCase();
+      const nodes = allKnownNodes();
+      const exact = nodes.find(node =>
+        String(node.id || '').toLowerCase() === lower ||
+        String(node.label || '').toLowerCase() === lower ||
+        String(node.id || '').toLowerCase() === componentLower ||
+        String(node.label || '').toLowerCase() === componentLower
+      );
+      if (exact) return exact.id;
+      const basename = clean.split(/[\\/]+/).filter(Boolean).pop() || '';
+      if (basename) {
+        const baseLower = basename.toLowerCase();
+        const baseMatch = nodes.find(node =>
+          String(node.id || '').toLowerCase() === baseLower ||
+          String(node.label || '').toLowerCase() === baseLower
+        );
+        if (baseMatch) return baseMatch.id;
+      }
+      return '';
+    }
+
+    function flowPlaybackNodeFromEvidence(evidence) {
+      for (const proof of evidence || []) {
+        const direct = flowPlaybackNodeId(proof.component || proof.title || '');
+        if (direct) return direct;
+        const path = proof.path || proof.file_path || '';
+        const fromPath = flowPlaybackNodeId(path);
+        if (fromPath) return fromPath;
+      }
+      return '';
+    }
+
+    function flowPlaybackEdgeForStep(sourceId, targetId) {
+      if (!sourceId || !targetId) return null;
+      const edges = state.allEdges || [];
+      return edges.find(edge => edge.source === sourceId && edge.target === targetId) ||
+        edges.find(edge => edge.source === targetId && edge.target === sourceId) ||
+        null;
+    }
+
+    function ensureFlowPlaybackVisibility(playback) {
+      state.focusSelection = true;
+      state.focusHops = 1;
+      state.traceMode = null;
+      state.connectedOnly = false;
+      state.minEdgeWeight = 1;
+      if (state.nodeBudget > 0) {
+        state.nodeBudget = Math.max(state.nodeBudget, Math.min(260, Math.max(24, playback.nodeIds.size + 32)));
+      }
+      for (const id of playback.nodeIds || []) {
+        const node = state.nodeIndex.get(id);
+        if (node) state.categoryVisibility[nodeCategory(node)] = true;
+      }
+      for (const step of playback.steps || []) {
+        if (!step.edge) continue;
+        for (const category of edgeConnectionCategories(step.edge)) state.connectionVisibility[category] = true;
+      }
+      updateScaleControls();
+      renderFilterControls();
+    }
+
+    function renderFlowPlaybackHud() {
+      const hud = document.getElementById('flowPlaybackHud');
+      if (!hud) return;
+      const playback = state.flowPlayback;
+      if (!playback || state.view !== 'architecture') {
+        hud.hidden = true;
+        return;
+      }
+      const step = flowPlaybackCurrentStep();
+      const count = playback.steps.length;
+      hud.hidden = false;
+      document.getElementById('flowPlaybackTitle').textContent = playback.title;
+      document.getElementById('flowPlaybackStep').textContent = step
+        ? 'Step ' + (playback.stepIndex + 1) + ' of ' + count + ': ' + step.title
+        : 'Step 0 of 0';
+      document.getElementById('flowPlaybackPrevBtn').disabled = playback.stepIndex <= 0;
+      document.getElementById('flowPlaybackNextBtn').disabled = playback.stepIndex >= count - 1;
+      document.getElementById('flowPlaybackPlayBtn').textContent = playback.playing ? 'Pause' : 'Play';
+      document.getElementById('flowPlaybackSpeedSelect').value = String(playback.speedMs || 1600);
+      const scrubber = document.getElementById('flowPlaybackScrubber');
+      scrubber.max = String(Math.max(0, count - 1));
+      scrubber.value = String(playback.stepIndex || 0);
+    }
+
+    function stopFlowPlayback() {
+      state.flowPlayback = null;
+      state.pendingFlowPlaybackUrl = null;
+      if (state.selected && state.selected.kind === 'flowPlayback') state.selected = null;
+      state.focusSelection = false;
+      state.traceMode = null;
+      updateScaleControls();
+      applyFilters();
+      renderFlowPlaybackHud();
+      renderSelection(state.selected);
+      scheduleUrlStateUpdate();
+    }
+
+    function toggleFlowPlayback() {
+      const playback = state.flowPlayback;
+      if (!playback) {
+        const first = firstBriefingFlow();
+        if (first) startFlowPlayback(first, { playing: true });
+        else loadBriefing(false);
+        return;
+      }
+      if (!playback.playing && playback.stepIndex >= playback.steps.length - 1) playback.stepIndex = 0;
+      playback.playing = !playback.playing;
+      playback.lastAdvanceAt = performance.now();
+      state.selected = { kind: 'flowPlayback', playback };
+      renderFlowPlaybackHud();
+      renderSelection(state.selected);
+      focusCameraOnFlowStep();
+      scheduleUrlStateUpdate();
+    }
+
+    function stepFlowPlayback(delta) {
+      const playback = state.flowPlayback;
+      if (!playback) return;
+      setFlowPlaybackStep(playback.stepIndex + delta, true);
+    }
+
+    function setFlowPlaybackSpeed(speedMs) {
+      const playback = state.flowPlayback;
+      if (!playback) return;
+      playback.speedMs = clamp(Math.round(Number(speedMs || 1600)), 700, 3200);
+      playback.lastAdvanceAt = performance.now();
+      renderFlowPlaybackHud();
+      scheduleUrlStateUpdate();
+    }
+
+    function setFlowPlaybackStep(index, userInitiated) {
+      const playback = state.flowPlayback;
+      if (!playback) return;
+      playback.stepIndex = clamp(Math.round(Number(index || 0)), 0, Math.max(0, playback.steps.length - 1));
+      playback.lastAdvanceAt = performance.now();
+      if (userInitiated) playback.playing = false;
+      state.selected = { kind: 'flowPlayback', playback };
+      renderFlowPlaybackHud();
+      renderSelection(state.selected);
+      focusCameraOnFlowStep();
+      scheduleUrlStateUpdate();
+    }
+
+    function advanceFlowPlayback(now) {
+      const playback = state.flowPlayback;
+      if (!playback || !playback.playing || state.view !== 'architecture') return;
+      const elapsed = now - (playback.lastAdvanceAt || now);
+      if (elapsed < (playback.speedMs || 1600)) return;
+      if (playback.steps.length <= 1) {
+        playback.lastAdvanceAt = now;
+        return;
+      }
+      if (playback.stepIndex >= playback.steps.length - 1) {
+        playback.playing = false;
+        renderFlowPlaybackHud();
+        renderSelection(state.selected);
+        return;
+      }
+      setFlowPlaybackStep(playback.stepIndex + 1, false);
+    }
+
+    function flowPlaybackCurrentStep() {
+      const playback = state.flowPlayback;
+      if (!playback || !playback.steps.length) return null;
+      return playback.steps[clamp(playback.stepIndex || 0, 0, playback.steps.length - 1)] || null;
+    }
+
+    function flowPlaybackVisitedNodeIds() {
+      const playback = state.flowPlayback;
+      if (!playback) return new Set();
+      const limit = clamp(playback.stepIndex || 0, 0, Math.max(0, playback.steps.length - 1));
+      if (playback._visitedNodeStep === limit && playback._visitedNodeIds) return playback._visitedNodeIds;
+      const ids = new Set();
+      for (let index = 0; index <= limit; index += 1) {
+        for (const id of playback.steps[index].nodeIds || []) ids.add(id);
+      }
+      playback._visitedNodeStep = limit;
+      playback._visitedNodeIds = ids;
+      return ids;
+    }
+
+    function flowPlaybackVisitedEdgeKeys() {
+      const playback = state.flowPlayback;
+      if (!playback) return new Set();
+      const limit = clamp(playback.stepIndex || 0, 0, Math.max(0, playback.steps.length - 1));
+      if (playback._visitedEdgeStep === limit && playback._visitedEdgeKeys) return playback._visitedEdgeKeys;
+      const keys = new Set();
+      for (let index = 0; index <= limit; index += 1) {
+        if (playback.steps[index].edgeKey) keys.add(playback.steps[index].edgeKey);
+      }
+      playback._visitedEdgeStep = limit;
+      playback._visitedEdgeKeys = keys;
+      return keys;
+    }
+
+    function flowPlaybackFocus() {
+      const playback = state.flowPlayback;
+      if (!playback || state.view !== 'architecture') return null;
+      const current = flowPlaybackCurrentStep();
+      const selected = new Set(current ? current.nodeIds : []);
+      const connected = new Set();
+      for (const id of flowPlaybackVisitedNodeIds()) connected.add(id);
+      return { selected, connected };
+    }
+
+    function isFlowPlaybackNode(node, side) {
+      if (side || !state.flowPlayback || !node) return false;
+      return flowPlaybackVisitedNodeIds().has(node.id) || isFlowPlaybackCurrentNode(node, side);
+    }
+
+    function isFlowPlaybackCurrentNode(node, side) {
+      if (side || !node) return false;
+      const step = flowPlaybackCurrentStep();
+      return Boolean(step && step.nodeIds.includes(node.id));
+    }
+
+    function isFlowPlaybackCurrentEdge(edge, side) {
+      if (side || !edge) return false;
+      const step = flowPlaybackCurrentStep();
+      return Boolean(step && step.edgeKey && step.edgeKey === edgeKeyForSide(edge, null));
+    }
+
+    function isFlowPlaybackVisitedEdge(edge, side) {
+      if (side || !edge || !state.flowPlayback) return false;
+      return flowPlaybackVisitedEdgeKeys().has(edgeKeyForSide(edge, null));
+    }
+
+    function flowPlaybackItemCurrent(item, side) {
+      if (!state.flowPlayback || side) return false;
+      if (item.kind === 'bundle') return (item.edges || []).some(edge => isFlowPlaybackCurrentEdge(edge, side));
+      return isFlowPlaybackCurrentEdge(item.edge, side);
+    }
+
+    function flowPlaybackItemInPath(item, side) {
+      if (!state.flowPlayback || side || !state.flowPlayback.edgeKeys) return false;
+      if (item.kind === 'bundle') {
+        return (item.edges || []).some(edge => state.flowPlayback.edgeKeys.has(edgeKeyForSide(edge, null)));
+      }
+      return Boolean(item.edge && state.flowPlayback.edgeKeys.has(edgeKeyForSide(item.edge, null)));
+    }
+
+    function flowPlaybackItemRevealed(item, side) {
+      if (!state.flowPlayback || side) return false;
+      if (item.kind === 'bundle') {
+        return (item.edges || []).some(edge => isFlowPlaybackCurrentEdge(edge, side) || isFlowPlaybackVisitedEdge(edge, side));
+      }
+      return isFlowPlaybackCurrentEdge(item.edge, side) || isFlowPlaybackVisitedEdge(item.edge, side);
+    }
+
+    function flowPlaybackEdgeAlpha(edge, side) {
+      if (side || !state.flowPlayback || !edge) return null;
+      const key = edgeKeyForSide(edge, null);
+      const step = flowPlaybackCurrentStep();
+      if (step && step.edgeKey === key) return 1;
+      if (flowPlaybackVisitedEdgeKeys().has(key)) return 0.86;
+      return 0.024;
+    }
+
+    function focusCameraOnFlowStep() {
+      const playback = state.flowPlayback;
+      const step = flowPlaybackCurrentStep();
+      if (!playback || !step) return;
+      const nodesById = state.graphCache.visibleNodesById || new Map();
+      const nodes = step.nodeIds
+        .map(id => nodesById.get(id) || state.nodeIndex.get(id))
+        .filter(Boolean);
+      if (nodes.length) fitCameraToNodes(nodes, null);
+    }
+
+    function renderFlowPlaybackSelection(selection, title, meta) {
+      const playback = selection.playback || state.flowPlayback;
+      const step = flowPlaybackCurrentStep();
+      title.textContent = playback ? 'Flow: ' + playback.title : 'Flow playback';
+      const stack = detailStack(meta);
+      if (!playback || !step) {
+        appendDetailSection(stack, 'Flow Playback', ['No active flow step.'], true);
+        return;
+      }
+      appendDetailSection(stack, 'Flow Playback', [
+        playback.intent || 'Animated evidence path through the repository.',
+        'step: ' + (playback.stepIndex + 1) + ' of ' + playback.steps.length,
+        'lens: ' + (LENS_LABELS[playback.lens] || playback.lens || 'Overview'),
+        playback.playing ? 'status: playing' : 'status: paused'
+      ], true);
+      const controls = appendDetailSection(stack, 'Playback Controls', [], false);
+      const row = document.createElement('div');
+      row.className = 'flow-playback-selection-controls';
+      row.append(
+        flowPlaybackPanelButton('Previous', () => stepFlowPlayback(-1), playback.stepIndex <= 0),
+        flowPlaybackPanelButton(playback.playing ? 'Pause' : 'Play', () => toggleFlowPlayback(), false),
+        flowPlaybackPanelButton('Next', () => stepFlowPlayback(1), playback.stepIndex >= playback.steps.length - 1),
+        flowPlaybackPanelButton('Stop', () => stopFlowPlayback(), false)
+      );
+      controls.appendChild(row);
+      const current = appendDetailSection(stack, 'Current Step', [
+        step.title,
+        step.detail,
+        step.component ? 'component: ' + step.component : '',
+        step.sourceId ? 'source: ' + labelForNode(step.sourceId) : '',
+        step.targetId ? 'target: ' + labelForNode(step.targetId) : '',
+        step.edgeType ? 'connection: ' + step.edgeType : '',
+        step.confidence ? 'confidence: ' + Math.round(step.confidence * 100) + '%' : ''
+      ].filter(Boolean), true);
+      current.appendChild(briefingEvidenceBlock(step.detail || playback.intent || 'Flow step evidence.', step.evidence || []));
+      const timelineBody = appendDetailSection(stack, 'Flow Timeline', [], false);
+      timelineBody.appendChild(flowPlaybackTimeline(playback));
+    }
+
+    function flowPlaybackPanelButton(label, onClick, disabled) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      button.disabled = Boolean(disabled);
+      button.onclick = onClick;
+      return button;
+    }
+
+    function flowPlaybackTimeline(playback) {
+      const list = document.createElement('div');
+      list.className = 'trace-timeline';
+      for (const step of playback.steps || []) {
+        const row = document.createElement('div');
+        row.className = 'trace-step' + (step.index === playback.stepIndex ? ' active' : '');
+        row.onclick = () => setFlowPlaybackStep(step.index, true);
+        const marker = document.createElement('div');
+        marker.className = 'trace-step-marker';
+        const copy = document.createElement('div');
+        const title = document.createElement('div');
+        title.className = 'trace-step-title';
+        title.textContent = String(step.index + 1) + '. ' + step.title;
+        const meta = document.createElement('div');
+        meta.className = 'trace-step-meta';
+        meta.textContent = [
+          step.component || '',
+          step.edgeType || '',
+          step.confidence ? Math.round(step.confidence * 100) + '% confidence' : ''
+        ].filter(Boolean).join(' / ');
+        copy.append(title, meta);
+        row.append(marker, copy);
+        list.appendChild(row);
+      }
+      return list;
+    }
+
     function runStructuralQuery(query) {
       const status = document.getElementById('chatStatus');
       const answerRoot = document.getElementById('chatAnswer');
       const sourcesRoot = document.getElementById('chatSources');
-      status.textContent = 'Querying graph...';
+      setLoadingTask('query', 'Querying graph', 'Running a structured query against indexed symbols and relationships.', { blocking: false });
+      setInlineStatusLoading(status, 'Querying graph...', true);
       status.classList.remove('error-text');
       answerRoot.classList.remove('workflow-mode');
       answerRoot.textContent = '';
@@ -2459,6 +4021,9 @@
         .catch(err => {
           status.textContent = err.message;
           status.classList.add('error-text');
+        })
+        .finally(() => {
+          clearLoadingTask('query');
         });
     }
 
@@ -2475,7 +4040,8 @@
       };
       const config = endpoints[action];
       if (!config) return;
-      status.textContent = 'Running ' + action.replace('-', ' ') + '...';
+      setLoadingTask('workflow', 'Running workflow', 'Collecting indexed evidence for ' + action.replace('-', ' ') + '.', { blocking: false });
+      setInlineStatusLoading(status, 'Running ' + action.replace('-', ' ') + '...', true);
       status.classList.remove('error-text');
       answerRoot.classList.add('workflow-mode');
       answerRoot.innerHTML = '';
@@ -2499,6 +4065,9 @@
           status.textContent = action + ' failed';
           status.classList.add('error-text');
           renderWorkflowError(answerRoot, action, err.message);
+        })
+        .finally(() => {
+          clearLoadingTask('workflow');
         });
     }
 
@@ -3105,6 +4674,7 @@
       const selectedSide = state.selected && state.selected.kind === 'node' ? state.selected.side : null;
       const hasSelection = state.selected && ['node', 'edge', 'path', 'bundle'].includes(state.selected.kind);
       const hasTabbedSelection = detailTabsVisibleForSelection(state.selected);
+      const firstFlow = firstBriefingFlow();
       return [
         { label: 'Copy current map link', detail: 'lens, filters, selection, camera', kind: 'share', keywords: 'url permalink state', run: copyCurrentMapLink },
         { label: 'Copy compact map link', detail: 'short state link for dense filtered maps', kind: 'share', keywords: 'url permalink compressed state', run: copyCompactMapLink },
@@ -3118,14 +4688,15 @@
         { label: 'Show History tab', detail: 'selection commits and co-change evidence', kind: 'view', keywords: 'detail panel tab git commits history', disabled: hasTabbedSelection ? '' : 'No selection', run: () => setDetailTab('history') },
         { label: 'Show more nodes', detail: 'increase the node budget without going full graph', kind: 'view', keywords: 'budget performance more', run: showMoreNodesFromPalette },
         { label: 'Reduce map complexity', detail: 'turn on guardrails for a dense graph', kind: 'view', keywords: 'simplify performance fewer', run: applySmartSimplify },
+        { label: 'Open repo briefing', detail: 'first-time reader guide with evidence and flows', kind: 'view', keywords: 'briefing onboarding understand repository first time', run: () => setGraph('briefing') },
+        { label: 'Play first repo flow', detail: 'animate the first evidence-backed onboarding flow', kind: 'trace', keywords: 'flow playback animation guided journey', disabled: firstFlow ? '' : 'Load briefing first', run: () => startFlowPlayback(firstFlow, { playing: true }) },
+        { label: state.flowPlayback && state.flowPlayback.playing ? 'Pause flow playback' : 'Resume flow playback', detail: 'toggle the active animated flow', kind: 'trace', keywords: 'flow playback pause play animation', disabled: state.flowPlayback ? '' : 'No active flow', run: toggleFlowPlayback },
+        { label: 'Stop flow playback', detail: 'clear the active animated flow', kind: 'trace', keywords: 'flow playback stop clear animation', disabled: state.flowPlayback ? '' : 'No active flow', run: stopFlowPlayback },
         { label: 'Save view preset', detail: 'store current filters and lens locally', kind: 'view', keywords: 'preset bookmark filters lens', run: saveCurrentViewPreset },
         { label: 'Apply selected view preset', detail: 'restore the chosen saved preset', kind: 'view', keywords: 'preset restore filters lens', disabled: state.viewPresets.length ? '' : 'No presets', run: applySelectedViewPreset },
         { label: 'Export view presets', detail: 'download saved map presets as JSON', kind: 'view', keywords: 'preset export json backup', disabled: state.viewPresets.length ? '' : 'No presets', run: exportViewPresets },
         { label: 'Import view presets', detail: 'load saved map presets from JSON', kind: 'view', keywords: 'preset import json restore', run: () => document.getElementById('viewPresetImportInput').click() },
         { label: 'Toggle stale UI auto-reload', detail: state.autoReloadStaleUi ? 'disable stale UI reload countdown' : 'enable stale UI reload countdown', kind: 'view', keywords: 'reload refresh stale ui frontend', run: toggleStaleAutoReload },
-        { label: state.compareChangesOnly ? 'Show compare context' : 'Show compare changes only', detail: 'toggle unchanged architecture around compare diffs', kind: 'view', keywords: 'compare diff changes context unchanged', disabled: state.view === 'compare' ? '' : 'Open compare mode', run: toggleCompareChangesOnly },
-        { label: state.compareSyncViewports ? 'Unlock compare cameras' : 'Sync compare cameras', detail: 'toggle linked pan and zoom in compare mode', kind: 'view', keywords: 'compare sync lock pan zoom camera', disabled: state.view === 'compare' ? '' : 'Open compare mode', run: toggleCompareViewportSync },
-        { label: 'Explain compare diff', detail: 'write a concise compare brief in Ask', kind: 'view', keywords: 'compare explain summary diff changes impact', disabled: state.compare ? '' : 'Run compare first', run: explainCompareDiff },
         { label: 'Hide third-party', detail: 'turn off external dependency nodes', kind: 'filter', keywords: 'external dependencies packages', run: () => setCategoryFromCommand('third_party', false) },
         { label: 'Show third-party', detail: 'turn on external dependency nodes', kind: 'filter', keywords: 'external dependencies packages', run: () => setCategoryFromCommand('third_party', true) },
         { label: 'Hide docs/config', detail: 'turn off docs and config nodes', kind: 'filter', keywords: 'readme setup requirements', run: () => setCategoryFromCommand('docs_config', false) },
@@ -3299,7 +4870,8 @@
       const status = document.getElementById('chatStatus');
       const answerRoot = document.getElementById('chatAnswer');
       const sourcesRoot = document.getElementById('chatSources');
-      status.textContent = 'Packing context...';
+      setLoadingTask('agent', 'Packing agent context', 'Selecting files, snippets, tests, risk notes, and evidence for an AI coding task.', { blocking: false });
+      setInlineStatusLoading(status, 'Packing context...', true);
       status.classList.remove('error-text');
       answerRoot.classList.remove('workflow-mode');
       answerRoot.textContent = '';
@@ -3326,6 +4898,9 @@
         .catch(err => {
           status.textContent = err.message;
           status.classList.add('error-text');
+        })
+        .finally(() => {
+          clearLoadingTask('agent');
         });
     }
 
@@ -3341,7 +4916,8 @@
       const status = document.getElementById('chatStatus');
       const answerRoot = document.getElementById('chatAnswer');
       const sourcesRoot = document.getElementById('chatSources');
-      status.textContent = 'Packing context...';
+      setLoadingTask('agent', 'Packing agent context', 'Selecting files, snippets, tests, risk notes, and evidence for an AI coding task.', { blocking: false });
+      setInlineStatusLoading(status, 'Packing context...', true);
       status.classList.remove('error-text');
       answerRoot.classList.remove('workflow-mode');
       answerRoot.textContent = '';
@@ -3364,6 +4940,9 @@
         .catch(err => {
           status.textContent = err.message;
           status.classList.add('error-text');
+        })
+        .finally(() => {
+          clearLoadingTask('agent');
         });
     }
 
@@ -3713,7 +5292,11 @@
     }
 
     function focusCameraOnSelection(selection) {
-      if (!selection || !['node', 'edge', 'path', 'bundle'].includes(selection.kind)) return;
+      if (!selection || !['node', 'edge', 'path', 'bundle', 'flowPlayback'].includes(selection.kind)) return;
+      if (selection.kind === 'flowPlayback') {
+        focusCameraOnFlowStep();
+        return;
+      }
       const side = selection.side || (selection.kind === 'path' ? selection.path.side : null);
       if (state.view === 'compare' && !side) return;
       const nodes = selectionCameraNodes(selection, side);
@@ -3744,6 +5327,9 @@
           ids.add(edge.source);
           ids.add(edge.target);
         }
+      } else if (selection.kind === 'flowPlayback') {
+        const step = flowPlaybackCurrentStep();
+        for (const id of step ? step.nodeIds : selection.playback.nodeIds || []) ids.add(id);
       }
       return [...ids].map(id => nodesById.get(id)).filter(Boolean);
     }
@@ -4194,9 +5780,18 @@
     }
 
     function setGraph(view) {
+      if (!VIEW_CHOICES.includes(view)) view = 'architecture';
       state.view = view;
       setActiveViewButton();
       invalidateNodeDetailCache();
+      if (view === 'briefing') {
+        setBriefingGraph();
+        return;
+      }
+      if (view === 'fileflow') {
+        setFileFlowGraph();
+        return;
+      }
       if (view === 'compare') {
         if (!state.compare) {
           runCompare();
@@ -4217,6 +5812,49 @@
       renderStats(state.raw.stats);
       applyFilters();
       renderFilterControls();
+    }
+
+    function setFileFlowGraph(startId) {
+      const source = state.raw && state.raw.file_graph ? state.raw.file_graph : { nodes: [], edges: [] };
+      state.allNodes = (source.nodes || []).map((node, index) => positionedNode(node, index, 'fileflow'));
+      state.allEdges = source.edges || [];
+      state.hiddenNodeIds = new Set();
+      if (startId) {
+        state.fileFlowStartId = startId;
+        state.fileFlowPathIds = [startId];
+      }
+      if (!state.fileFlowStartId || !state.allNodes.some(node => node.id === state.fileFlowStartId)) {
+        state.fileFlowStartId = defaultFileFlowStartId();
+        state.fileFlowPathIds = state.fileFlowStartId ? [state.fileFlowStartId] : [];
+      } else if (!state.fileFlowPathIds.length || state.fileFlowPathIds[0] !== state.fileFlowStartId) {
+        state.fileFlowPathIds = [state.fileFlowStartId];
+      }
+      rebuildNodeIndex();
+      rebuildGraphCache();
+      layoutFileFlowGraph();
+      const selectedId = state.fileFlowPathIds[state.fileFlowPathIds.length - 1] || state.fileFlowStartId;
+      const selectedNode = selectedId ? state.allNodes.find(node => node.id === selectedId) : null;
+      state.selected = selectedNode ? { kind: 'node', node: selectedNode } : null;
+      renderStats(currentGraphStats());
+      applyFilters();
+      renderFilterControls();
+    }
+
+    function setBriefingGraph() {
+      if (state.raw) {
+        const source = architectureGraphWithOverlay();
+        state.allNodes = source.nodes.map((node, index) => positionedNode(node, index, 'architecture'));
+        state.allEdges = source.edges;
+        state.hiddenNodeIds = new Set();
+        state.selected = null;
+        rebuildNodeIndex();
+        rebuildGraphCache();
+        prepareGraphLayoutForCurrentFilters('architecture', 165);
+        renderStats(state.raw.stats);
+        applyFilters();
+        renderFilterControls();
+      }
+      loadBriefing(false);
     }
 
     function architectureGraphWithOverlay() {
@@ -4284,7 +5922,7 @@
 
     function layoutStorageKey(scope) {
       const repo = state.raw && state.raw.repo ? state.raw.repo.path || state.raw.repo.name : 'repo';
-      return repo + '::' + (scope === 'commits' ? 'commits' : 'architecture');
+      return repo + '::' + (scope === 'commits' ? 'commits' : scope === 'fileflow' ? 'fileflow' : 'architecture');
     }
 
     function savedLayoutPosition(nodeId, scope) {
@@ -4358,6 +5996,194 @@
         node.vy = 0;
         node._layoutSaved = true;
       }
+    }
+
+    function defaultFileFlowStartId() {
+      if (!state.allNodes.length) return '';
+      const scores = new Map(state.allNodes.map(node => [node.id, 0]));
+      const targetSets = new Map();
+      const incoming = new Map();
+      for (const edge of state.allEdges || []) {
+        const weight = Number(edge.weight || 1);
+        scores.set(edge.source, (scores.get(edge.source) || 0) + weight * 4);
+        incoming.set(edge.target, (incoming.get(edge.target) || 0) + weight);
+        if (!targetSets.has(edge.source)) targetSets.set(edge.source, new Set());
+        targetSets.get(edge.source).add(edge.target);
+      }
+      for (const [id, targets] of targetSets.entries()) {
+        scores.set(id, (scores.get(id) || 0) + targets.size * 35 + (incoming.get(id) || 0) * 0.15);
+      }
+      const connected = state.allNodes.filter(node => (targetSets.get(node.id) || new Set()).size > 0);
+      const candidates = connected.length ? connected : state.allNodes;
+      return [...candidates]
+        .sort((a, b) => (scores.get(b.id) || 0) - (scores.get(a.id) || 0) || a.id.localeCompare(b.id))[0].id;
+    }
+
+    function layoutFileFlowGraph() {
+      const layers = buildFileFlowLayers(state.fileFlowStartId, state.fileFlowDepth);
+      state.fileFlowLayers = layers;
+      for (const node of state.allNodes) {
+        node.layer = 0;
+        node.fileFlowSelected = false;
+      }
+      const layerGap = 340;
+      for (const [layerIndex, layer] of layers.entries()) {
+        const ids = orderedFileFlowLayerIds(layer);
+        const rowGap = ids.length > 34 ? 42 : ids.length > 20 ? 54 : ids.length > 10 ? 68 : 86;
+        const startY = -((ids.length - 1) * rowGap) / 2;
+        for (const [rowIndex, id] of ids.entries()) {
+          const node = state.allNodes.find(item => item.id === id);
+          if (!node) continue;
+          node.x = layerIndex * layerGap;
+          node.y = startY + rowIndex * rowGap;
+          node.vx = 0;
+          node.vy = 0;
+          node.layer = layerIndex + 1;
+          node.fileFlowSelected = layer.selectedId === id;
+          node._layoutSaved = true;
+        }
+      }
+    }
+
+    function buildFileFlowLayers(startId, depth) {
+      const nodeIds = new Set(state.allNodes.map(node => node.id));
+      if (!startId || !nodeIds.has(startId)) startId = defaultFileFlowStartId();
+      if (!nodeIds.has(startId)) return [];
+      const maxDepth = clamp(Number(depth || 3), 1, 5);
+      const path = normalizeFileFlowPath(startId, maxDepth, nodeIds);
+      const outgoing = new Map();
+      for (const edge of state.allEdges || []) {
+        if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
+        if (!outgoing.has(edge.source)) outgoing.set(edge.source, []);
+        outgoing.get(edge.source).push(edge);
+      }
+      const layers = [];
+      const first = path[0] || startId;
+      layers.push({
+        index: 0,
+        ids: [first],
+        selectedId: first,
+        sourceId: '',
+        options: fileFlowAllFileOptions()
+      });
+      let sourceId = first;
+      for (let index = 1; index < maxDepth && sourceId; index += 1) {
+        const options = fileFlowTargetOptions(sourceId);
+        const ids = options.map(option => option.id);
+        if (!ids.length) break;
+        const selectedId = path[index] && ids.includes(path[index]) ? path[index] : '';
+        layers.push({ index, ids, selectedId, sourceId, options });
+        if (!selectedId) break;
+        sourceId = selectedId;
+      }
+      state.fileFlowPathIds = path;
+      state.fileFlowStartId = path[0] || startId;
+      return layers;
+    }
+
+    function normalizeFileFlowPath(startId, maxDepth, nodeIds) {
+      const seed = (state.fileFlowPathIds || []).filter(id => nodeIds.has(id));
+      if (!seed.length || seed[0] !== startId) seed.unshift(startId);
+      const path = [startId];
+      for (let index = 1; index < maxDepth; index += 1) {
+        const sourceId = path[index - 1];
+        const candidate = seed[index];
+        if (!candidate) break;
+        const options = new Set(fileFlowTargetOptions(sourceId).map(option => option.id));
+        if (!options.has(candidate)) break;
+        path.push(candidate);
+      }
+      return path.slice(0, maxDepth);
+    }
+
+    function orderedFileFlowLayerIds(layer) {
+      const ids = [...(layer.ids || [])].sort(fileFlowNodeSort);
+      if (!layer.selectedId || !ids.includes(layer.selectedId) || ids.length < 3) return ids;
+      const selectedIndex = ids.indexOf(layer.selectedId);
+      ids.splice(selectedIndex, 1);
+      ids.splice(Math.floor(ids.length / 2), 0, layer.selectedId);
+      return ids;
+    }
+
+    function fileFlowAllFileOptions() {
+      return [...state.allNodes]
+        .sort(fileFlowNodeSort)
+        .map(node => ({
+          id: node.id,
+          label: node.label,
+          weight: fileFlowNodeScore(node.id),
+          edges: [],
+          examples: 0,
+          types: []
+        }));
+    }
+
+    function fileFlowTargetOptions(sourceId) {
+      const byTarget = new Map();
+      for (const edge of state.allEdges || []) {
+        if (edge.source !== sourceId) continue;
+        const item = byTarget.get(edge.target) || {
+          id: edge.target,
+          label: labelForNode(edge.target),
+          weight: 0,
+          examples: 0,
+          edges: [],
+          types: new Set()
+        };
+        item.weight += Number(edge.weight || 1);
+        item.examples += (edge.examples || []).length;
+        item.edges.push(edge);
+        item.types.add(edge.type || 'edge');
+        byTarget.set(edge.target, item);
+      }
+      return [...byTarget.values()]
+        .map(item => ({ ...item, types: [...item.types].sort() }))
+        .sort((a, b) =>
+          b.weight - a.weight ||
+          b.examples - a.examples ||
+          fileFlowNodeScore(b.id) - fileFlowNodeScore(a.id) ||
+          a.label.localeCompare(b.label)
+        );
+    }
+
+    function fileFlowPathEdgeSet() {
+      const keys = new Set();
+      for (const layer of state.fileFlowLayers || []) {
+        if (!layer.sourceId || !layer.selectedId) continue;
+        for (const edge of state.allEdges || []) {
+          if (edge.source === layer.sourceId && edge.target === layer.selectedId) {
+            keys.add(edge.id || edge.source + '->' + edge.target + ':' + edge.type);
+          }
+        }
+      }
+      return keys;
+    }
+
+    function fileFlowEdgeKey(edge) {
+      return edge.id || edge.source + '->' + edge.target + ':' + edge.type;
+    }
+
+    function fileFlowNodeSort(a, b) {
+      const idA = fileFlowNodeId(a);
+      const idB = fileFlowNodeId(b);
+      const scoreA = fileFlowNodeScore(idA);
+      const scoreB = fileFlowNodeScore(idB);
+      return scoreB - scoreA || idA.localeCompare(idB);
+    }
+
+    function fileFlowNodeId(value) {
+      if (typeof value === 'string') return value;
+      if (value && typeof value.id === 'string') return value.id;
+      return String(value || '');
+    }
+
+    function fileFlowNodeScore(id) {
+      let score = 0;
+      for (const edge of state.allEdges || []) {
+        if (edge.source === id) score += Number(edge.weight || 1) * 4;
+        if (edge.target === id) score += Number(edge.weight || 1) * 0.25;
+      }
+      return score;
     }
 
     function placeNewNodesNearNeighbors(nodes, edges) {
@@ -4507,8 +6333,69 @@
         applyCompareFilters();
         return;
       }
+      if (state.view === 'fileflow') {
+        applyFileFlowFilters();
+        return;
+      }
       if (requestGraphWorkerFilter()) return;
       applyArchitectureFiltersMainThread();
+    }
+
+    function applyFileFlowFilters() {
+      const startedAt = performance.now();
+      layoutFileFlowGraph();
+      const visibleIds = new Set();
+      for (const layer of state.fileFlowLayers || []) {
+        for (const id of layer.ids || []) visibleIds.add(id);
+      }
+      state.nodes = state.allNodes.filter(node => visibleIds.has(node.id));
+      const allowedEdgeKeys = new Set();
+      for (const layer of state.fileFlowLayers || []) {
+        if (!layer.sourceId) continue;
+        const targets = new Set(layer.ids || []);
+        for (const edge of state.allEdges || []) {
+          if (edge.source === layer.sourceId && targets.has(edge.target)) allowedEdgeKeys.add(fileFlowEdgeKey(edge));
+        }
+      }
+      state.edges = (state.allEdges || []).filter(edge => {
+        if (!visibleIds.has(edge.source) || !visibleIds.has(edge.target)) return false;
+        return allowedEdgeKeys.has(fileFlowEdgeKey(edge));
+      });
+      state.visibleNodeIds = visibleIds;
+      state.graphCache.visibleNodesById = new Map(state.nodes.map(node => [node.id, node]));
+      rebuildPinnedTraceCache();
+      state.visibilityStatus = {
+        view: 'fileflow',
+        totalNodes: state.allNodes.length,
+        visibleNodes: state.nodes.length,
+        totalEdges: state.allEdges.length,
+        visibleEdges: state.edges.length,
+        categoryHidden: 0,
+        manualHidden: 0,
+        connectionHidden: 0,
+        connectedHidden: Math.max(0, state.allNodes.length - state.nodes.length),
+        focusHidden: 0,
+        budgetHidden: 0
+      };
+      if (state.selected && state.selected.kind === 'node' && !visibleIds.has(state.selected.node.id)) {
+        const startNode = state.allNodes.find(node => node.id === state.fileFlowStartId);
+        state.selected = startNode ? { kind: 'node', node: startNode } : null;
+      }
+      if (
+        state.selected &&
+        state.selected.kind === 'edge' &&
+        (!visibleIds.has(state.selected.edge.source) || !visibleIds.has(state.selected.edge.target))
+      ) {
+        state.selected = null;
+      }
+      invalidateNodeDetailCache();
+      renderFilterSummary();
+      renderSelection(state.selected);
+      renderTopEdges();
+      renderFileFlowLayerControls();
+      state.lastFilterMs = Math.round((performance.now() - startedAt) * 10) / 10;
+      renderPerfPanel();
+      scheduleUrlStateUpdate();
     }
 
     function applyArchitectureFiltersMainThread() {
@@ -4577,6 +6464,7 @@
       if (!worker) return false;
       const requestId = ++state.graphWorkerRequestId;
       state.graphWorkerInFlight = true;
+      setLoadingTask('filters', 'Filtering map', 'Applying lens, category, connection, focus, and node-budget filters on the graph worker.', { blocking: false, surface: 'filters' });
       worker.postMessage(graphWorkerPayload(requestId));
       return true;
     }
@@ -4599,6 +6487,7 @@
         worker.onerror = () => {
           state.graphWorkerSupported = false;
           state.graphWorkerInFlight = false;
+          clearLoadingTask('filters');
           if (state.graphWorker) state.graphWorker.terminate();
           state.graphWorker = null;
           applyArchitectureFiltersMainThread();
@@ -4654,10 +6543,12 @@
       if (!payload || payload.requestId !== state.graphWorkerRequestId) return;
       if (!payload.ok) {
         state.graphWorkerInFlight = false;
+        clearLoadingTask('filters');
         applyArchitectureFiltersMainThread();
         return;
       }
       state.graphWorkerInFlight = false;
+      clearLoadingTask('filters');
       state.graphWorkerLastMs = payload.durationMs || null;
       state.lastFilterMs = payload.durationMs || null;
       state.lastFilterWorkerUsed = true;
@@ -5007,6 +6898,7 @@
       if (state.view === 'compare' && sideName && state.selected.side && state.selected.side !== sideName) return null;
       if (state.selected.kind === 'node') return new Set([state.selected.node.id]);
       if (state.selected.kind === 'edge') return new Set([state.selected.edge.source, state.selected.edge.target]);
+      if (state.selected.kind === 'flowPlayback') return new Set(state.selected.playback.nodeIds || []);
       return null;
     }
 
@@ -5463,6 +7355,19 @@
         .filter(connection => isConnectionVisible(connection.id))
         .map(connection => connection.label.toLowerCase())
         .join(', ') || 'none';
+      if (state.view === 'fileflow') {
+        const layers = state.fileFlowLayers || [];
+        const selectedHops = Math.max(0, (state.fileFlowPathIds || []).length - 1);
+        const nextChoices = layers.length ? (layers[layers.length - 1].options || []).length : 0;
+        document.getElementById('filterSummary').textContent =
+          formatCount(status.visibleNodes) + ' visible file nodes | ' +
+          layers.length + ' layer' + (layers.length === 1 ? '' : 's') +
+          ' | selected hops: ' + selectedHops +
+          (nextChoices ? ' | next choices: ' + formatCount(nextChoices) : '');
+        renderMapStatus(status, 'file flow', activeConnections);
+        updateFocusBreadcrumb();
+        return;
+      }
       const scale = 'min w: ' + state.minEdgeWeight + (state.nodeBudget ? ' | top ' + state.nodeBudget : '') + (state.connectedOnly ? ' | connected only' : '');
       const focus = state.focusSelection ? ' | focus: ' + state.focusHops + ' hop' + (state.focusHops === 1 ? '' : 's') : '';
       document.getElementById('filterSummary').textContent =
@@ -5548,6 +7453,7 @@
     }
 
     function currentEmptyMapState() {
+      if (state.view === 'briefing') return null;
       if (state.graphLoadError) {
         return {
           title: 'Failed to load graph',
@@ -5804,15 +7710,20 @@
       }
     }
 
+    function currentGraphStats() {
+      return state.raw && state.raw.stats ? state.raw.stats : {};
+    }
+
     function renderStats(stats) {
+      const safeStats = stats || {};
       const root = document.getElementById('stats');
       root.innerHTML = '';
       const cards = [
-        { key: 'files', label: 'Files', value: stats.files },
-        { key: 'symbols', label: 'Symbols', value: stats.symbols },
-        { key: 'components', label: 'Components', value: stats.components },
-        { key: 'edges', label: 'Edges', value: stats.component_edges },
-        { key: 'commits', label: 'Commits', value: stats.commits }
+        { key: 'files', label: 'Files', value: safeStats.files || 0 },
+        { key: 'symbols', label: 'Symbols', value: safeStats.symbols || 0 },
+        { key: 'components', label: 'Components', value: safeStats.components || 0 },
+        { key: 'edges', label: 'Edges', value: safeStats.component_edges || 0 },
+        { key: 'commits', label: 'Commits', value: safeStats.commits || 0 }
       ];
       for (const card of cards) {
         root.appendChild(statCard(card, () => selectStat(card.key)));
@@ -5937,6 +7848,7 @@
     function tick() {
       const frameStartedAt = performance.now();
       resize();
+      advanceFlowPlayback(frameStartedAt);
       const drawStartedAt = performance.now();
       draw();
       state.lastDrawMs = Math.round((performance.now() - drawStartedAt) * 10) / 10;
@@ -6001,7 +7913,25 @@
         updateLegendLayout(false);
         return;
       }
+      if (state.view === 'briefing') {
+        if (state.nodes.length) {
+          ctx.save();
+          ctx.globalAlpha = 0.34;
+          drawGraphPanel(state.nodes, state.edges, { x: 0, y: 0, w, h }, null);
+          ctx.restore();
+        }
+        updateEmptyMapOverlay(false);
+        updateLegendLayout(true);
+        return;
+      }
       if (!state.nodes.length) {
+        updateEmptyMapOverlay();
+        updateLegendLayout(false);
+        return;
+      }
+      if (state.view === 'fileflow') {
+        drawFileFlow(w, h);
+        ctx.globalAlpha = 1;
         updateEmptyMapOverlay();
         updateLegendLayout(false);
         return;
@@ -6010,6 +7940,222 @@
       ctx.globalAlpha = 1;
       updateEmptyMapOverlay();
       updateLegendLayout(false);
+    }
+
+    function drawFileFlow(w, h) {
+      drawFileFlowPanel(state.nodes, state.edges, { x: 0, y: 0, w, h });
+      drawMinimapOverlay(state.nodes, { x: 0, y: 0, w, h }, null);
+    }
+
+    function drawFileFlowPanel(nodes, edges, rect) {
+      const transform = graphTransformFor(nodes, rect, null);
+      drawFileFlowLayerBands(transform, rect);
+      positionFileFlowLayerControls(transform, rect);
+      const nodesById = new Map(nodes.map(node => [node.id, node]));
+      const selectedPathEdges = fileFlowPathEdgeSet();
+      for (const edge of edges) drawFileFlowEdge(edge, nodesById, transform, rect, selectedPathEdges);
+      const sorted = [...nodes].sort((a, b) => (a.layer || 0) - (b.layer || 0) || a.label.localeCompare(b.label));
+      for (const node of sorted) drawFileFlowNode(node, transform, rect);
+    }
+
+    function renderFileFlowLayerControls() {
+      const root = document.getElementById('fileFlowLayerControls');
+      if (!root) return;
+      const layers = state.fileFlowLayers || [];
+      if (state.view !== 'fileflow' || !layers.length) {
+        root.hidden = true;
+        root.innerHTML = '';
+        state.fileFlowControlsSignature = '';
+        return;
+      }
+      root.hidden = false;
+      const signature = JSON.stringify(layers.map(layer => [
+        layer.index,
+        layer.sourceId || '',
+        layer.selectedId || '',
+        (layer.options || []).map(option => option.id).join('\u001f')
+      ]));
+      if (signature === state.fileFlowControlsSignature) return;
+      state.fileFlowControlsSignature = signature;
+      root.innerHTML = '';
+      for (const layer of layers) {
+        const card = document.createElement('div');
+        card.className = 'file-flow-layer-control' + (layer.selectedId ? ' active' : '');
+        card.dataset.layerIndex = String(layer.index);
+        const heading = document.createElement('div');
+        heading.className = 'file-flow-layer-label';
+        const title = document.createElement('span');
+        title.textContent = layer.index === 0 ? 'Layer 1 / start file' : 'Layer ' + (layer.index + 1) + ' / connected files';
+        const count = document.createElement('span');
+        count.className = 'file-flow-layer-count';
+        count.textContent = layer.index === 0
+          ? formatCount(state.allNodes.length) + ' files'
+          : formatCount((layer.options || []).length) + ' connected';
+        heading.append(title, count);
+        const select = document.createElement('select');
+        select.setAttribute('aria-label', title.textContent);
+        const options = layer.options || [];
+        if (layer.index > 0) {
+          const placeholder = document.createElement('option');
+          placeholder.value = '';
+          placeholder.textContent = 'Choose connected file...';
+          select.appendChild(placeholder);
+        }
+        if (!options.length) {
+          const option = document.createElement('option');
+          option.value = '';
+          option.textContent = layer.index === 0 ? 'No files indexed' : 'No outgoing file links';
+          select.appendChild(option);
+          select.disabled = true;
+        } else {
+          for (const option of options) {
+            const item = document.createElement('option');
+            item.value = option.id;
+            item.textContent = fileFlowOptionLabel(option, layer.index);
+            select.appendChild(item);
+          }
+          select.value = layer.selectedId || '';
+        }
+        select.onchange = () => setFileFlowLayerSelection(layer.index, select.value);
+        const meta = document.createElement('div');
+        meta.className = 'file-flow-layer-meta';
+        meta.textContent = fileFlowLayerMetaText(layer);
+        card.append(heading, select, meta);
+        root.appendChild(card);
+      }
+    }
+
+    function positionFileFlowLayerControls(transform, rect) {
+      const root = document.getElementById('fileFlowLayerControls');
+      if (!root || root.hidden) return;
+      for (const card of root.querySelectorAll('.file-flow-layer-control')) {
+        const layerIndex = Number(card.dataset.layerIndex || 0);
+        const layer = (state.fileFlowLayers || []).find(item => item.index === layerIndex);
+        if (!layer) continue;
+        const anchorId = layer.selectedId || (layer.ids || [])[0];
+        const node = anchorId ? state.nodeIndex.get(anchorId) : null;
+        const anchor = node || { x: layerIndex * 340, y: 0, size: 8 };
+        const p = projectInRect(anchor, transform, rect);
+        const half = 118;
+        card.style.left = clamp(p.x, rect.x + half + 10, rect.x + rect.w - half - 10) + 'px';
+        card.style.top = (rect.y + 20) + 'px';
+      }
+    }
+
+    function fileFlowOptionLabel(option, layerIndex) {
+      const label = option.label || option.id;
+      if (layerIndex === 0) return label;
+      const facts = [];
+      if (option.weight) facts.push('links ' + option.weight);
+      if (option.examples) facts.push('paths ' + option.examples);
+      if (option.types && option.types.length) facts.push(option.types.join('/'));
+      return label + (facts.length ? ' - ' + facts.join(', ') : '');
+    }
+
+    function fileFlowLayerMetaText(layer) {
+      if (layer.index === 0) return 'Pick any indexed file as the first layer.';
+      const source = fileFlowShortLabel(layer.sourceId || '');
+      if (!(layer.options || []).length) return 'No outgoing file links from ' + source + '.';
+      if (!layer.selectedId) return 'Pick a connected file from ' + source + ' to open the next layer.';
+      const selected = fileFlowShortLabel(layer.selectedId);
+      return 'Following ' + source + ' -> ' + selected + '.';
+    }
+
+    function drawFileFlowLayerBands(transform, rect) {
+      const layers = state.fileFlowLayers || [];
+      ctx.save();
+      ctx.textAlign = 'center';
+      ctx.font = '11px system-ui';
+      for (const [index, layer] of layers.entries()) {
+        const ids = layer.ids || [];
+        if (!ids.length) continue;
+        const first = state.nodeIndex.get(ids[0]);
+        if (!first) continue;
+        const p = projectInRect(first, transform, rect);
+        ctx.fillStyle = 'rgba(32, 36, 45, .34)';
+        ctx.strokeStyle = 'rgba(96, 165, 250, .16)';
+        ctx.lineWidth = 1;
+        roundedRect(p.x - 92, rect.y + 18, 184, rect.h - 36, 18);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = index === 0 ? '#22d3ee' : '#9ba7b6';
+        ctx.fillText(index === 0 ? 'Layer 1 / start file' : 'Layer ' + (index + 1), p.x, rect.y + 38);
+      }
+      ctx.restore();
+    }
+
+    function drawFileFlowEdge(edge, nodesById, transform, rect, selectedPathEdges) {
+      const source = nodesById.get(edge.source);
+      const target = nodesById.get(edge.target);
+      if (!source || !target) return;
+      const pa = projectInRect(source, transform, rect);
+      const pb = projectInRect(target, transform, rect);
+      const selected = isSelectedEdge(edge, null);
+      const inPath = selectedPathEdges && selectedPathEdges.has(fileFlowEdgeKey(edge));
+      const related = selected || inPath || (state.selected && state.selected.kind === 'node' && (state.selected.node.id === edge.source || state.selected.node.id === edge.target));
+      const alpha = selected || inPath ? 0.95 : state.selected ? (related ? 0.56 : 0.16) : 0.42;
+      const width = selected || inPath ? 4.8 : Math.min(4.2, 1.2 + Math.log2((edge.weight || 1) + 1) * 0.55);
+      const mid = Math.max(70, Math.abs(pb.x - pa.x) * 0.42);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = selected || inPath ? '#22d3ee' : edgeColor(edge.type, edge);
+      ctx.lineWidth = width;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(pa.x + pa.r * 0.72, pa.y);
+      ctx.bezierCurveTo(pa.x + mid, pa.y, pb.x - mid, pb.y, pb.x - pb.r * 0.72, pb.y);
+      ctx.stroke();
+      if (selected || inPath) {
+        ctx.globalAlpha = 0.95;
+        ctx.fillStyle = '#eef1f5';
+        const t = (performance.now() % 1400) / 1400;
+        const pulse = cubicBezierPoint({ x: pa.x + pa.r * 0.72, y: pa.y }, { x: pa.x + mid, y: pa.y }, { x: pb.x - mid, y: pb.y }, { x: pb.x - pb.r * 0.72, y: pb.y }, t);
+        ctx.beginPath();
+        ctx.arc(pulse.x, pulse.y, 4.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    function cubicBezierPoint(p0, p1, p2, p3, t) {
+      const mt = 1 - t;
+      return {
+        x: mt * mt * mt * p0.x + 3 * mt * mt * t * p1.x + 3 * mt * t * t * p2.x + t * t * t * p3.x,
+        y: mt * mt * mt * p0.y + 3 * mt * mt * t * p1.y + 3 * mt * t * t * p2.y + t * t * t * p3.y
+      };
+    }
+
+    function drawFileFlowNode(node, transform, rect) {
+      const p = projectInRect(node, transform, rect);
+      const selected = isSelectedNode(node, null);
+      const start = node.id === state.fileFlowStartId;
+      const inPath = Boolean(node.fileFlowSelected);
+      const dim = state.search && !node.label.toLowerCase().includes(state.search);
+      ctx.save();
+      ctx.globalAlpha = dim ? 0.2 : 1;
+      ctx.fillStyle = start ? '#22d3ee' : nodeColor(node);
+      ctx.strokeStyle = selected ? '#eef1f5' : (start || inPath) ? 'rgba(34, 211, 238, .95)' : 'rgba(238, 241, 245, .72)';
+      ctx.lineWidth = selected || start || inPath ? 3 : 1.5;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#eef1f5';
+      ctx.font = selected || start ? '13px system-ui' : '12px system-ui';
+      ctx.textAlign = 'center';
+      ctx.fillText(fileFlowShortLabel(node.label), p.x, p.y + p.r + 15);
+      ctx.fillStyle = '#9ba7b6';
+      ctx.font = '10px system-ui';
+      const metrics = node.metrics || {};
+      ctx.fillText(String(metrics.lines || 0) + ' lines', p.x, p.y + p.r + 28);
+      ctx.restore();
+    }
+
+    function fileFlowShortLabel(label) {
+      const text = String(label || '');
+      const parts = text.split('/');
+      if (parts.length <= 2) return truncateText(text, 22);
+      return truncateText(parts.slice(-2).join('/'), 24);
     }
 
     function drawCompare(w, h) {
@@ -6210,6 +8356,7 @@
       for (const item of edgeItems) {
         drawEdgeRenderItem(item, transform, rect, side, lowDetail);
       }
+      drawFlowPlaybackPathOverlay(nodesById, transform, rect, side);
       const sorted = [...nodes].sort(
         (a, b) => nodeFocusRank(a, focus) - nodeFocusRank(b, focus)
       );
@@ -6218,7 +8365,7 @@
         const dim = state.search && !node.label.toLowerCase().includes(state.search);
         const alpha = Math.min(dim ? 0.18 : 1, nodeFocusAlpha(node, focus), compareDiffNodeAlpha(node, diffFocus));
         ctx.fillStyle = nodeColor(node);
-        const selected = isSelectedNode(node, side) || isSelectedEdgeEndpoint(node, side) || isSelectedPathEndpoint(node, side);
+        const selected = isSelectedNode(node, side) || isSelectedEdgeEndpoint(node, side) || isSelectedPathEndpoint(node, side) || isFlowPlaybackNode(node, side);
         const changed = shouldHighlightDiff() && hasChange(node);
         ctx.strokeStyle = selected ? '#eef1f5' : changed ? '#fca5a5' : '#0f1115';
         ctx.lineWidth = selected ? 3 : changed ? 2.5 : 1.5;
@@ -6227,6 +8374,7 @@
         ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
         ctx.fill();
         ctx.stroke();
+        if (isFlowPlaybackCurrentNode(node, side)) drawFlowPlaybackNodePulse(p);
         if (shouldDrawNodeLabel(node, p, lowDetail, focus, dim, alpha, side)) {
           ctx.fillStyle = '#eef1f5';
           ctx.font = '12px system-ui';
@@ -6238,7 +8386,7 @@
     }
 
     function edgeRenderItemsForPanel(nodes, edges, transform, rect, side, nodesById) {
-      if (!state.edgeBundling || shouldHighlightDiff()) {
+      if ((!side && state.flowPlayback) || !state.edgeBundling || shouldHighlightDiff()) {
         return edges.map(edge => exactEdgeRenderItem(edge, nodesById)).filter(Boolean);
       }
       const lowDetail = lowDetailMode(transform, nodes, edges);
@@ -6387,15 +8535,21 @@
       const pa = projectPointInRect(item.sourcePoint, transform, rect);
       const pb = projectPointInRect(item.targetPoint, transform, rect);
       const edge = item.kind === 'bundle' ? item.edges[0] : item.edge;
-      const selected = item.kind === 'bundle' ? isSelectedBundle(item, side) : isSelectedEdge(edge, side) || isSelectedPathEdge(edge, side);
+      const playbackCurrent = flowPlaybackItemCurrent(item, side);
+      const playbackInPath = flowPlaybackItemInPath(item, side);
+      const playbackRevealed = flowPlaybackItemRevealed(item, side);
+      const selected = playbackCurrent || (item.kind === 'bundle' ? isSelectedBundle(item, side) : isSelectedEdge(edge, side) || isSelectedPathEdge(edge, side));
       const hovered = item.kind === 'bundle' ? isHoveredBundle(item, side) : isHoveredEdge(edge, side);
       const pinned = item.kind !== 'bundle' && isPinnedTraceEdge(edge, side);
       const alpha = item.kind === 'bundle' ? bundleAlpha(item, side) : edgeAlpha(edge, side);
       ctx.globalAlpha = visibleEdgeAlpha(hovered ? Math.max(alpha, 0.98) : pinned ? Math.max(alpha, 0.9) : alpha, lowDetail);
       ctx.strokeStyle = edgeColor(item.type, edge);
       const baseWidth = Math.min(5.5, 1.15 + Math.log2((item.weight || 1) + 1) * 0.62) * edgeWidthScale();
+      const quietBaseWidth = !side && state.flowPlayback && (!playbackInPath || !playbackRevealed) && !selected && !hovered && !pinned
+        ? baseWidth * 0.48
+        : baseWidth;
       const diffEdge = shouldHighlightDiff() && hasChange(edge);
-      ctx.lineWidth = hovered ? Math.min(7, baseWidth + 2.2) : selected ? 5.5 : pinned ? Math.min(6, baseWidth + 1.6) : item.kind === 'bundle' ? Math.min(7, baseWidth + 1.1) : diffEdge ? Math.min(5, baseWidth + 1.2) : baseWidth;
+      ctx.lineWidth = hovered ? Math.min(7, quietBaseWidth + 2.2) : selected ? 5.5 : pinned ? Math.min(6, quietBaseWidth + 1.6) : item.kind === 'bundle' ? Math.min(7, quietBaseWidth + 1.1) : diffEdge ? Math.min(5, quietBaseWidth + 1.2) : quietBaseWidth;
       ctx.setLineDash(edgeDashPattern(item.type, item.kind, selected, hovered, pinned, diffEdge));
       ctx.lineDashOffset = 0;
       ctx.beginPath();
@@ -6403,7 +8557,129 @@
       ctx.lineTo(pb.x, pb.y);
       ctx.stroke();
       ctx.setLineDash([]);
-      if (item.kind === 'bundle') drawBundleLabel(item, pa, pb, selected || hovered);
+      if (playbackCurrent) drawFlowPlaybackPulse(pa, pb);
+      if (item.kind === 'bundle' && (!state.flowPlayback || side || selected || hovered)) {
+        drawBundleLabel(item, pa, pb, selected || hovered);
+      }
+    }
+
+    function drawFlowPlaybackPulse(pa, pb) {
+      const t = (performance.now() % 1200) / 1200;
+      const x = pa.x + (pb.x - pa.x) * t;
+      const y = pa.y + (pb.y - pa.y) * t;
+      ctx.save();
+      ctx.globalAlpha = 1;
+      ctx.shadowColor = 'rgba(34, 211, 238, .55)';
+      ctx.shadowBlur = 12;
+      ctx.strokeStyle = 'rgba(34, 211, 238, .92)';
+      ctx.lineWidth = Math.max(3, 4.2 * edgeWidthScale());
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(pa.x, pa.y);
+      ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+      ctx.fillStyle = '#eef1f5';
+      ctx.beginPath();
+      ctx.arc(x, y, 4.6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function drawFlowPlaybackPathOverlay(nodesById, transform, rect, side) {
+      if (side || !state.flowPlayback) return;
+      const points = flowPlaybackRevealedPathPoints(flowPlaybackPathPoints(nodesById, transform, rect));
+      if (points.length < 2) return;
+      ctx.save();
+      ctx.setLineDash([]);
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.globalAlpha = 0.22;
+      ctx.strokeStyle = 'rgba(238, 241, 245, .9)';
+      ctx.lineWidth = Math.max(7, 8.5 * edgeWidthScale());
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+      ctx.stroke();
+      ctx.globalAlpha = 0.96;
+      ctx.strokeStyle = 'rgba(34, 211, 238, .96)';
+      ctx.lineWidth = Math.max(3, 4.2 * edgeWidthScale());
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (const point of points.slice(1)) ctx.lineTo(point.x, point.y);
+      ctx.stroke();
+      ctx.restore();
+      drawFlowPlaybackCurrentSegmentPulse(points);
+    }
+
+    function flowPlaybackRevealedPathPoints(points) {
+      const playback = state.flowPlayback;
+      if (!playback || !Array.isArray(points) || !points.length) return [];
+      const limit = clamp((playback.stepIndex || 0) + 1, 1, points.length);
+      return points.slice(0, limit);
+    }
+
+    function flowPlaybackPathPoints(nodesById, transform, rect) {
+      const playback = state.flowPlayback;
+      if (!playback) return [];
+      const points = [];
+      for (const step of playback.steps || []) {
+        const id = step.targetId || step.sourceId || (step.nodeIds || [])[0];
+        if (!id) continue;
+        const node = nodesById.get(id);
+        if (!node) continue;
+        const previous = points[points.length - 1];
+        if (previous && previous.id === id) continue;
+        points.push({ id, ...projectInRect(node, transform, rect) });
+      }
+      return points;
+    }
+
+    function drawFlowPlaybackCurrentSegmentPulse(points) {
+      const playback = state.flowPlayback;
+      if (!playback || points.length < 2 || (playback.stepIndex || 0) <= 0) return;
+      const index = clamp(playback.stepIndex || 0, 1, points.length - 1);
+      const pa = points[index - 1];
+      const pb = points[index];
+      if (!pa || !pb) return;
+      drawFlowPlaybackPulse(pa, pb);
+    }
+
+    function drawFlowPlaybackVirtualEdge(nodesById, transform, rect, side) {
+      if (side || !state.flowPlayback) return;
+      const step = flowPlaybackCurrentStep();
+      if (!step || step.edge || !step.sourceId || !step.targetId || step.sourceId === step.targetId) return;
+      const source = nodesById.get(step.sourceId);
+      const target = nodesById.get(step.targetId);
+      if (!source || !target) return;
+      const pa = projectInRect(source, transform, rect);
+      const pb = projectInRect(target, transform, rect);
+      ctx.save();
+      ctx.globalAlpha = 0.92;
+      ctx.strokeStyle = 'rgba(34, 211, 238, .78)';
+      ctx.lineWidth = Math.max(2.4, 3.2 * edgeWidthScale());
+      ctx.setLineDash([9, 6]);
+      ctx.lineDashOffset = -((performance.now() / 44) % 15);
+      ctx.beginPath();
+      ctx.moveTo(pa.x, pa.y);
+      ctx.lineTo(pb.x, pb.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+      drawFlowPlaybackPulse(pa, pb);
+    }
+
+    function drawFlowPlaybackNodePulse(projected) {
+      const t = (performance.now() % 1100) / 1100;
+      ctx.save();
+      ctx.globalAlpha = 0.86 - t * 0.42;
+      ctx.strokeStyle = 'rgba(34, 211, 238, .95)';
+      ctx.lineWidth = 2.2;
+      ctx.shadowColor = 'rgba(34, 211, 238, .5)';
+      ctx.shadowBlur = 12;
+      ctx.beginPath();
+      ctx.arc(projected.x, projected.y, projected.r + 5 + t * 7, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
     }
 
     function edgeDashPattern(type, kind, selected, hovered, pinned, diffEdge) {
@@ -6439,6 +8715,7 @@
     }
 
     function visibleEdgeAlpha(alpha, lowDetail) {
+      if (state.flowPlayback && state.view === 'architecture') return alpha;
       return lowDetail ? Math.max(alpha, LOW_DETAIL_EDGE_ALPHA_FLOOR) : alpha;
     }
 
@@ -6469,7 +8746,7 @@
 
     function shouldDrawNodeLabel(node, projected, lowDetail, focus, dim, alpha, side) {
       if (dim || alpha <= 0.35 || projected.r <= 9) return false;
-      if (isSelectedNode(node, side) || isSelectedEdgeEndpoint(node, side) || isSelectedPathEndpoint(node, side)) return true;
+      if (isSelectedNode(node, side) || isSelectedEdgeEndpoint(node, side) || isSelectedPathEndpoint(node, side) || isFlowPlaybackNode(node, side)) return true;
       const metrics = node.metrics || {};
       const important = Number(metrics.files || 0) >= 3 ||
         Number(node.size || 0) >= 24 ||
@@ -6482,6 +8759,11 @@
     }
 
     function bundleAlpha(bundle, side) {
+      if (state.flowPlayback && !side) {
+        if ((bundle.edges || []).some(edge => isFlowPlaybackCurrentEdge(edge, side))) return 1;
+        if ((bundle.edges || []).some(edge => isFlowPlaybackVisitedEdge(edge, side))) return adjustEdgeAlpha(0.86);
+        return adjustEdgeAlpha(0.024);
+      }
       if (isSelectedBundle(bundle, side)) return 1;
       if (!state.selected || !['node', 'edge', 'path', 'bundle'].includes(state.selected.kind)) return adjustEdgeAlpha(0.72);
       if (state.selected.kind === 'node') {
@@ -6501,7 +8783,8 @@
     function graphFocus(edges, side) {
       const hasSelectedFocus = state.selected && ['node', 'edge', 'path', 'bundle'].includes(state.selected.kind);
       const pinnedTrace = pinnedTraceSubgraph(edges, side);
-      if (!hasSelectedFocus && !pinnedTrace) return null;
+      const playbackFocus = !side ? flowPlaybackFocus() : null;
+      if (!hasSelectedFocus && !pinnedTrace && !playbackFocus) return null;
       if (side && state.selected && state.selected.side && side !== state.selected.side && !pinnedTrace) {
         return { selected: new Set(), connected: new Set() };
       }
@@ -6536,6 +8819,10 @@
       if (pinnedTrace) {
         selected.add(state.pinnedTrace.nodeId);
         for (const id of pinnedTrace.ids) connected.add(id);
+      }
+      if (playbackFocus) {
+        for (const id of playbackFocus.selected) selected.add(id);
+        for (const id of playbackFocus.connected) connected.add(id);
       }
       return { selected, connected };
     }
@@ -6633,6 +8920,7 @@
       if (state.view === 'compare' && state.compare && side && state.compare[side] && state.compare[side].allNodes.length) {
         return state.compare[side].allNodes;
       }
+      if (state.view === 'fileflow') return nodes && nodes.length ? nodes : [{ x: 0, y: 0 }];
       if (state.allNodes && state.allNodes.length) return state.allNodes;
       return nodes && nodes.length ? nodes : [{ x: 0, y: 0 }];
     }
@@ -6658,6 +8946,8 @@
     }
 
     function edgeAlpha(edge, side) {
+      const playbackAlpha = flowPlaybackEdgeAlpha(edge, side);
+      if (playbackAlpha !== null) return adjustEdgeAlpha(playbackAlpha);
       let alpha = 0.62;
       if (!state.selected || !['node', 'edge', 'path'].includes(state.selected.kind)) {
         alpha = shouldHighlightDiff() ? (hasChange(edge) ? 0.94 : 0.22) : 0.62;
@@ -6817,6 +9107,11 @@
         applyDetailFilters();
         return;
       }
+      if (selection.kind === 'flowPlayback') {
+        renderFlowPlaybackSelection(selection, title, meta);
+        applyDetailFilters();
+        return;
+      }
       if (selection.kind === 'addConnection') {
         renderAddConnectionSelection(title, meta);
         applyDetailFilters();
@@ -6909,13 +9204,13 @@
     }
 
     function detailTabsVisibleForSelection(selection) {
-      return Boolean(selection && ['node', 'edge', 'path', 'bundle', 'architecture'].includes(selection.kind));
+      return Boolean(selection && ['node', 'edge', 'path', 'bundle', 'architecture', 'flowPlayback'].includes(selection.kind));
     }
 
     function preferredDetailTabForSelection(selection) {
       if (!selection) return 'evidence';
       if (selection.kind === 'edge' || selection.kind === 'bundle') return 'evidence';
-      if (selection.kind === 'node' || selection.kind === 'path' || selection.kind === 'architecture') return 'flow';
+      if (selection.kind === 'node' || selection.kind === 'path' || selection.kind === 'architecture' || selection.kind === 'flowPlayback') return 'flow';
       return 'evidence';
     }
 
@@ -7031,7 +9326,7 @@
     function updateFitSelectionButton(selection) {
       const button = document.getElementById('fitSelectionBtn');
       if (!button) return;
-      button.disabled = !selection || !['node', 'edge', 'path', 'bundle'].includes(selection.kind);
+      button.disabled = !selection || !['node', 'edge', 'path', 'bundle', 'flowPlayback'].includes(selection.kind);
     }
 
     function renderAddConnectionSelection(title, meta) {
@@ -7636,9 +9931,99 @@
       if (node.details) overview.push('', node.details);
       appendCompareNodeDiffSection(stack, node, selection.side);
       appendDetailSection(stack, 'Overview', overview, true);
+      appendFileFlowNodeSection(stack, node);
       appendTraceModeSection(stack, node, selection.side);
       renderNodeConnections(stack, node, selection.side);
       cacheNodeDetail(selection, title.textContent, stack);
+    }
+
+    function appendFileFlowNodeSection(stack, node) {
+      if (state.view !== 'fileflow' || !node || node.type !== 'file') return;
+      const outgoing = (state.allEdges || []).filter(edge => edge.source === node.id);
+      const incoming = (state.allEdges || []).filter(edge => edge.target === node.id);
+      const body = appendDetailSection(stack, 'File Flow Controls', [
+        'file: ' + node.id,
+        'layer: ' + (node.layer || '?'),
+        'outgoing file paths: ' + outgoing.length,
+        'incoming file paths: ' + incoming.length
+      ], true);
+      const actions = document.createElement('div');
+      actions.className = 'path-actions';
+      const start = document.createElement('button');
+      start.type = 'button';
+      start.textContent = node.id === state.fileFlowStartId ? 'Current start' : 'Start from this file';
+      start.disabled = node.id === state.fileFlowStartId;
+      start.onclick = () => setFileFlowStart(node.id);
+      const depth = document.createElement('select');
+      depth.setAttribute('aria-label', 'File flow depth');
+      for (const value of [2, 3, 4, 5]) {
+        const option = document.createElement('option');
+        option.value = String(value);
+        option.textContent = value + ' layers';
+        depth.appendChild(option);
+      }
+      depth.value = String(state.fileFlowDepth);
+      depth.onchange = event => setFileFlowDepth(Number(event.target.value || 3));
+      actions.append(start, depth);
+      body.appendChild(actions);
+      if (outgoing.length) appendFileFlowEdgeList(body, 'Outgoing file paths', outgoing.slice(0, 12));
+      if (incoming.length) appendFileFlowEdgeList(body, 'Incoming references', incoming.slice(0, 12));
+    }
+
+    function setFileFlowLayerSelection(layerIndex, fileId) {
+      const index = Math.max(0, Math.round(Number(layerIndex || 0)));
+      if (index === 0) {
+        setFileFlowStart(fileId, false);
+        return;
+      }
+      const layer = (state.fileFlowLayers || []).find(item => item.index === index);
+      if (!layer) return;
+      const nextPath = (state.fileFlowPathIds || []).slice(0, index);
+      if (fileId && (layer.ids || []).includes(fileId)) nextPath[index] = fileId;
+      state.fileFlowPathIds = nextPath.filter(Boolean);
+      state.fileFlowStartId = state.fileFlowPathIds[0] || state.fileFlowStartId;
+      state.fileFlowSelectedExampleIndex = 0;
+      const selectedId = fileId || state.fileFlowPathIds[state.fileFlowPathIds.length - 1] || state.fileFlowStartId;
+      const node = selectedId ? state.allNodes.find(item => item.id === selectedId) : null;
+      state.selected = node ? { kind: 'node', node } : null;
+      layoutFileFlowGraph();
+      applyFilters();
+      renderSelection(state.selected);
+    }
+
+    function setFileFlowStart(fileId, focus) {
+      if (!fileId || !state.allNodes.some(node => node.id === fileId)) return;
+      state.fileFlowStartId = fileId;
+      state.fileFlowPathIds = [fileId];
+      state.fileFlowSelectedExampleIndex = 0;
+      const node = state.allNodes.find(item => item.id === fileId);
+      state.selected = node ? { kind: 'node', node } : null;
+      layoutFileFlowGraph();
+      applyFilters();
+      renderSelection(state.selected);
+      if (focus !== false) focusCameraOnSelection(state.selected);
+    }
+
+    function setFileFlowDepth(depth) {
+      state.fileFlowDepth = clamp(Math.round(Number(depth || 3)), 1, 5);
+      state.fileFlowPathIds = (state.fileFlowPathIds || []).slice(0, state.fileFlowDepth);
+      layoutFileFlowGraph();
+      applyFilters();
+    }
+
+    function appendFileFlowEdgeList(parent, title, edges) {
+      const section = document.createElement('details');
+      section.className = 'detail-card detail-nested';
+      const summary = document.createElement('summary');
+      summary.textContent = title + ' (' + edges.length + ')';
+      const body = document.createElement('div');
+      body.className = 'detail-body';
+      const list = document.createElement('div');
+      list.className = 'edge-list';
+      for (const edge of edges) list.appendChild(edgeRow(edge, null));
+      body.appendChild(list);
+      section.append(summary, body);
+      parent.appendChild(section);
     }
 
     function cachedNodeDetail(selection) {
@@ -7668,6 +10053,8 @@
         state.view,
         selection.side || '',
         selection.node.id,
+        state.fileFlowStartId || '',
+        state.fileFlowDepth || 3,
         state.traceMode || '',
         state.focusHops || 1
       ].join('|');
@@ -8037,6 +10424,7 @@
       if (edge.file) overview.push('file: ' + edge.file);
       appendEdgeEvidenceSection(stack, edge, side, true);
       appendCompareEdgeDiffSection(stack, edge, side);
+      appendFileFlowEdgeControls(stack, edge, side);
       appendEdgeFlowSection(stack, edge, side, false);
       appendDetailSection(stack, 'Overview', overview, false);
       appendExampleSection(stack, 'Function / API Examples', edge.examples || [], false, edge, side);
@@ -8047,6 +10435,59 @@
         }
         appendDetailSection(stack, 'Summary Evidence', evidence, false);
       }
+    }
+
+    function appendFileFlowEdgeControls(stack, edge, side) {
+      if (state.view !== 'fileflow' || side || !edge) return;
+      const examples = edge.examples || [];
+      const body = appendDetailSection(stack, 'File Path Explorer', [
+        'source file: ' + edge.source,
+        'target file: ' + edge.target,
+        'exact function/import paths: ' + examples.length
+      ], true);
+      const actions = document.createElement('div');
+      actions.className = 'path-actions file-flow-actions';
+      const select = document.createElement('select');
+      select.setAttribute('aria-label', 'Exact file-flow example');
+      if (!examples.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No exact examples';
+        select.appendChild(option);
+        select.disabled = true;
+      } else {
+        examples.forEach((example, index) => {
+          const option = document.createElement('option');
+          option.value = String(index);
+          option.textContent = (index + 1) + '. ' + edgeExampleTitle(example);
+          select.appendChild(option);
+        });
+        select.value = String(clamp(state.fileFlowSelectedExampleIndex || 0, 0, examples.length - 1));
+      }
+      const continueButton = document.createElement('button');
+      continueButton.type = 'button';
+      continueButton.textContent = 'Continue from target file';
+      continueButton.onclick = () => setFileFlowStart(edge.target);
+      actions.append(select, continueButton);
+      body.appendChild(actions);
+      const preview = document.createElement('div');
+      preview.className = 'file-flow-example-preview';
+      body.appendChild(preview);
+      const renderPreview = () => {
+        preview.innerHTML = '';
+        const index = clamp(Number(select.value || 0), 0, Math.max(0, examples.length - 1));
+        state.fileFlowSelectedExampleIndex = index;
+        const example = examples[index];
+        if (!example) {
+          appendPlainLine(preview, 'No exact parser example is attached to this file path.');
+          return;
+        }
+        preview.appendChild(exampleFlowCard(example, edge, index, side));
+        const location = formatLocation(example);
+        if (location) appendPlainLine(preview, 'Open files: ' + location);
+      };
+      select.onchange = renderPreview;
+      renderPreview();
     }
 
     function detailStack(root) {
@@ -8218,6 +10659,8 @@
         const title = call || source + ' -> ' + target;
         const meta = [
           example.type || edge.type || 'connection',
+          example.resolution_tier ? example.resolution_tier + ' tier' : '',
+          example.confidence ? Math.round(Number(example.confidence) * 100) + '% confidence' : '',
           location ? 'at ' + location : '',
           example.commit ? 'commit ' + example.commit : ''
         ].filter(Boolean).join(' | ');
@@ -8235,6 +10678,11 @@
       const examples = edge.examples || [];
       const reasons = (edge.reasons || []).filter(Boolean);
       const weight = Number(edge.weight || 1);
+      const metadataConfidence = Math.max(
+        0,
+        ...examples.map(example => Number(example.confidence || 0) * 100)
+      );
+      if (metadataConfidence > 0) return Math.round(clamp(metadataConfidence, 5, 99));
       let score = 10;
       if (examples.length) score += Math.min(55, 25 + examples.length * 6);
       if (reasons.length) score += Math.min(20, reasons.length * 4);

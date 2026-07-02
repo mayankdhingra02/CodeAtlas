@@ -17,6 +17,8 @@ from .agent_install import install_agent
 from .analysis import dead_code, http_confidence_summary, route_summary, structural_query
 from .artifacts import export_graph_artifact, import_graph_artifact
 from .benchmark import Benchmarker
+from .briefing import render_briefing_markdown, repo_briefing
+from .doctor import doctor_report
 from .external_index import import_external_index
 from .graph import GraphService
 from .indexer import RepositoryIndexer
@@ -24,6 +26,7 @@ from .memory import MemoryQueryEngine
 from .mcp_server import run_mcp_server
 from .packs import context_pack, render_context_pack
 from .retrieval import RetrievalEngine
+from .retrieval_eval import evaluate_retrieval_manifest, load_retrieval_eval_manifest
 from .rules import run_rule_checks
 from .source import source_outline
 from .status import index_status
@@ -67,6 +70,8 @@ def index_cmd(
     table.add_row("Symbols indexed", str(report.symbols_indexed))
     table.add_row("Graph edges", str(report.edges_indexed))
     console.print(table)
+    for warning in report.warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
     if report.parser_errors:
         console.print("[bold yellow]Parser errors[/bold yellow]")
         for error in report.parser_errors:
@@ -100,6 +105,12 @@ def context_cmd(
     console.print(f"Baseline: {report.baseline_tokens:,} tokens")
     console.print(f"Optimized: {report.optimized_tokens:,} tokens")
     console.print(f"Savings: {report.savings_percent:.0f}%")
+    latency_style = "green" if result.timings.total_ms <= 1000 else "yellow"
+    latency_status = "ok" if result.timings.total_ms <= 1000 else "slow"
+    console.print(
+        f"[{latency_style}]Warm retrieval: {result.timings.total_ms:.1f}ms "
+        f"(target <1,000ms, {latency_status})[/{latency_style}]"
+    )
     console.print(
         "[dim]"
         f"Lookup {result.timings.symbol_lookup_ms:.1f}ms, "
@@ -338,6 +349,54 @@ def index_status_cmd(
     console.print(table)
 
 
+@app.command("doctor")
+def doctor_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository to diagnose.")] = Path("."),
+    output_json: Annotated[
+        bool,
+        typer.Option("--json", help="Print the full diagnostic payload as JSON."),
+    ] = False,
+) -> None:
+    report = doctor_report(repo_path)
+    if output_json:
+        console.print_json(json.dumps(report, default=str))
+    else:
+        table = Table(title="CodeAtlas Doctor")
+        table.add_column("Status")
+        table.add_column("Check")
+        table.add_column("Detail")
+        table.add_column("Run")
+        for check in report["checks"]:
+            table.add_row(
+                "ok" if check["ok"] else "fix",
+                str(check["name"]),
+                str(check["detail"]),
+                str(check.get("command") or ""),
+            )
+        console.print(table)
+        if report["recommended_commands"]:
+            console.print("[bold]Recommended commands[/bold]")
+            for command in report["recommended_commands"]:
+                console.print(f"- {command}")
+    if not report["ok"]:
+        raise typer.Exit(1)
+
+
+@app.command("briefing")
+def briefing_cmd(
+    repo_path: Annotated[Path, typer.Argument(help="Repository containing .codeatlas/index.db.")] = Path("."),
+    output_json: Annotated[
+        bool,
+        typer.Option("--json", help="Print the full evidence-backed briefing payload as JSON."),
+    ] = False,
+) -> None:
+    payload = repo_briefing(repo_path)
+    if output_json:
+        console.print_json(json.dumps(payload, default=str))
+        return
+    console.print(render_briefing_markdown(payload))
+
+
 @app.command("query")
 def query_cmd(
     expression: Annotated[
@@ -391,7 +450,7 @@ def http_confidence_cmd(
 @app.command("install-agent")
 def install_agent_cmd(
     repo_path: Annotated[Path, typer.Argument(help="Repository to configure for an AI coding agent.")] = Path("."),
-    agent: Annotated[str, typer.Option("--agent", help="Agent to configure. Currently: codex.")] = "codex",
+    agent: Annotated[str, typer.Option("--agent", help="Agent to configure: codex, claude, or all.")] = "codex",
 ) -> None:
     payload = install_agent(repo_path, agent)
     console.print_json(json.dumps(payload, default=str))
@@ -429,14 +488,18 @@ def outline_cmd(
 
 @app.command("import-index")
 def import_index_cmd(
-    input_path: Annotated[Path, typer.Argument(help="External code-intelligence JSON, such as SCIP JSON.")],
+    input_path: Annotated[Path, typer.Argument(help="External code-intelligence index.")],
     repo_path: Annotated[
         Path,
         typer.Option("--repo-path", "-r", help="Repository to augment with the external index."),
     ] = Path("."),
     index_format: Annotated[
         str,
-        typer.Option("--format", "-f", help="Index format: auto, scip-json, or generic-json."),
+        typer.Option(
+            "--format",
+            "-f",
+            help="Index format: auto, scip, scip-protobuf, scip-json, or generic-json.",
+        ),
     ] = "auto",
 ) -> None:
     console.print_json(
@@ -643,6 +706,65 @@ def benchmark_cmd(
         console.print("[bold yellow]Parser errors were recorded; benchmark excludes failed files.[/bold yellow]")
 
 
+@app.command("eval-retrieval")
+def eval_retrieval_cmd(
+    manifest_path: Annotated[
+        Path,
+        typer.Argument(help="JSON retrieval-eval manifest with labeled query expectations."),
+    ] = Path("evals/retrieval/default.json"),
+    repository_id: Annotated[
+        list[str] | None,
+        typer.Option("--repo-id", help="Only run suites for this repository id."),
+    ] = None,
+    no_index: Annotated[
+        bool,
+        typer.Option(
+            "--no-index",
+            help="Use the existing .codeatlas/index.db instead of reindexing first.",
+        ),
+    ] = False,
+    fail_missing: Annotated[
+        bool,
+        typer.Option(
+            "--fail-missing",
+            help="Fail when optional pinned repositories are not checked out.",
+        ),
+    ] = False,
+) -> None:
+    manifest = load_retrieval_eval_manifest(manifest_path)
+    run = evaluate_retrieval_manifest(
+        manifest,
+        repository_ids=set(repository_id or ()),
+        index=not no_index,
+        skip_missing=not fail_missing,
+    )
+    table = Table(title="CodeAtlas Retrieval Eval")
+    table.add_column("Suite")
+    table.add_column("Repo")
+    table.add_column("Cases", justify="right")
+    table.add_column("Files", justify="right")
+    table.add_column("Symbols", justify="right")
+    table.add_column("Status")
+    for result in run.results:
+        table.add_row(
+            result.suite.id,
+            str(result.repo_root),
+            str(len(result.case_results)),
+            f"{result.file_recall:.0%}",
+            f"{result.symbol_recall:.0%}",
+            "pass" if result.passed else "fail",
+        )
+    console.print(table)
+    for skipped in run.skipped:
+        console.print(
+            f"[yellow]Skipped {skipped.suite_id} ({skipped.repository_id}): "
+            f"{skipped.reason}[/yellow]"
+        )
+    if not run.passed:
+        console.print(run.failure_report())
+        raise typer.Exit(1)
+
+
 @app.command("watch")
 def watch_cmd(
     repo_path: Annotated[Path, typer.Argument(help="Repository to watch.")] = Path("."),
@@ -684,8 +806,12 @@ def mcp_cmd(
         Path,
         typer.Option("--repo-path", "-r", help="Repository containing .codeatlas/index.db."),
     ] = Path("."),
+    profile: Annotated[
+        str,
+        typer.Option("--profile", help="MCP tool profile: agent for the reduced default surface, full for legacy tools."),
+    ] = "agent",
 ) -> None:
-    run_mcp_server(repo_path)
+    run_mcp_server(repo_path, profile=profile)
 
 
 def _print_evidence(items: object) -> None:

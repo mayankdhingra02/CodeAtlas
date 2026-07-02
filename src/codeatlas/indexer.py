@@ -20,6 +20,7 @@ from .parsers import ParserRegistry
 from .project_config import load_project_config
 from .scanner import iter_source_files
 from .storage import (
+    SCHEMA_VERSION,
     GraphStore,
     file_node_key,
     module_node_key,
@@ -42,8 +43,17 @@ class RepositoryIndexer:
         paths.cache_dir.mkdir(parents=True, exist_ok=True)
 
         store = GraphStore(paths.database_path)
+        warnings: list[str] = []
         try:
-            store.initialize()
+            store.initialize(validate_schema=False)
+            schema_status = store.schema_version_status()
+            if not schema_status["ok"]:
+                warnings.append(
+                    "Index rebuilt because schema changed "
+                    f"from {schema_status['actual']} to {SCHEMA_VERSION}."
+                )
+                incremental = False
+                store.recreate()
             previous_hashes = store.previous_file_hashes()
             source_files = tuple(iter_source_files(repo_root))
             current_hashes = {source.relative_path: source.sha256 for source in source_files}
@@ -109,11 +119,13 @@ class RepositoryIndexer:
                         )
                     )
 
-            store.set_metadata("schema_version", 1)
+            parse_quality = store.parse_quality_stats()
+            store.set_metadata("schema_version", SCHEMA_VERSION)
             store.set_metadata("repo_root", str(repo_root))
             store.set_metadata("last_indexed_at", utc_now())
             store.set_metadata("supported_languages", list(self.parser_registry.supported_languages))
             store.set_metadata("project_config", project_config.public_payload())
+            store.set_metadata("parse_quality", parse_quality)
             store.set_metadata("last_index_report", {
                 "files_scanned": len(source_files),
                 "files_indexed": len(parsed_results),
@@ -125,6 +137,7 @@ class RepositoryIndexer:
             store.commit()
 
             stats_payload = store.repository_stats()
+            stats_payload["parse_quality"] = parse_quality
             metadata_payload: dict[str, Any] = {
                 "repo_root": str(repo_root),
                 "database_path": str(paths.database_path),
@@ -149,6 +162,7 @@ class RepositoryIndexer:
                 edges_indexed=store.count_edges(),
                 parser_errors=tuple(parser_errors),
                 file_results=tuple(sorted(file_results, key=lambda item: item.relative_path)),
+                warnings=tuple(warnings),
             )
         finally:
             store.close()
@@ -178,6 +192,7 @@ class RepositoryIndexer:
         }
         store.delete_file(relative_path, replacement_keys=replacement_keys)
         file_id = store.upsert_file(parse_result.source_file)
+        content = parse_result.source_file.path.read_text(encoding="utf-8", errors="replace")
 
         store.insert_node(
             file_key,
@@ -188,8 +203,9 @@ class RepositoryIndexer:
         )
         store.upsert_file_search(
             parse_result.source_file,
-            parse_result.source_file.path.read_text(encoding="utf-8", errors="replace"),
+            content,
         )
+        store.upsert_file_snippet(file_id, parse_result.source_file, content)
         store.insert_node(
             module_key,
             NodeType.MODULE,
@@ -203,6 +219,7 @@ class RepositoryIndexer:
             module_key,
             NodeType.MODULE,
             EdgeType.CONTAINS,
+            metadata={"resolution_tier": "parser", "confidence": 1.0},
         )
 
         for import_record in parse_result.imports:
@@ -224,11 +241,14 @@ class RepositoryIndexer:
                     "name": import_record.name,
                     "alias": import_record.alias,
                     "line": import_record.line_number,
+                    "resolution_tier": "parser",
+                    "confidence": 0.9,
                 },
             )
 
         for symbol in parse_result.symbols:
-            store.insert_symbol(file_id, relative_path, symbol)
+            symbol_id = store.insert_symbol(file_id, relative_path, symbol)
+            store.upsert_symbol_snippet(file_id, symbol_id, relative_path, symbol, content)
             route = route_info_for_symbol(symbol)
             if route:
                 route_key = route_node_key(symbol.qualified_name)
@@ -246,7 +266,7 @@ class RepositoryIndexer:
                     symbol.node_type,
                     EdgeType.HANDLES,
                     weight=0.95,
-                    metadata=route | {"confidence": 0.95},
+                    metadata=route | {"confidence": 0.95, "resolution_tier": "parser"},
                 )
             parent_key = (
                 symbol_node_key(symbol.parent_qualified_name)
@@ -260,6 +280,7 @@ class RepositoryIndexer:
                 symbol.node_key,
                 symbol.node_type,
                 EdgeType.CONTAINS,
+                metadata={"resolution_tier": "parser", "confidence": 1.0},
             )
             store.insert_edge(
                 file_key,
@@ -267,6 +288,7 @@ class RepositoryIndexer:
                 symbol.node_key,
                 symbol.node_type,
                 EdgeType.DEFINES,
+                metadata={"resolution_tier": "parser", "confidence": 1.0},
             )
 
         store.commit()
@@ -290,10 +312,16 @@ class RepositoryIndexer:
                     NodeType.ROUTE,
                     EdgeType.HTTP_CALLS,
                     weight=http_call["confidence"],
-                    metadata=http_call,
+                    metadata=http_call | {"resolution_tier": "heuristic"},
                 )
-            target_key = store.resolve_symbol_node_key(call.target_name, parse_result.module_name)
+            resolution = store.resolve_symbol(
+                call.target_name,
+                parse_result.module_name,
+                parse_result.imports,
+            )
+            target_key = resolution.node_key if resolution else None
             target_type = NodeType.SYMBOL
+            resolved = target_key is not None
             if target_key is None:
                 target_key = unresolved_symbol_node_key(call.target_name)
                 store.insert_node(
@@ -312,14 +340,20 @@ class RepositoryIndexer:
                     "display": call.display_name,
                     "line": call.line_number,
                     "arguments": list(call.arguments),
+                    "resolution_tier": resolution.tier if resolution else "unresolved",
+                    "confidence": resolution_confidence(resolution.tier if resolution else None, 0.68),
                 },
             )
 
         for inheritance in parse_result.inheritance:
             source_key = symbol_node_key(inheritance.source_qualified_name)
-            target_key = store.resolve_symbol_node_key(
-                inheritance.target_name, parse_result.module_name
+            resolution = store.resolve_symbol(
+                inheritance.target_name,
+                parse_result.module_name,
+                parse_result.imports,
             )
+            target_key = resolution.node_key if resolution else None
+            resolved = target_key is not None
             if target_key is None:
                 target_key = unresolved_symbol_node_key(inheritance.target_name)
                 store.insert_node(
@@ -334,11 +368,20 @@ class RepositoryIndexer:
                 target_key,
                 NodeType.SYMBOL,
                 EdgeType.INHERITS,
-                metadata={"line": inheritance.line_number},
+                metadata={
+                    "line": inheritance.line_number,
+                    "resolution_tier": resolution.tier if resolution else "unresolved",
+                    "confidence": resolution_confidence(resolution.tier if resolution else None, 0.74),
+                },
             )
 
         for reference in parse_result.references:
-            target_key = store.resolve_symbol_node_key(reference.target_name, parse_result.module_name)
+            resolution = store.resolve_symbol(
+                reference.target_name,
+                parse_result.module_name,
+                parse_result.imports,
+            )
+            target_key = resolution.node_key if resolution else None
             if target_key is None:
                 continue
             store.insert_edge(
@@ -347,13 +390,22 @@ class RepositoryIndexer:
                 target_key,
                 NodeType.SYMBOL,
                 EdgeType.REFERENCES,
-                metadata={"line": reference.line_number},
+                metadata={
+                    "line": reference.line_number,
+                    "resolution_tier": resolution.tier,
+                    "confidence": resolution_confidence(resolution.tier, 0.66),
+                },
             )
 
         for import_record in parse_result.imports:
             if not import_record.name:
                 continue
-            target_key = store.resolve_symbol_node_key(import_record.name, parse_result.module_name)
+            resolution = store.resolve_symbol(
+                import_record.name,
+                parse_result.module_name,
+                parse_result.imports,
+            )
+            target_key = resolution.node_key if resolution else None
             if target_key is None:
                 continue
             store.insert_edge(
@@ -362,7 +414,12 @@ class RepositoryIndexer:
                 target_key,
                 NodeType.SYMBOL,
                 EdgeType.REFERENCES,
-                metadata={"import": import_record.display_name, "line": import_record.line_number},
+                metadata={
+                    "import": import_record.display_name,
+                    "line": import_record.line_number,
+                    "resolution_tier": resolution.tier,
+                    "confidence": resolution_confidence(resolution.tier, 0.72),
+                },
             )
 
         store.commit()
@@ -446,6 +503,17 @@ def first_literal_argument(arguments: tuple[str, ...]) -> str | None:
     if value.startswith(("http://", "https://", "/")):
         return value
     return None
+
+
+def resolution_confidence(tier: str | None, default: float) -> float:
+    return {
+        "exact_qualified": 0.95,
+        "import_scoped": 0.86,
+        "same_module": 0.8,
+        "unique_name": 0.7,
+        "name": default,
+        "unresolved": 0.2,
+    }.get(str(tier or ""), default)
 
 
 def route_node_key(qualified_name: str) -> str:

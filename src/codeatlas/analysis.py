@@ -42,11 +42,24 @@ def dead_code(repo_path: str | Path, *, limit: int = 50) -> dict[str, Any]:
             ORDER BY inbound ASC, f.path, s.line_start
             """
         ).fetchall()
+        unresolved_names = {
+            str(row["target_key"]).removeprefix("symbol_ref:")
+            for row in store.connection.execute(
+                """
+                SELECT DISTINCT target_key
+                FROM edges
+                WHERE edge_type IN ('CALLS', 'REFERENCES')
+                  AND target_key LIKE 'symbol_ref:%'
+                """
+            ).fetchall()
+        }
         candidates = []
         for row in rows:
             name = str(row["name"])
             file_path = str(row["file_path"])
             if int(row["inbound"] or 0) > 0:
+                continue
+            if name in unresolved_names:
                 continue
             if _is_entrypoint(name, file_path):
                 continue

@@ -1,27 +1,27 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import tempfile
 import threading
 import textwrap
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 from urllib.request import urlopen
 
 from codeatlas.agent_install import install_agent
 from codeatlas.analysis import dead_code, http_confidence_summary, route_summary, structural_query
 from codeatlas.artifacts import export_graph_artifact, import_graph_artifact
 from codeatlas.benchmark import Benchmarker
+from codeatlas.briefing import render_briefing_markdown, repo_briefing
 from codeatlas.config import CodeAtlasPaths
 from codeatlas.external_index import import_external_index
 from codeatlas.indexer import RepositoryIndexer
 from codeatlas.memory import MemoryQueryEngine
 from codeatlas.mcp_server import create_tool_handlers
-from codeatlas.models import SourceFile, estimate_tokens
+from codeatlas.models import SourceFile, estimate_tokens, estimate_tokens_for_size
 from codeatlas.packs import context_pack, render_context_pack
 from codeatlas.parsers.javascript import JavaScriptParser
 from codeatlas.parsers.python import PythonParser
@@ -31,6 +31,7 @@ from codeatlas.rules import run_rule_checks
 from codeatlas.scanner import iter_source_files
 from codeatlas.source import source_outline
 from codeatlas.status import index_status
+from codeatlas.storage import GraphStore, symbol_node_key
 from codeatlas.verification import verification_plan
 from codeatlas.visualization import (
     ASSET_DIR,
@@ -42,709 +43,7 @@ from codeatlas.visualization import (
 )
 from codeatlas.workflow_cache import cached_workflow
 
-
-class CodeAtlasTestCase(unittest.TestCase):
-    def make_repo(self) -> tempfile.TemporaryDirectory[str]:
-        temp = tempfile.TemporaryDirectory()
-        root = Path(temp.name)
-        (root / "app").mkdir()
-        (root / "app" / "__init__.py").write_text("", encoding="utf-8")
-        (root / "app" / "payments.py").write_text(
-            textwrap.dedent(
-                '''
-                class PaymentService:
-                    """Charges customers."""
-
-                    def charge(self, total):
-                        return total
-                '''
-            ).lstrip(),
-            encoding="utf-8",
-        )
-        (root / "app" / "orders.py").write_text(
-            textwrap.dedent(
-                '''
-                from app.payments import PaymentService
-
-                @service
-                class OrderService:
-                    def create_order(self, total):
-                        processor = PaymentService()
-                        return processor.charge(total)
-                '''
-            ).lstrip(),
-            encoding="utf-8",
-        )
-        (root / "node_modules").mkdir()
-        (root / "node_modules" / "ignored.py").write_text("def ignored(): pass\n", encoding="utf-8")
-        return temp
-
-    def make_memory_repo(self) -> tempfile.TemporaryDirectory[str]:
-        temp = self.make_repo()
-        root = Path(temp.name)
-        (root / "docs" / "adr").mkdir(parents=True)
-        (root / "README.md").write_text(
-            "# Memory Repo\n\nAuthentication and payments are core repository areas.\n",
-            encoding="utf-8",
-        )
-        run_git(root, "init", "-b", "main")
-        run_git(root, "config", "user.name", "Alice Example")
-        run_git(root, "config", "user.email", "alice@example.com")
-        run_git(root, "add", ".")
-        run_git(
-            root,
-            "commit",
-            "-m",
-            "Add payment service",
-            env=git_env("Alice Example", "alice@example.com", "2024-01-01T12:00:00+00:00"),
-        )
-
-        (root / "app" / "auth.py").write_text(
-            textwrap.dedent(
-                '''
-                class AuthService:
-                    def login(self, token):
-                        return token
-                '''
-            ).lstrip(),
-            encoding="utf-8",
-        )
-        (root / "docs" / "adr" / "0001-redis-auth.md").write_text(
-            textwrap.dedent(
-                '''
-                # ADR 0001: Redis cache for authentication retries
-
-                ## Context
-
-                Authentication requests were timing out during transient upstream failures.
-
-                ## Decision
-
-                Introduce Redis as a short-lived cache for authentication retry state.
-
-                ## Alternatives
-
-                We considered local in-process caches, but rejected them because workers
-                would not share retry state.
-                '''
-            ).lstrip(),
-            encoding="utf-8",
-        )
-        run_git(root, "add", ".")
-        run_git(
-            root,
-            "commit",
-            "-m",
-            "Introduce Redis cache for auth retry timeouts (#12)",
-            env=git_env("Bob Reviewer", "bob@example.com", "2025-02-01T12:00:00+00:00"),
-        )
-        return temp
-
-
-class ParserTests(CodeAtlasTestCase):
-    def test_python_parser_extracts_symbols_imports_calls_and_inheritance(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            source = next(file for file in iter_source_files(root) if file.relative_path == "app/orders.py")
-            result = PythonParser().parse(root, source)
-
-        self.assertEqual(result.module_name, "app.orders")
-        self.assertEqual(result.imports[0].module, "app.payments")
-        self.assertEqual(result.imports[0].name, "PaymentService")
-        names = {symbol.qualified_name for symbol in result.symbols}
-        self.assertIn("app.orders.OrderService", names)
-        self.assertIn("app.orders.OrderService.create_order", names)
-        self.assertIn("PaymentService", {call.target_name for call in result.calls})
-        self.assertIn("charge", {call.target_name for call in result.calls})
-        calls_by_display = {call.display_name: call for call in result.calls}
-        self.assertEqual(calls_by_display["processor.charge"].arguments, ("total",))
-
-    def test_scanner_ignores_dependency_directories(self) -> None:
-        with self.make_repo() as root_name:
-            files = {source.relative_path for source in iter_source_files(Path(root_name))}
-
-        self.assertIn("app/orders.py", files)
-        self.assertNotIn("node_modules/ignored.py", files)
-
-    def test_project_config_controls_languages_and_ignored_paths(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            (root / "web").mkdir()
-            (root / "web" / "client.ts").write_text("export const value = 1;\n", encoding="utf-8")
-            (root / "generated").mkdir()
-            (root / "generated" / "skip.py").write_text("def ignored(): pass\n", encoding="utf-8")
-            (root / ".codeatlas.yml").write_text(
-                textwrap.dedent(
-                    """
-                    languages:
-                      python: true
-                      javascript: false
-                    ignore:
-                      paths:
-                        - generated/**
-                    ui:
-                      default_lens: apis
-                      node_budget: 80
-                      connected_only: false
-                      edge_contrast: 72
-                    classification:
-                      owned_prefixes:
-                        - app
-                      team_prefixes:
-                        - company_
-                      third_party_packages:
-                        - requests
-                      hide_packages:
-                        - docutils
-                      show_packages:
-                        - company_sdk
-                    cache:
-                      ttl_seconds: 120
-                    """
-                ).strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            config = load_project_config(root)
-            files = {source.relative_path for source in iter_source_files(root)}
-
-        self.assertFalse(config.languages["javascript"])
-        self.assertEqual(config.ui.default_lens, "apis")
-        self.assertEqual(config.ui.node_budget, 80)
-        self.assertFalse(config.ui.connected_only)
-        self.assertEqual(config.ui.edge_contrast, 72)
-        self.assertEqual(config.classification.owned_prefixes, ("app",))
-        self.assertEqual(config.classification.team_prefixes, ("company_",))
-        self.assertEqual(config.classification.third_party_packages, ("requests",))
-        self.assertEqual(config.classification.hide_packages, ("docutils",))
-        self.assertEqual(config.classification.show_packages, ("company_sdk",))
-        self.assertEqual(config.public_payload()["ui"]["edge_contrast"], 72)
-        self.assertEqual(config.public_payload()["classification"]["third_party_packages"], ["requests"])
-        self.assertEqual(config.public_payload()["classification"]["show_packages"], ["company_sdk"])
-        self.assertEqual(config.cache.ttl_seconds, 120)
-        self.assertNotIn("web/client.ts", files)
-        self.assertNotIn("generated/skip.py", files)
-
-    def test_update_classification_config_persists_and_restores_exact_package_bucket(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            (root / ".codeatlas.yml").write_text(
-                textwrap.dedent(
-                    """
-                    classification:
-                      show_packages:
-                        - requests
-                      hide_packages:
-                        - docutils
-                    """
-                ).strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            updated = update_classification_config(root, "requests", "third_party")
-            restored = restore_classification_config(root, {"show_packages": ["requests"], "hide_packages": ["docutils"]})
-            reloaded = load_project_config(root)
-
-        self.assertEqual(updated.classification.third_party_packages, ("requests",))
-        self.assertEqual(restored.classification.show_packages, ("requests",))
-        self.assertEqual(reloaded.classification.third_party_packages, ())
-        self.assertEqual(reloaded.classification.show_packages, ("requests",))
-        self.assertIn("third_party_packages", reloaded.public_payload()["classification"])
-
-    def test_javascript_parser_extracts_imports_symbols_and_calls(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            (root / "web").mkdir()
-            (root / "web" / "client.ts").write_text(
-                textwrap.dedent(
-                    """
-                    import { fetchUser as loadUser } from './api';
-
-                    export class UserClient {
-                      async load(id: string) {
-                        return loadUser(id);
-                      }
-                    }
-
-                    export const renderUser = (id: string) => loadUser(id);
-
-                    router.get('/users/:id', renderUser);
-                    test('renders user profile', () => renderUser('1'));
-                    """
-                ).strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            source = next(file for file in iter_source_files(root) if file.relative_path == "web/client.ts")
-            result = JavaScriptParser().parse(root, source)
-
-        self.assertEqual(result.module_name, "web.client")
-        self.assertIn("./api", {record.module for record in result.imports})
-        names = {symbol.qualified_name for symbol in result.symbols}
-        self.assertIn("web.client.UserClient", names)
-        self.assertIn("web.client.UserClient.load", names)
-        self.assertIn("web.client.renderUser", names)
-        self.assertIn("web.client.route_get_users_id", names)
-        self.assertIn("web.client.test_renders_user_profile", names)
-        self.assertIn("loadUser", {call.target_name for call in result.calls})
-
-
-class IndexAndRetrievalTests(CodeAtlasTestCase):
-    def test_indexer_persists_sqlite_index_and_stats(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            report = RepositoryIndexer().index(root)
-            stats = RetrievalEngine().repository_stats(root)
-            self.assertTrue(report.database_path.exists())
-            self.assertEqual(report.files_scanned, 3)
-            self.assertGreaterEqual(report.symbols_indexed, 4)
-            self.assertEqual(stats.files_indexed, 3)
-            self.assertGreater(stats.graph_edges, 0)
-
-    def test_retrieval_ranks_exact_symbol_and_related_callees(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            result = RetrievalEngine().retrieve(root, "create_order", depth=2, max_tokens=1000)
-
-        self.assertGreaterEqual(len(result.snippets), 2)
-        self.assertEqual(result.snippets[0].symbol_name, "create_order")
-        self.assertIn("PaymentService", {snippet.symbol_name for snippet in result.snippets})
-        self.assertLessEqual(
-            result.token_report.optimized_tokens,
-            result.token_report.baseline_tokens,
-        )
-
-    def test_incremental_indexing_only_processes_changed_files(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            (root / "app" / "orders.py").write_text(
-                textwrap.dedent(
-                    '''
-                    from app.payments import PaymentService
-
-                    class OrderService:
-                        def create_order(self, total):
-                            return PaymentService().charge(total)
-
-                        def cancel_order(self):
-                            return None
-                    '''
-                ).lstrip(),
-                encoding="utf-8",
-            )
-            report = RepositoryIndexer().index(root, incremental=True)
-            symbols = RetrievalEngine().find_symbol(root, "cancel_order")
-
-        self.assertEqual(report.files_indexed, 1)
-        self.assertEqual(report.files_skipped, 2)
-        self.assertEqual(symbols[0]["name"], "cancel_order")
-
-    def test_token_estimation_uses_four_character_rule(self) -> None:
-        self.assertEqual(estimate_tokens("abcd"), 1)
-        self.assertEqual(estimate_tokens("abcde"), 2)
-        self.assertEqual(estimate_tokens(""), 0)
-
-    def test_retrieval_falls_back_to_indexed_file_text(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            (root / "docs").mkdir()
-            (root / "docs" / "notes.py").write_text(
-                "# migration playbook\nROLLBACK_TOKEN = 'blue-green receipts'\n",
-                encoding="utf-8",
-            )
-            RepositoryIndexer().index(root)
-            result = RetrievalEngine().retrieve(root, "blue green receipts", depth=1, max_tokens=500)
-
-        self.assertTrue(result.snippets)
-        self.assertEqual(result.snippets[0].kind, "FILE")
-        self.assertIn("blue-green receipts", result.snippets[0].code)
-        self.assertIn("SQLite FTS match", result.snippets[0].reason)
-
-    def test_graph_artifact_export_import_and_index_status(self) -> None:
-        with self.make_repo() as root_name, tempfile.TemporaryDirectory() as import_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            export_report = export_graph_artifact(root)
-            import_root = Path(import_name)
-            (import_root / ".codeatlas").mkdir()
-            artifact_copy = import_root / ".codeatlas" / "graph.db.gz"
-            artifact_copy.write_bytes(export_report.artifact_path.read_bytes())
-            import_report = import_graph_artifact(import_root)
-            status = index_status(root)
-            (root / "app" / "orders.py").write_text("# changed\n", encoding="utf-8")
-            dirty_status = index_status(root)
-            self.assertTrue(export_report.artifact_path.exists())
-            self.assertTrue(import_report.database_path.exists())
-            self.assertTrue(status["indexed"])
-            self.assertGreaterEqual(dirty_status["dirty_files"], 1)
-            self.assertTrue(dirty_status["stale"])
-
-    def test_structural_query_dead_code_routes_and_http_confidence(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            (root / "app" / "api.py").write_text(
-                textwrap.dedent(
-                    '''
-                    class App:
-                        def get(self, path):
-                            return path
-
-                    app = App()
-
-                    @app.get("/health")
-                    def health():
-                        return {"ok": True}
-
-                    def call_health(client):
-                        return client.get("/health")
-
-                    def unused_helper():
-                        return "unused"
-                    '''
-                ).lstrip(),
-                encoding="utf-8",
-            )
-            RepositoryIndexer().index(root)
-            callers = structural_query(root, "callers:health")
-            routes = route_summary(root)
-            http = http_confidence_summary(root)
-            dead = dead_code(root)
-
-        self.assertEqual(callers["type"], "incoming")
-        self.assertTrue(any(route["metadata"]["path"] == "/health" for route in routes["routes"]))
-        self.assertTrue(any(edge["type"] == "HTTP_CALLS" for edge in http["edges"]))
-        self.assertIn("app.api.unused_helper", {item["qualified_name"] for item in dead["items"]})
-
-    def test_install_agent_writes_codex_config(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            payload = install_agent(root, "codex")
-            mcp_path = Path(payload["mcp_config"])
-            instructions_path = Path(payload["instructions"])
-            self.assertTrue(mcp_path.exists())
-            self.assertTrue(instructions_path.exists())
-            self.assertIn("codeatlas", mcp_path.read_text(encoding="utf-8"))
-            self.assertIn("Use CodeAtlas", instructions_path.read_text(encoding="utf-8"))
-
-    def test_context_pack_rules_verification_and_source_outline(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            (root / "tests").mkdir()
-            (root / "app" / "security.py").write_text(
-                textwrap.dedent(
-                    '''
-                    import requests
-
-                    API_TOKEN = "super-secret-token"
-                    CHANGE_PASSWORD = "CHANGE_PASSWORD"
-
-                    def fetch_user():
-                        return requests.get("https://example.com/users")
-                    '''
-                ).lstrip(),
-                encoding="utf-8",
-            )
-            (root / "tests" / "test_security.py").write_text(
-                "from app.security import fetch_user\n\ndef test_fetch_user_exists():\n    assert fetch_user\n",
-                encoding="utf-8",
-            )
-            run_git(root, "init", "-b", "main")
-            run_git(root, "config", "user.name", "Alice Example")
-            run_git(root, "config", "user.email", "alice@example.com")
-            run_git(root, "add", ".")
-            run_git(root, "commit", "-m", "Add security client")
-            (root / "app" / "security.py").write_text(
-                textwrap.dedent(
-                    '''
-                    import requests
-
-                    API_TOKEN = "super-secret-token"
-                    CHANGE_PASSWORD = "CHANGE_PASSWORD"
-
-                    def fetch_user():
-                        response = requests.get("https://example.com/users")
-                        return response.json()
-                    '''
-                ).lstrip(),
-                encoding="utf-8",
-            )
-            RepositoryIndexer().index(root)
-            rules = run_rule_checks(root)
-            outline = source_outline(root, "fetch_user")
-            plan = verification_plan(root, base_ref="HEAD", task="fix user fetch timeout")
-            pack = context_pack(root, "fix user fetch timeout", max_tokens=2500)
-            rendered = render_context_pack(pack, output_format="markdown")
-
-        self.assertIn("possible-secret", {finding["rule_id"] for finding in rules["findings"]})
-        self.assertEqual(
-            1,
-            len([finding for finding in rules["findings"] if finding["rule_id"] == "possible-secret"]),
-        )
-        self.assertIn("python-requests-without-timeout", {finding["rule_id"] for finding in rules["findings"]})
-        self.assertEqual(outline["files"][0]["file_path"], "app/security.py")
-        self.assertIn("tests/test_security.py", plan["test_files"])
-        self.assertIn("app/security.py", pack["recommended_files"])
-        self.assertIn("# CodeAtlas Context Pack", rendered)
-        self.assertNotIn("super-secret-token", rendered)
-
-    def test_rules_respect_config_suppression_and_test_severity(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_dynamic.py").write_text(
-                "def test_eval_path():\n    eval('1 + 1')\n",
-                encoding="utf-8",
-            )
-            (root / "app" / "secret.py").write_text(
-                "API_TOKEN = 'real-secret-token'\n",
-                encoding="utf-8",
-            )
-            (root / ".codeatlas.yml").write_text(
-                textwrap.dedent(
-                    """
-                    rules:
-                      tests_lower_severity: true
-                      suppressions:
-                        - rule: possible-secret
-                          path: app/secret.py
-                          reason: test suppression
-                    """
-                ).strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            rules = run_rule_checks(root)
-
-        rule_ids = {finding["rule_id"] for finding in rules["findings"]}
-        self.assertNotIn("possible-secret", rule_ids)
-        dynamic = next(finding for finding in rules["findings"] if finding["rule_id"] == "dynamic-code-execution")
-        self.assertEqual(dynamic["severity"], "medium")
-
-    def test_workflow_cache_reuses_result_until_index_or_config_changes(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            calls = {"count": 0}
-
-            def compute() -> dict[str, object]:
-                calls["count"] += 1
-                return {"value": calls["count"]}
-
-            first = cached_workflow(root, "demo", {"query": "x"}, compute)
-            second = cached_workflow(root, "demo", {"query": "x"}, compute)
-            (root / ".codeatlas.yml").write_text("cache:\n  ttl_seconds: 300\n", encoding="utf-8")
-            third = cached_workflow(root, "demo", {"query": "x"}, compute)
-
-        self.assertFalse(first["cache"]["hit"])
-        self.assertTrue(second["cache"]["hit"])
-        self.assertFalse(third["cache"]["hit"])
-        self.assertEqual(calls["count"], 2)
-
-    def test_import_external_index_adds_symbols_and_edges(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            external_path = root / "external-index.json"
-            external_path.write_text(
-                json.dumps(
-                    {
-                        "symbols": [
-                            {
-                                "qualified_name": "external.Service.handle",
-                                "name": "handle",
-                                "kind": "FUNCTION",
-                                "file_path": "external/service.go",
-                                "line_start": 3,
-                                "line_end": 5,
-                            }
-                        ],
-                        "edges": [
-                            {
-                                "source": "external.Service.handle",
-                                "target": "external.Transport.call",
-                                "type": "CALLS",
-                            }
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            report = import_external_index(root, external_path)
-            query = structural_query(root, "calls:handle")
-            outline = source_outline(root, "handle")
-
-        self.assertEqual(report["format"], "generic-json")
-        self.assertEqual(report["symbols"], 1)
-        self.assertEqual(query["type"], "outgoing")
-        self.assertTrue(query["edges"])
-        self.assertEqual(outline["files"][0]["file_path"], "external/service.go")
-
-    def test_import_scip_style_fixture_adds_relationships(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            fixture = Path(__file__).parent / "fixtures" / "scip-index.json"
-            report = import_external_index(root, fixture)
-            query = structural_query(root, "calls:route_get_health")
-            outline = source_outline(root, "callHealth")
-
-        self.assertEqual(report["format"], "scip-json")
-        self.assertGreaterEqual(report["symbols"], 2)
-        self.assertEqual(query["type"], "outgoing")
-        self.assertTrue(query["edges"])
-        self.assertEqual(outline["files"][0]["file_path"], "web/router.ts")
-
-
-class BenchmarkAndMcpTests(CodeAtlasTestCase):
-    def test_benchmark_uses_actual_repository_metrics(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            report = Benchmarker().run(root, query="create_order")
-
-        self.assertEqual(report.files_scanned, 3)
-        self.assertGreater(report.indexing_time_seconds, 0)
-        self.assertGreaterEqual(report.estimated_tokens_before, report.estimated_tokens_after)
-        self.assertIn("snippets returned", report.retrieval_accuracy)
-
-    def test_mcp_handlers_return_context_and_stats(self) -> None:
-        with self.make_repo() as root_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            handlers = create_tool_handlers(root)
-            context = handlers["get_code_context"]("create_order", max_tokens=1000, depth=2)
-            stats = handlers["repository_stats"]()
-
-        self.assertEqual(context["snippets"][0]["symbol_name"], "create_order")
-        self.assertEqual(stats["files_indexed"], 3)
-
-
-class RepositoryMemoryTests(CodeAtlasTestCase):
-    def test_memory_indexer_extracts_git_history_and_documents(self) -> None:
-        with self.make_memory_repo() as root_name:
-            root = Path(root_name)
-            report = MemoryQueryEngine().index_memory(root)
-
-        self.assertTrue(report.git_available)
-        self.assertEqual(report.commits_indexed, 2)
-        self.assertEqual(report.documents_indexed, 2)
-        self.assertGreaterEqual(report.entities_indexed, 6)
-        self.assertGreaterEqual(report.evidence_indexed, 4)
-
-    def test_history_ownership_and_decisions_are_evidence_backed(self) -> None:
-        with self.make_memory_repo() as root_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            memory = MemoryQueryEngine()
-            memory.index_memory(root)
-            history = memory.history(root, "auth")
-            ownership = memory.ownership(root, "auth")
-            decisions = memory.decisions(root, "Why was Redis introduced?")
-            context = memory.compressed_context(root, "auth", max_tokens=1000)
-
-        self.assertTrue(any("Redis" in event.title or "Redis" in event.summary for event in history))
-        self.assertEqual(ownership[0].developer, "Bob Reviewer")
-        self.assertGreater(ownership[0].evidence[0].confidence, 0)
-        self.assertNotIn("No evidence-backed", decisions[0].answer)
-        self.assertTrue(decisions[0].evidence)
-        self.assertTrue(context.evidence)
-
-    def test_mcp_memory_handlers_are_available(self) -> None:
-        with self.make_memory_repo() as root_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            MemoryQueryEngine().index_memory(root)
-            handlers = create_tool_handlers(root)
-            history = handlers["get_history"]("auth")
-            decisions = handlers["get_decisions"]("Redis")
-            context = handlers["get_context"]("auth", max_tokens=1000)
-
-        self.assertIn("get_ownership", handlers)
-        self.assertTrue(history)
-        self.assertTrue(decisions[0]["evidence"])
-        self.assertEqual(context["query"], "auth")
-
-    def test_git_nexus_related_files_hotspots_and_fts_search(self) -> None:
-        with self.make_memory_repo() as root_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            memory = MemoryQueryEngine()
-            memory.index_memory(root)
-            search = memory.search_memory(root, "authentication retry state")
-            related = memory.related_files(root, "app/auth.py")
-            hotspots = memory.hotspots(root)
-            summary = memory.component_summary(root, "auth")
-
-        self.assertTrue(any("Redis" in item["title"] for item in search))
-        self.assertIn(
-            "docs/adr/0001-redis-auth.md",
-            {link.related_file_path for link in related},
-        )
-        self.assertTrue(hotspots)
-        self.assertIn("auth", summary.summary.lower())
-
-    def test_impact_report_uses_changed_files_history_and_token_savings(self) -> None:
-        with self.make_memory_repo() as root_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            memory = MemoryQueryEngine()
-            memory.index_memory(root)
-            (root / "app" / "auth.py").write_text(
-                textwrap.dedent(
-                    '''
-                    class AuthService:
-                        def login(self, token):
-                            if not token:
-                                return None
-                            return token
-                    '''
-                ).lstrip(),
-                encoding="utf-8",
-            )
-            report = memory.impact(root, base_ref="HEAD")
-
-        self.assertEqual(report.changed_files, ("app/auth.py",))
-        self.assertEqual(report.risk_level, "high")
-        self.assertEqual(report.impacted_files[0].owners[0].developer, "Bob Reviewer")
-        self.assertGreaterEqual(
-            report.token_report.baseline_tokens,
-            report.token_report.optimized_tokens,
-        )
-
-    def test_mcp_git_nexus_handlers_are_available(self) -> None:
-        with self.make_memory_repo() as root_name:
-            root = Path(root_name)
-            RepositoryIndexer().index(root)
-            MemoryQueryEngine().index_memory(root)
-            (root / "app" / "auth.py").write_text("# changed\n", encoding="utf-8")
-            handlers = create_tool_handlers(root)
-            impact = handlers["get_impact"]("HEAD")
-            hotspots = handlers["get_hotspots"](limit=3)
-            nexus = handlers["get_nexus"]("auth")
-            status = handlers["get_index_status"]()
-            query = handlers["query_code_graph"]("calls:login")
-            rules = handlers["run_rules"](limit=3)
-            outline = handlers["get_source_outline"]("login")
-            plan = handlers["get_verification_plan"]("HEAD")
-
-        self.assertIn("get_impact", handlers)
-        self.assertIn("get_index_status", handlers)
-        self.assertIn("query_code_graph", handlers)
-        self.assertIn("find_dead_code", handlers)
-        self.assertIn("get_routes", handlers)
-        self.assertIn("get_context_pack", handlers)
-        self.assertIn("get_verification_plan", handlers)
-        self.assertIn("run_rules", handlers)
-        self.assertIn("get_source_outline", handlers)
-        self.assertIn("import_code_index", handlers)
-        self.assertEqual(impact["changed_files"], ("app/auth.py",))
-        self.assertTrue(hotspots)
-        self.assertEqual(nexus["component"], "auth")
-        self.assertTrue(status["indexed"])
-        self.assertEqual(query["type"], "outgoing")
-        self.assertIn("findings", rules)
-        self.assertTrue(outline["files"])
-        self.assertIn("app/auth.py", plan["changed_files"])
-
+from tests.helpers import CodeAtlasTestCase, run_git
 
 class VisualizationTests(CodeAtlasTestCase):
     def test_visualization_assets_are_split_and_rendered(self) -> None:
@@ -764,8 +63,39 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertIn('id="focusBreadcrumb"', html)
         self.assertIn('id="edgeHoverTooltip"', html)
         self.assertIn('id="detailTabs"', html)
+        self.assertIn('id="briefingViewBtn"', html)
+        self.assertNotIn('id="fileFlowBtn"', html)
+        self.assertNotIn('id="commitsBtn"', html)
+        self.assertNotIn('id="compareViewBtn"', html)
+        self.assertIn('id="fileFlowLayerControls"', html)
+        self.assertIn('id="briefingOverlay"', html)
+        self.assertIn('id="flowPlaybackHud"', html)
+        self.assertIn('id="flowPlaybackPlayBtn"', html)
+        self.assertIn('id="flowPlaybackScrubber"', html)
+        self.assertIn('id="globalLoadingBadge"', html)
+        self.assertIn('id="filterLoadingBadge"', html)
+        self.assertIn('id="loadingOverlay"', html)
         self.assertIn('data-detail-tab="evidence"', html)
         self.assertIn(".legend-dot", css)
+        self.assertIn(".loading-chip", css)
+        self.assertIn(".loading-overlay", css)
+        self.assertIn(".inline-loading", css)
+        self.assertIn("button.is-loading", css)
+        self.assertIn("@keyframes loading-spin", css)
+        self.assertIn(".flow-playback-hud", css)
+        self.assertIn(".flow-playback-selection-controls", css)
+        self.assertIn(".file-flow-layer-controls", css)
+        self.assertIn(".file-flow-layer-control", css)
+        self.assertIn(".file-flow-actions", css)
+        self.assertIn(".file-flow-example-preview", css)
+        self.assertIn(".trace-step.active", css)
+        self.assertIn(".briefing-overlay", css)
+        self.assertIn(".briefing-dashboard", css)
+        self.assertIn(".new-engineer-dashboard", css)
+        self.assertIn(".new-engineer-panel", css)
+        self.assertIn(".briefing-journey-intro", css)
+        self.assertIn(".briefing-evidence-block", css)
+        self.assertIn(".briefing-file-action", css)
         self.assertIn(".legend.auto-compact", css)
         self.assertIn(".empty-map-overlay", css)
         self.assertIn(".focus-breadcrumb", css)
@@ -776,6 +106,28 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertIn("::-webkit-scrollbar-thumb", css)
         self.assertIn("scrollbar-gutter: stable", css)
         self.assertIn("function applyDetailTabFilter", js)
+        self.assertIn("function loadBriefing", js)
+        self.assertIn("function setFileFlowGraph", js)
+        self.assertIn("function renderFileFlowLayerControls", js)
+        self.assertIn("function setFileFlowLayerSelection", js)
+        self.assertIn("function fileFlowNodeId", js)
+        self.assertIn("function currentGraphStats", js)
+        self.assertIn("renderStats(currentGraphStats())", js)
+        self.assertIn("function drawFileFlowPanel", js)
+        self.assertIn("function buildFileFlowLayers", js)
+        self.assertIn("function appendFileFlowEdgeControls", js)
+        self.assertIn("function renderBriefing", js)
+        self.assertIn("function focusBriefingComponent", js)
+        self.assertIn("function setLoadingTask", js)
+        self.assertIn("function renderLoadingIndicators", js)
+        self.assertIn("function setInlineStatusLoading", js)
+        self.assertIn("function setButtonLoading", js)
+        self.assertIn("function startFlowPlayback", js)
+        self.assertIn("function renderFlowPlaybackHud", js)
+        self.assertIn("function drawFlowPlaybackPulse", js)
+        self.assertIn("function drawFlowPlaybackVirtualEdge", js)
+        self.assertIn("function flowPlaybackFallbackSteps", js)
+        self.assertIn("function restoreUrlFlowPlayback", js)
         self.assertIn("edgeDashPattern", js)
         self.assertNotIn("Blue: owned", HTML_APP)
         self.assertNotIn("Violet: third-party", HTML_APP)
@@ -862,6 +214,22 @@ class VisualizationTests(CodeAtlasTestCase):
     def test_visualization_map_contains_architecture_and_commit_graphs(self) -> None:
         with self.make_memory_repo() as root_name:
             root = Path(root_name)
+            (root / "app" / "helpers.py").write_text(
+                "def charge(total):\n    return total\n",
+                encoding="utf-8",
+            )
+            (root / "app" / "orders.py").write_text(
+                textwrap.dedent(
+                    '''
+                    from app.helpers import charge
+
+                    class OrderService:
+                        def create_order(self, total):
+                            return charge(total)
+                    '''
+                ).lstrip(),
+                encoding="utf-8",
+            )
             RepositoryIndexer().index(root)
             MemoryQueryEngine().index_memory(root)
             payload = VisualizationService().build_map(root)
@@ -886,6 +254,12 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertTrue(any(example["target"].get("signature") for example in call_examples))
         self.assertIn("commit", commit_types)
         self.assertIn("developer", commit_types)
+        self.assertTrue(payload["file_graph"]["nodes"])
+        self.assertTrue(payload["file_graph"]["edges"])
+        file_edge = next(edge for edge in payload["file_graph"]["edges"] if edge["source"] == "app/orders.py" and edge["target"] == "app/helpers.py" and edge["type"] == "calls")
+        self.assertEqual(file_edge["type"], "calls")
+        self.assertTrue(file_edge["examples"])
+        self.assertTrue(any(example["source_file"] == "app/orders.py" and example["target_file"] == "app/helpers.py" for example in file_edge["examples"]))
         self.assertEqual(payload["stats"]["files"], len(payload["inventory"]["files"]))
         self.assertEqual(payload["stats"]["symbols"], len(payload["inventory"]["symbols"]))
         self.assertEqual(payload["stats"]["commits"], len(payload["inventory"]["commits"]))
@@ -951,6 +325,8 @@ class VisualizationTests(CodeAtlasTestCase):
                 port = server.server_address[1]
                 with urlopen(f"http://127.0.0.1:{port}/api/graph", timeout=5) as response:
                     payload = json.loads(response.read().decode("utf-8"))
+                with urlopen(f"http://127.0.0.1:{port}/api/briefing", timeout=5) as response:
+                    briefing_payload = json.loads(response.read().decode("utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
@@ -959,13 +335,16 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertEqual(payload["repo"]["name"], root.name)
         self.assertGreaterEqual(payload["stats"]["files"], 1)
         self.assertTrue(payload["component_graph"]["nodes"])
+        self.assertTrue(briefing_payload["ok"])
+        self.assertIn("start_here", briefing_payload)
+        self.assertIn("agent_brief", briefing_payload)
 
     def test_mcp_visual_map_handler_is_available(self) -> None:
         with self.make_memory_repo() as root_name:
             root = Path(root_name)
             RepositoryIndexer().index(root)
             MemoryQueryEngine().index_memory(root)
-            handlers = create_tool_handlers(root)
+            handlers = create_tool_handlers(root, profile="full")
             payload = handlers["get_visual_map"]()
 
         self.assertIn("get_visual_map", handlers)
@@ -1098,6 +477,17 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertIn("edgeTouchesSelectedNode(edge, side)", HTML_APP)
         self.assertIn("visibleEdgeAlpha", HTML_APP)
         self.assertIn("Math.max(alpha, LOW_DETAIL_EDGE_ALPHA_FLOOR)", HTML_APP)
+        self.assertIn("drawFlowPlaybackPathOverlay", HTML_APP)
+        self.assertIn("flowPlaybackItemInPath", HTML_APP)
+        self.assertIn("flowPlaybackItemRevealed", HTML_APP)
+        self.assertIn("flowPlaybackRevealedPathPoints", HTML_APP)
+        self.assertIn("points.slice(0, limit)", HTML_APP)
+        self.assertIn("flowPlaybackVisitedNodeIds().has(node.id)", HTML_APP)
+        self.assertNotIn("const connected = new Set(playback.nodeIds || [])", HTML_APP)
+        self.assertIn("state.flowPlayback.edgeKeys.has(edgeKeyForSide", HTML_APP)
+        self.assertIn("return 0.024", HTML_APP)
+        self.assertIn("state.flowPlayback && state.view === 'architecture'", HTML_APP)
+        self.assertIn("(!side && state.flowPlayback) || !state.edgeBundling", HTML_APP)
         self.assertIn('id="commandPalette"', HTML_APP)
         self.assertIn('id="commandPaletteInput"', HTML_APP)
         self.assertIn("openCommandPalette", HTML_APP)
@@ -1119,6 +509,74 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertIn("Pin current trace", HTML_APP)
         self.assertIn("Clear pinned trace", HTML_APP)
         self.assertIn("Copy agent pack", HTML_APP)
+        self.assertIn("Open repo briefing", HTML_APP)
+        self.assertNotIn("Open file flow", HTML_APP)
+        self.assertIn("First-time brief", HTML_APP)
+        self.assertIn("VIEW_CHOICES = ['briefing', 'architecture']", HTML_APP)
+        self.assertIn("file_graph", HTML_APP)
+        self.assertIn("fileFlowPathIds", HTML_APP)
+        self.assertIn("filePath", HTML_APP)
+        self.assertIn("Choose connected file", HTML_APP)
+        self.assertIn("Pick any indexed file as the first layer", HTML_APP)
+        self.assertIn("File Path Explorer", HTML_APP)
+        self.assertIn("Start from this file", HTML_APP)
+        self.assertIn("Continue from target file", HTML_APP)
+        self.assertIn("buildFileFlowLayers", HTML_APP)
+        self.assertIn("flowPlaybackRevealedPathPoints", HTML_APP)
+        self.assertIn("BRIEFING_SECTION_IDS = ['start', 'concepts', 'runtime', 'core', 'data', 'tests', 'risk', 'agent'", HTML_APP)
+        self.assertIn("setGraph('briefing')", HTML_APP)
+        self.assertIn("loadBriefing", HTML_APP)
+        self.assertIn("renderBriefingFlows", HTML_APP)
+        self.assertIn("appendNewEngineerDashboard", HTML_APP)
+        self.assertIn("newEngineerPanel", HTML_APP)
+        self.assertIn("new_engineer_dashboard", HTML_APP)
+        self.assertIn("Read these first", HTML_APP)
+        self.assertIn("Understand these flows", HTML_APP)
+        self.assertIn("Avoid this noise", HTML_APP)
+        self.assertIn("High-risk areas", HTML_APP)
+        self.assertIn("briefingEvidenceBlock", HTML_APP)
+        self.assertIn("Why?", HTML_APP)
+        self.assertIn("Open files", HTML_APP)
+        self.assertIn("openBriefingEvidenceFile", HTML_APP)
+        self.assertIn("briefingComponentFromPath", HTML_APP)
+        self.assertIn("architectureChapterIds", HTML_APP)
+        self.assertIn("scheduler-orchestration", HTML_APP)
+        self.assertIn("docs-config", HTML_APP)
+        self.assertIn("Architecture chapters", HTML_APP)
+        self.assertIn("startup-config-flow", HTML_APP)
+        self.assertIn("data-model-flow", HTML_APP)
+        self.assertIn("test-flow", HTML_APP)
+        self.assertIn("git-change-flow", HTML_APP)
+        self.assertIn("Play flow", HTML_APP)
+        self.assertIn("Play first repo flow", HTML_APP)
+        self.assertIn("Flow Playback", HTML_APP)
+        self.assertIn("flowStep", HTML_APP)
+        self.assertIn("flowPlaybackFocus", HTML_APP)
+        self.assertIn("selected.playback.nodeIds", HTML_APP)
+        self.assertIn("flowPlaybackFallbackSteps", HTML_APP)
+        self.assertIn("drawFlowPlaybackVirtualEdge", HTML_APP)
+        self.assertIn("playback.steps.length <= 1", HTML_APP)
+        self.assertIn("Loading architecture", HTML_APP)
+        self.assertIn("Filtering map", HTML_APP)
+        self.assertIn("Loading compare", HTML_APP)
+        self.assertIn("Building briefing", HTML_APP)
+        self.assertIn("setInlineStatusLoading(status, 'Thinking...', true)", HTML_APP)
+        self.assertIn("Start here", HTML_APP)
+        self.assertIn("Main concepts", HTML_APP)
+        self.assertIn("Main runtime flow", HTML_APP)
+        self.assertIn("Core components", HTML_APP)
+        self.assertIn("Data/state", HTML_APP)
+        self.assertIn("label: 'Tests'", HTML_APP)
+        self.assertIn("Risk/recent change", HTML_APP)
+        self.assertIn("Agent context", HTML_APP)
+        self.assertIn("renderBriefingRuntime", HTML_APP)
+        self.assertIn("renderBriefingTests", HTML_APP)
+        self.assertNotIn("Guided Chapters", HTML_APP)
+        self.assertNotIn("Agent Brief", HTML_APP)
+        self.assertIn("copyBriefingAgentBrief", HTML_APP)
+        self.assertIn('id="briefingRefreshBtn"', HTML_APP)
+        self.assertIn('id="briefingCopyBtn"', HTML_APP)
+        self.assertIn('id="briefingMapBtn"', HTML_APP)
         self.assertIn("commandActionScore", HTML_APP)
         self.assertIn("commandActionHaystack", HTML_APP)
         self.assertIn("command-group", HTML_APP)
@@ -1368,6 +826,7 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertIn("/api/verify-plan", HTML_APP)
         self.assertIn("/api/rules", HTML_APP)
         self.assertIn("/api/source-outline", HTML_APP)
+        self.assertIn("/api/briefing", HTML_APP)
         self.assertIn('id="diagnosticsPanel"', HTML_APP)
         self.assertIn('id="classificationWizard"', HTML_APP)
         self.assertIn("renderClassificationWizard", HTML_APP)
@@ -1385,6 +844,7 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertIn('id="baseCommitSelect"', HTML_APP)
         self.assertIn('id="headCommitSelect"', HTML_APP)
         self.assertIn('id="compareMapControls"', HTML_APP)
+        self.assertIn('id="compareMapControls" class="compare-map-controls" hidden aria-hidden="true"', HTML_APP)
         self.assertIn("compare-map-controls", HTML_APP)
         self.assertIn("selectedCompareRefs", HTML_APP)
         self.assertIn("compareRefsFromSelectors", HTML_APP)
@@ -1582,50 +1042,3 @@ class VisualizationTests(CodeAtlasTestCase):
         with mock.patch("codeatlas.visualization.socket.socket", return_value=PermissionDeniedSocket()):
             with self.assertRaisesRegex(RuntimeError, "permission denied"):
                 find_available_port("127.0.0.1", 8852)
-
-
-class SourceFileTests(unittest.TestCase):
-    def test_source_file_model_can_be_constructed_for_parser_plugins(self) -> None:
-        source_file = SourceFile(
-            path=Path("example.py"),
-            relative_path="example.py",
-            language="python",
-            size_bytes=10,
-            mtime_ns=1,
-            sha256="abc",
-            line_count=1,
-        )
-
-        self.assertEqual(source_file.language, "python")
-
-
-def run_git(
-    root: Path,
-    *args: str,
-    env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    merged_env = os.environ.copy()
-    if env:
-        merged_env.update(env)
-    return subprocess.run(
-        ["git", "-C", str(root), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=merged_env,
-    )
-
-
-def git_env(name: str, email: str, timestamp: str) -> dict[str, str]:
-    return {
-        "GIT_AUTHOR_NAME": name,
-        "GIT_AUTHOR_EMAIL": email,
-        "GIT_AUTHOR_DATE": timestamp,
-        "GIT_COMMITTER_NAME": name,
-        "GIT_COMMITTER_EMAIL": email,
-        "GIT_COMMITTER_DATE": timestamp,
-    }
-
-
-if __name__ == "__main__":
-    unittest.main()

@@ -1,14 +1,32 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections import deque
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .models import EdgeType, ImportRecord, NodeType, SourceFile, SymbolKind, SymbolRecord
+
+SCHEMA_VERSION = 3
+MAX_EDGE_EXAMPLES = 20
+MAX_EDGE_LINES = 1000
+RESOLUTION_TIER_PRIORITY = {
+    "unresolved": 0,
+    "heuristic": 1,
+    "name": 2,
+    "unique_name": 2,
+    "same_module": 3,
+    "import_scoped": 4,
+    "exact_qualified": 5,
+    "parser": 6,
+    "external": 7,
+    "scip": 8,
+}
 
 
 class GraphStore:
@@ -19,11 +37,12 @@ class GraphStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
+        self._symbol_resolution_index: SymbolResolutionIndex | None = None
 
     def close(self) -> None:
         self.connection.close()
 
-    def initialize(self) -> None:
+    def initialize(self, *, validate_schema: bool = True) -> None:
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS files (
@@ -64,6 +83,21 @@ class GraphStore:
               is_from INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS snippets (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+              symbol_id INTEGER REFERENCES symbols(id) ON DELETE CASCADE,
+              cache_key TEXT NOT NULL UNIQUE,
+              file_path TEXT NOT NULL,
+              qualified_name TEXT,
+              kind TEXT NOT NULL,
+              line_start INTEGER NOT NULL,
+              line_end INTEGER NOT NULL,
+              code TEXT NOT NULL,
+              sha256 TEXT NOT NULL,
+              indexed_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS nodes (
               key TEXT PRIMARY KEY,
               type TEXT NOT NULL,
@@ -82,7 +116,7 @@ class GraphStore:
               edge_type TEXT NOT NULL,
               weight REAL NOT NULL DEFAULT 1.0,
               metadata_json TEXT NOT NULL DEFAULT '{}',
-              UNIQUE(source_key, target_key, edge_type, metadata_json)
+              UNIQUE(source_key, target_key, edge_type)
             );
 
             CREATE TABLE IF NOT EXISTS metadata (
@@ -101,6 +135,8 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);
             CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols(kind);
             CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(file_id);
+            CREATE INDEX IF NOT EXISTS idx_snippets_file ON snippets(file_path);
+            CREATE INDEX IF NOT EXISTS idx_snippets_symbol ON snippets(qualified_name);
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_key);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_key);
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(edge_type);
@@ -115,6 +151,32 @@ class GraphStore:
             """
         )
         self.connection.commit()
+        if validate_schema:
+            self.validate_schema()
+
+    def validate_schema(self) -> None:
+        status = self.schema_version_status()
+        if status["ok"]:
+            return
+        msg = (
+            f"CodeAtlas index schema is {status['actual']}; expected {SCHEMA_VERSION}. "
+            "Run `codeatlas index <repo>` to rebuild the local index."
+        )
+        raise RuntimeError(msg)
+
+    def schema_version_status(self) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        row_count = self.connection.execute("SELECT COUNT(*) AS count FROM files").fetchone()
+        file_count = int(row_count["count"])
+        if row is None:
+            return {"ok": file_count == 0, "actual": "missing", "expected": SCHEMA_VERSION}
+        try:
+            actual = json.loads(str(row["value"]))
+        except json.JSONDecodeError:
+            actual = str(row["value"])
+        return {"ok": actual == SCHEMA_VERSION, "actual": actual, "expected": SCHEMA_VERSION}
 
     def clear(self) -> None:
         self.connection.executescript(
@@ -122,6 +184,7 @@ class GraphStore:
             DELETE FROM edges;
             DELETE FROM nodes;
             DELETE FROM imports;
+            DELETE FROM snippets;
             DELETE FROM symbols;
             DELETE FROM files;
             DELETE FROM files_fts;
@@ -129,6 +192,27 @@ class GraphStore:
             """
         )
         self.connection.commit()
+        self._symbol_resolution_index = None
+
+    def recreate(self) -> None:
+        self.connection.executescript(
+            """
+            DROP VIEW IF EXISTS classes;
+            DROP VIEW IF EXISTS functions;
+            DROP VIEW IF EXISTS methods;
+            DROP TABLE IF EXISTS files_fts;
+            DROP TABLE IF EXISTS edges;
+            DROP TABLE IF EXISTS nodes;
+            DROP TABLE IF EXISTS imports;
+            DROP TABLE IF EXISTS snippets;
+            DROP TABLE IF EXISTS symbols;
+            DROP TABLE IF EXISTS files;
+            DROP TABLE IF EXISTS metadata;
+            """
+        )
+        self.connection.commit()
+        self._symbol_resolution_index = None
+        self.initialize(validate_schema=False)
 
     def upsert_file(self, source_file: SourceFile) -> int:
         indexed_at = utc_now()
@@ -279,6 +363,7 @@ class GraphStore:
             "SELECT id FROM symbols WHERE qualified_name = ?", (symbol.qualified_name,)
         ).fetchone()
         symbol_id = int(row["id"])
+        self._symbol_resolution_index = None
         self.insert_node(
             symbol.node_key,
             symbol.node_type,
@@ -319,6 +404,118 @@ class GraphStore:
             (source_file.relative_path, source_file.language, content),
         )
 
+    def upsert_file_snippet(self, file_id: int, source_file: SourceFile, content: str) -> None:
+        self._upsert_snippet(
+            file_id=file_id,
+            symbol_id=None,
+            cache_key=file_node_key(source_file.relative_path),
+            file_path=source_file.relative_path,
+            qualified_name=source_file.relative_path,
+            kind=NodeType.FILE.value,
+            line_start=1 if source_file.line_count else 0,
+            line_end=source_file.line_count,
+            code=content,
+        )
+
+    def upsert_symbol_snippet(
+        self,
+        file_id: int,
+        symbol_id: int,
+        relative_path: str,
+        symbol: SymbolRecord,
+        content: str,
+    ) -> None:
+        self._upsert_snippet(
+            file_id=file_id,
+            symbol_id=symbol_id,
+            cache_key=symbol.node_key,
+            file_path=relative_path,
+            qualified_name=symbol.qualified_name,
+            kind=symbol.kind.value,
+            line_start=symbol.line_start,
+            line_end=symbol.line_end,
+            code=line_range_from_text(content, symbol.line_start, symbol.line_end),
+        )
+
+    def cached_symbol_snippet(self, qualified_name: str) -> str | None:
+        row = self.connection.execute(
+            """
+            SELECT code
+            FROM snippets
+            WHERE cache_key = ?
+               OR qualified_name = ?
+            ORDER BY symbol_id IS NULL
+            LIMIT 1
+            """,
+            (symbol_node_key(qualified_name), qualified_name),
+        ).fetchone()
+        return str(row["code"]) if row is not None else None
+
+    def cached_file_content(self, relative_path: str) -> str | None:
+        row = self.connection.execute(
+            """
+            SELECT code
+            FROM snippets
+            WHERE cache_key = ?
+            LIMIT 1
+            """,
+            (file_node_key(relative_path),),
+        ).fetchone()
+        return str(row["code"]) if row is not None else None
+
+    def cached_line_range(self, relative_path: str, line_start: int, line_end: int) -> str | None:
+        content = self.cached_file_content(relative_path)
+        if content is None:
+            return None
+        return line_range_from_text(content, line_start, line_end)
+
+    def _upsert_snippet(
+        self,
+        *,
+        file_id: int,
+        symbol_id: int | None,
+        cache_key: str,
+        file_path: str,
+        qualified_name: str | None,
+        kind: str,
+        line_start: int,
+        line_end: int,
+        code: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO snippets(
+              file_id, symbol_id, cache_key, file_path, qualified_name, kind,
+              line_start, line_end, code, sha256, indexed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+              file_id = excluded.file_id,
+              symbol_id = excluded.symbol_id,
+              file_path = excluded.file_path,
+              qualified_name = excluded.qualified_name,
+              kind = excluded.kind,
+              line_start = excluded.line_start,
+              line_end = excluded.line_end,
+              code = excluded.code,
+              sha256 = excluded.sha256,
+              indexed_at = excluded.indexed_at
+            """,
+            (
+                file_id,
+                symbol_id,
+                cache_key,
+                file_path,
+                qualified_name,
+                kind,
+                line_start,
+                line_end,
+                code,
+                snippet_sha256(code),
+                utc_now(),
+            ),
+        )
+
     def insert_edge(
         self,
         source_key: str,
@@ -330,9 +527,42 @@ class GraphStore:
         weight: float = 1.0,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        metadata_payload = metadata or {}
+        existing = self.connection.execute(
+            """
+            SELECT id, weight, metadata_json
+            FROM edges
+            WHERE source_key = ? AND target_key = ? AND edge_type = ?
+            """,
+            (source_key, target_key, edge_type.value),
+        ).fetchone()
+        if existing is not None:
+            merged = merge_edge_metadata(
+                json.loads(str(existing["metadata_json"] or "{}")),
+                metadata_payload,
+            )
+            self.connection.execute(
+                """
+                UPDATE edges
+                SET
+                  source_type = ?,
+                  target_type = ?,
+                  weight = ?,
+                  metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    source_type.value,
+                    target_type.value,
+                    max(float(existing["weight"] or 1.0), weight),
+                    json.dumps(merged, sort_keys=True),
+                    int(existing["id"]),
+                ),
+            )
+            return
         self.connection.execute(
             """
-            INSERT OR IGNORE INTO edges(
+            INSERT INTO edges(
               source_key, source_type, target_key, target_type, edge_type, weight, metadata_json
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -344,7 +574,7 @@ class GraphStore:
                 target_type.value,
                 edge_type.value,
                 weight,
-                json.dumps(metadata or {}, sort_keys=True),
+                json.dumps(metadata_payload, sort_keys=True),
             ),
         )
 
@@ -438,29 +668,27 @@ class GraphStore:
             ).fetchall()
         )
 
-    def resolve_symbol_node_key(self, name: str, source_module: str | None = None) -> str | None:
-        rows = self.symbols_by_name(name)
-        if not rows:
-            rows = list(
-                self.connection.execute(
-                    """
-                    SELECT s.*, f.path AS file_path
-                    FROM symbols s
-                    JOIN files f ON f.id = s.file_id
-                    WHERE s.qualified_name LIKE ?
-                    ORDER BY LENGTH(s.qualified_name)
-                    LIMIT 10
-                    """,
-                    (f"%.{name}",),
-                ).fetchall()
-            )
-        if not rows:
-            return None
-        if source_module:
-            for row in rows:
-                if str(row["module"]) == source_module:
-                    return symbol_node_key(str(row["qualified_name"]))
-        return symbol_node_key(str(rows[0]["qualified_name"]))
+    def resolve_symbol_node_key(
+        self,
+        name: str,
+        source_module: str | None = None,
+        imports: Iterable[ImportRecord] = (),
+    ) -> str | None:
+        resolved = self.resolve_symbol(name, source_module, imports)
+        return resolved.node_key if resolved else None
+
+    def resolve_symbol(
+        self,
+        name: str,
+        source_module: str | None = None,
+        imports: Iterable[ImportRecord] = (),
+    ) -> SymbolResolution | None:
+        return self.symbol_resolution_index().resolve(name, source_module, imports)
+
+    def symbol_resolution_index(self) -> SymbolResolutionIndex:
+        if self._symbol_resolution_index is None:
+            self._symbol_resolution_index = SymbolResolutionIndex(self.all_symbols())
+        return self._symbol_resolution_index
 
     def traverse(self, start_keys: Iterable[str], depth: int) -> tuple[set[str], list[sqlite3.Row]]:
         start = set(start_keys)
@@ -569,29 +797,86 @@ class GraphStore:
             return []
         return list(rows)
 
-    def files_in_directories(self, directories: Iterable[str]) -> list[sqlite3.Row]:
-        directory_list = sorted(set(directories))
-        if not directory_list:
-            return self.file_rows()
-        rows: list[sqlite3.Row] = []
-        for directory in directory_list:
-            if directory in {"", "."}:
-                rows.extend(
-                    self.connection.execute(
-                        "SELECT * FROM files WHERE instr(path, '/') = 0"
-                    ).fetchall()
-                )
-            else:
-                rows.extend(
-                    self.connection.execute(
-                        "SELECT * FROM files WHERE path LIKE ?",
-                        (f"{directory.rstrip('/')}/%",),
-                    ).fetchall()
-                )
-        unique: dict[str, sqlite3.Row] = {}
-        for row in rows:
-            unique[str(row["path"])] = row
-        return list(unique.values())
+    def files_by_paths(self, paths: Iterable[str]) -> list[sqlite3.Row]:
+        path_list = sorted(set(paths))
+        if not path_list:
+            return []
+        placeholders = ",".join("?" for _ in path_list)
+        return list(
+            self.connection.execute(
+                f"SELECT * FROM files WHERE path IN ({placeholders})",
+                tuple(path_list),
+            ).fetchall()
+        )
+
+    def parse_quality_stats(self) -> dict[str, Any]:
+        symbol_rows = self.connection.execute(
+            """
+            SELECT f.path, COUNT(s.id) AS symbols
+            FROM files f
+            LEFT JOIN symbols s ON s.file_id = f.id
+            GROUP BY f.path
+            """
+        ).fetchall()
+        symbols_by_path = {str(row["path"]): int(row["symbols"] or 0) for row in symbol_rows}
+        call_counts: dict[str, dict[str, int]] = {}
+        for row in self.connection.execute(
+            """
+            SELECT n.file_path, e.target_key, e.metadata_json
+            FROM edges e
+            LEFT JOIN nodes n ON n.key = e.source_key
+            WHERE e.edge_type = 'CALLS'
+            """
+        ).fetchall():
+            file_path = str(row["file_path"] or "")
+            if not file_path:
+                continue
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+            count = _edge_count(metadata)
+            bucket = call_counts.setdefault(file_path, {"total": 0, "unresolved": 0})
+            bucket["total"] += count
+            if str(row["target_key"]).startswith("symbol_ref:") or metadata.get(
+                "resolution_tier"
+            ) == "unresolved":
+                bucket["unresolved"] += count
+
+        files: list[dict[str, Any]] = []
+        total_symbols = 0
+        total_lines = 0
+        total_calls = 0
+        total_unresolved = 0
+        for row in self.file_rows():
+            path = str(row["path"])
+            line_count = int(row["line_count"] or 0)
+            symbols = symbols_by_path.get(path, 0)
+            calls = call_counts.get(path, {"total": 0, "unresolved": 0})
+            total_symbols += symbols
+            total_lines += line_count
+            total_calls += calls["total"]
+            total_unresolved += calls["unresolved"]
+            files.append(
+                {
+                    "path": path,
+                    "language": str(row["language"]),
+                    "line_count": line_count,
+                    "symbols": symbols,
+                    "symbols_per_kloc": symbols_per_kloc(symbols, line_count),
+                    "calls": calls["total"],
+                    "unresolved_calls": calls["unresolved"],
+                    "unresolved_call_ratio": ratio(calls["unresolved"], calls["total"]),
+                }
+            )
+        return {
+            "summary": {
+                "files": len(files),
+                "symbols": total_symbols,
+                "symbols_per_kloc": symbols_per_kloc(total_symbols, total_lines),
+                "calls": total_calls,
+                "unresolved_calls": total_unresolved,
+                "unresolved_call_ratio": ratio(total_unresolved, total_calls),
+            },
+            "files": files,
+        }
 
     def repository_stats(self) -> dict[str, Any]:
         row = self.connection.execute(
@@ -634,6 +919,296 @@ class GraphStore:
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def line_range_from_text(content: str, line_start: int, line_end: int) -> str:
+    lines = content.splitlines()
+    start = max(line_start - 1, 0)
+    end = min(max(line_end, line_start), len(lines))
+    return "\n".join(lines[start:end])
+
+
+def snippet_sha256(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()
+
+
+def merge_edge_metadata(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    existing_count = _edge_count(existing)
+    incoming_count = _edge_count(incoming)
+    for key, value in incoming.items():
+        if key not in merged and key not in {"count", "lines", "examples"}:
+            merged[key] = value
+    merged.update(preferred_resolution_metadata(existing, incoming))
+    lines = merge_edge_lines(existing, incoming)
+    if lines:
+        merged["line"] = lines[0]
+        merged["lines"] = lines[:MAX_EDGE_LINES]
+    examples = merge_edge_examples(existing, incoming)
+    if examples:
+        merged["examples"] = examples[:MAX_EDGE_EXAMPLES]
+    merged["count"] = existing_count + incoming_count
+    return merged
+
+
+def preferred_resolution_metadata(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    existing_confidence = _edge_confidence(existing)
+    incoming_confidence = _edge_confidence(incoming)
+    existing_tier = str(existing.get("resolution_tier") or "")
+    incoming_tier = str(incoming.get("resolution_tier") or "")
+    if incoming_confidence < existing_confidence and (
+        RESOLUTION_TIER_PRIORITY.get(incoming_tier, -1)
+        <= RESOLUTION_TIER_PRIORITY.get(existing_tier, -1)
+    ):
+        return {}
+    selected: dict[str, Any] = {}
+    if "confidence" in incoming:
+        selected["confidence"] = incoming["confidence"]
+    if incoming_tier:
+        selected["resolution_tier"] = incoming_tier
+    if "source" in incoming:
+        selected["source"] = incoming["source"]
+    return selected
+
+
+def _edge_confidence(metadata: dict[str, Any]) -> float:
+    try:
+        return float(metadata.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _edge_count(metadata: dict[str, Any]) -> int:
+    try:
+        return max(1, int(metadata.get("count") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def symbols_per_kloc(symbols: int, line_count: int) -> float:
+    if line_count <= 0:
+        return 0.0
+    return round(symbols / (line_count / 1000), 2)
+
+
+def ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(numerator / denominator, 4)
+
+
+def merge_edge_lines(*metadata_items: dict[str, Any]) -> list[int]:
+    lines: list[int] = []
+    seen: set[int] = set()
+    for metadata in metadata_items:
+        for raw in _metadata_lines(metadata):
+            try:
+                line = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if line <= 0 or line in seen:
+                continue
+            seen.add(line)
+            lines.append(line)
+    return lines
+
+
+def _metadata_lines(metadata: dict[str, Any]) -> list[Any]:
+    lines: list[Any] = []
+    if "line" in metadata:
+        lines.append(metadata["line"])
+    raw_lines = metadata.get("lines")
+    if isinstance(raw_lines, list):
+        lines.extend(raw_lines)
+    return lines
+
+
+def merge_edge_examples(existing: dict[str, Any], incoming: dict[str, Any]) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for metadata in (existing, incoming):
+        raw_examples = metadata.get("examples")
+        if isinstance(raw_examples, list):
+            for example in raw_examples:
+                if isinstance(example, dict):
+                    _append_edge_example(examples, seen, example)
+        else:
+            occurrence = edge_occurrence_metadata(metadata)
+            if occurrence:
+                _append_edge_example(examples, seen, occurrence)
+    return examples
+
+
+def _append_edge_example(
+    examples: list[dict[str, Any]],
+    seen: set[str],
+    example: dict[str, Any],
+) -> None:
+    key = json.dumps(example, sort_keys=True, default=str)
+    if key in seen:
+        return
+    seen.add(key)
+    examples.append(example)
+
+
+def edge_occurrence_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in {"count", "examples", "lines"} and value not in (None, "", [])
+    }
+
+
+@dataclass(frozen=True)
+class SymbolResolution:
+    node_key: str
+    tier: str
+
+
+class SymbolResolutionIndex:
+    def __init__(self, rows: Iterable[sqlite3.Row]) -> None:
+        self.by_name: dict[str, list[sqlite3.Row]] = {}
+        self.by_qualified_name: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            name = str(row["name"])
+            qualified_name = str(row["qualified_name"])
+            self.by_name.setdefault(name, []).append(row)
+            self.by_qualified_name[qualified_name] = row
+        for candidates in self.by_name.values():
+            candidates.sort(key=_symbol_candidate_sort_key)
+
+    def resolve(
+        self,
+        name: str,
+        source_module: str | None,
+        imports: Iterable[ImportRecord],
+    ) -> SymbolResolution | None:
+        cleaned = name.strip()
+        if not cleaned:
+            return None
+        exact = self.by_qualified_name.get(cleaned)
+        if exact is not None:
+            return SymbolResolution(
+                symbol_node_key(str(exact["qualified_name"])),
+                "exact_qualified",
+            )
+        imported = self._resolve_import(cleaned, source_module, imports)
+        if imported is not None:
+            return imported
+        if source_module:
+            same_module = self.by_qualified_name.get(f"{source_module}.{cleaned}")
+            if same_module is not None:
+                return SymbolResolution(
+                    symbol_node_key(str(same_module["qualified_name"])),
+                    "same_module",
+                )
+        same_module_candidate = self._same_module_candidate(cleaned, source_module)
+        if same_module_candidate is not None:
+            return same_module_candidate
+        unique_name = self._unique_name_candidate(cleaned)
+        if unique_name is not None:
+            return unique_name
+        return None
+
+    def _resolve_import(
+        self,
+        name: str,
+        source_module: str | None,
+        imports: Iterable[ImportRecord],
+    ) -> SymbolResolution | None:
+        for record in imports:
+            imported_module = normalize_import_module(record.module, source_module)
+            if record.is_from and record.name:
+                local_name = record.alias or record.name
+                if name != local_name:
+                    continue
+                qualified_name = (
+                    f"{imported_module}.{record.name}" if imported_module else record.name
+                )
+                row = self.by_qualified_name.get(qualified_name)
+                if row is not None:
+                    return SymbolResolution(
+                        symbol_node_key(str(row["qualified_name"])),
+                        "import_scoped",
+                    )
+                candidates = [
+                    candidate
+                    for candidate in self.by_name.get(record.name, [])
+                    if str(candidate["module"]) == imported_module
+                ]
+                if len(candidates) == 1:
+                    return SymbolResolution(
+                        symbol_node_key(str(candidates[0]["qualified_name"])),
+                        "import_scoped",
+                    )
+            elif not record.is_from:
+                local_module_name = record.alias or record.module.rsplit(".", 1)[-1]
+                if name == local_module_name and imported_module in self.by_qualified_name:
+                    qualified_name = str(self.by_qualified_name[imported_module]["qualified_name"])
+                    return SymbolResolution(symbol_node_key(qualified_name), "import_scoped")
+                candidates = [
+                    candidate
+                    for candidate in self.by_name.get(name, [])
+                    if str(candidate["module"]) == imported_module
+                ]
+                if len(candidates) == 1:
+                    return SymbolResolution(
+                        symbol_node_key(str(candidates[0]["qualified_name"])),
+                        "import_scoped",
+                    )
+        return None
+
+    def _same_module_candidate(
+        self,
+        name: str,
+        source_module: str | None,
+    ) -> SymbolResolution | None:
+        if not source_module:
+            return None
+        candidates = [
+            candidate
+            for candidate in self.by_name.get(name, [])
+            if str(candidate["module"]) == source_module
+        ]
+        if len(candidates) == 1:
+            return SymbolResolution(
+                symbol_node_key(str(candidates[0]["qualified_name"])),
+                "same_module",
+            )
+        return None
+
+    def _unique_name_candidate(self, name: str) -> SymbolResolution | None:
+        candidates = self.by_name.get(name, [])
+        if len(candidates) == 1:
+            return SymbolResolution(
+                symbol_node_key(str(candidates[0]["qualified_name"])),
+                "unique_name",
+            )
+        return None
+
+
+def _symbol_candidate_sort_key(row: sqlite3.Row) -> tuple[int, str]:
+    qualified_name = str(row["qualified_name"])
+    return (qualified_name.count("."), qualified_name)
+
+
+def normalize_import_module(module: str, source_module: str | None) -> str:
+    if not module.startswith("."):
+        return module
+    if not source_module:
+        return module.lstrip(".")
+    leading_dots = len(module) - len(module.lstrip("."))
+    remainder = module[leading_dots:].replace("/", ".").strip(".")
+    base_parts = source_module.split(".")[:-1]
+    if leading_dots > 1:
+        base_parts = base_parts[: max(0, len(base_parts) - (leading_dots - 1))]
+    parts = [*base_parts]
+    if remainder:
+        parts.extend(part for part in remainder.split(".") if part)
+    return ".".join(parts)
 
 
 def file_node_key(relative_path: str) -> str:

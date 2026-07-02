@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .analysis import dead_code, http_confidence_summary, route_summary, structural_query
+from .briefing import repo_briefing
 from .config import CodeAtlasPaths, resolve_repo_root
 from .indexer import RepositoryIndexer
 from .memory import MemoryQueryEngine, MemoryStore, component_for_path, metadata_files, parse_json
@@ -34,7 +35,7 @@ from .workflow_cache import cached_workflow
 COMPARE_CACHE_VERSION = 1
 SERVER_STARTED = datetime.now(UTC)
 SERVER_STARTED_AT = SERVER_STARTED.isoformat()
-UI_VERSION = "compare-evidence-mode-1"
+UI_VERSION = "file-flow-path-mode-2"
 ASSET_DIR = Path(__file__).with_name("assets")
 VISUALIZATION_ASSET_NAMES = (
     "visualization.html",
@@ -100,6 +101,7 @@ class VisualizationService:
             repository_stats = graph_store.repository_stats()
 
             component_graph = self._component_graph(files, symbols, code_edges, commit_rows, memory_edges)
+            file_graph = self._file_graph(files, code_edges)
             commit_graph = self._commit_graph(commit_rows)
             stats = {
                 "files": len(files),
@@ -141,6 +143,7 @@ class VisualizationService:
                     index_report=index_report,
                 ),
                 "component_graph": component_graph,
+                "file_graph": file_graph,
                 "commit_graph": commit_graph,
             }
         finally:
@@ -522,7 +525,7 @@ class VisualizationService:
                     "examples": [],
                 },
             )
-            edge["weight"] += 1
+            edge["weight"] += edge_occurrence_count(row)
             if len(edge["reasons"]) < 5:
                 edge["reasons"].append(str(metadata.get("commit", ""))[:12])
             if len(edge["examples"]) < 10:
@@ -547,6 +550,48 @@ class VisualizationService:
             nodes.append(node)
         nodes.sort(key=lambda item: (-item["size"], item["label"]))
         edges = sorted(edge_weights.values(), key=lambda item: (-item["weight"], item["source"], item["target"]))
+        return {"nodes": nodes, "edges": edges}
+
+    def _file_graph(
+        self,
+        files: list[dict[str, Any]],
+        code_edges: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        file_nodes = {str(row["path"]): file_graph_node(row) for row in files}
+        edge_weights: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row in code_edges:
+            edge_type = str(row.get("edge_type") or "").upper()
+            if edge_type not in {"CALLS", "REFERENCES", "IMPORTS", "INHERITS"}:
+                continue
+            source_path = str(row.get("source_path") or "")
+            target_path = str(row.get("target_path") or "")
+            if not source_path or not target_path or source_path == target_path:
+                continue
+            if source_path not in file_nodes or target_path not in file_nodes:
+                continue
+            edge_key = (source_path, target_path, edge_type)
+            edge = edge_weights.setdefault(
+                edge_key,
+                {
+                    "id": "file|" + "|".join(edge_key),
+                    "source": source_path,
+                    "target": target_path,
+                    "type": edge_type.lower(),
+                    "weight": 0,
+                    "reasons": [],
+                    "examples": [],
+                },
+            )
+            edge["weight"] += edge_occurrence_count(row)
+            if len(edge["reasons"]) < 8:
+                edge["reasons"].append(file_edge_reason(row))
+            if len(edge["examples"]) < 20:
+                edge["examples"].append(
+                    component_edge_example(row, target_component=component_for_path(target_path))
+                    | {"source_file": source_path, "target_file": target_path}
+                )
+        nodes = sorted(file_nodes.values(), key=lambda item: item["id"])
+        edges = sorted(edge_weights.values(), key=lambda item: (-item["weight"], item["source"], item["target"], item["type"]))
         return {"nodes": nodes, "edges": edges}
 
     def _commit_graph(self, commit_rows: list[Any]) -> dict[str, Any]:
@@ -658,6 +703,18 @@ def create_visualization_server(
             elif route == "/api/index-status":
                 try:
                     payload = index_status(repo_root)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **payload})
+            elif route == "/api/briefing":
+                try:
+                    payload = cached_workflow(
+                        repo_root,
+                        "briefing",
+                        {"version": 1},
+                        lambda: repo_briefing(repo_root),
+                    )
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
                     return
@@ -1269,8 +1326,11 @@ def component_edge_example(row: dict[str, Any], *, target_component: str) -> dic
         "target": target,
         "display": display,
         "arguments": arguments,
+        "resolution_tier": metadata.get("resolution_tier"),
+        "confidence": metadata.get("confidence"),
         "file_path": source.get("path") or target.get("path"),
-        "line": metadata.get("line") or source.get("line_start"),
+        "line": edge_location(metadata) or source.get("line_start"),
+        "count": edge_occurrence_count(row),
     }
 
 
@@ -1312,6 +1372,26 @@ def edge_arguments(metadata: dict[str, Any]) -> list[str]:
     if not isinstance(arguments, list):
         return []
     return [str(argument) for argument in arguments if str(argument).strip()]
+
+
+def edge_occurrence_count(row: dict[str, Any]) -> int:
+    metadata = parse_json(row.get("metadata_json"))
+    try:
+        return max(1, int(metadata.get("count") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def edge_location(metadata: dict[str, Any]) -> str:
+    if metadata.get("line"):
+        return str(metadata["line"])
+    lines = metadata.get("lines")
+    if isinstance(lines, list) and lines:
+        first = str(lines[0])
+        if len(lines) > 1:
+            return f"{first} (+{len(lines) - 1})"
+        return first
+    return ""
 
 
 def edge_example_signature(example: dict[str, Any]) -> tuple[Any, ...]:
@@ -1363,6 +1443,42 @@ def external_node(label: str) -> dict[str, Any]:
     node["type"] = "external"
     node["tags"] = ["external"]
     return node
+
+
+def file_graph_node(row: dict[str, Any]) -> dict[str, Any]:
+    path = str(row.get("path") or "")
+    line_count = int(row.get("line_count") or 0)
+    return {
+        "id": path,
+        "label": path,
+        "type": "file",
+        "file_path": path,
+        "path": path,
+        "component": component_for_path(path),
+        "language": str(row.get("language") or ""),
+        "size": 8 + min(22, max(1, line_count // 30)),
+        "metrics": {
+            "lines": line_count,
+            "size_bytes": int(row.get("size_bytes") or 0),
+        },
+    }
+
+
+def file_edge_reason(row: dict[str, Any]) -> str:
+    metadata = parse_json(row.get("metadata_json"))
+    edge_type = str(row.get("edge_type") or "").lower()
+    display = edge_display(edge_type, row, metadata)
+    source = str(row.get("source_qualified_name") or row.get("source_label") or row.get("source_key") or "")
+    target = str(row.get("target_qualified_name") or row.get("target_label") or row.get("target_key") or "")
+    location = edge_location(metadata) or str(row.get("source_line_start") or "")
+    parts = [edge_type]
+    if display:
+        parts.append(display)
+    elif source or target:
+        parts.append(" -> ".join(part for part in (source, target) if part))
+    if location:
+        parts.append("line " + location)
+    return " | ".join(parts)
 
 
 def compact_file_inventory(files: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -13,15 +13,18 @@
     <header>
       <h1>CodeAtlas Map</h1>
       <div id="repoMeta" class="meta">Loading repository graph...</div>
+      <div id="globalLoadingBadge" class="loading-chip" role="status" aria-live="polite" hidden>
+        <span class="loading-spinner" aria-hidden="true"></span>
+        <span id="globalLoadingText">Loading</span>
+      </div>
       <div id="buildBadge" class="build-badge">index unknown</div>
       <div class="toolbar">
         <div class="toolbar-group">
           <button id="refreshBtn">Refresh</button>
         </div>
         <div class="toolbar-group view-switch" aria-label="Map view">
+          <button id="briefingViewBtn">Briefing</button>
           <button id="architectureBtn" class="active">Architecture</button>
-          <button id="commitsBtn">Commits</button>
-          <button id="compareViewBtn">Compare</button>
         </div>
         <button id="addConnectionBtn" class="icon-btn" aria-label="Add architecture connection">+</button>
         <input id="searchInput" placeholder="Filter nodes">
@@ -48,6 +51,10 @@
           <div class="filter-sticky-row">
             <span id="stickyLensLabel" class="filter-sticky-label">Overview</span>
             <span id="filterSummary" class="filter-summary compact">0 of 0 visible</span>
+            <span id="filterLoadingBadge" class="loading-chip compact" role="status" aria-live="polite" hidden>
+              <span class="loading-spinner" aria-hidden="true"></span>
+              <span>Filtering</span>
+            </span>
           </div>
           <div class="filter-sticky-actions">
             <input id="componentFilterInput" class="filter-search" placeholder="Find component">
@@ -158,7 +165,7 @@
       </div>
     </aside>
     <main>
-      <div id="compareMapControls" class="compare-map-controls">
+      <div id="compareMapControls" class="compare-map-controls" hidden aria-hidden="true">
         <select id="baseCommitSelect" aria-label="Base commit"></select>
         <select id="headCommitSelect" aria-label="Head commit"></select>
         <button id="runCompareBtn">Compare</button>
@@ -172,7 +179,60 @@
         <span id="focusBreadcrumbText"></span>
         <button id="focusBreadcrumbClearBtn" type="button" aria-label="Clear focus">x</button>
       </div>
+      <div id="fileFlowLayerControls" class="file-flow-layer-controls" aria-label="File flow layer selectors" hidden></div>
       <canvas id="graphCanvas"></canvas>
+      <div id="loadingOverlay" class="loading-overlay" role="status" aria-live="polite" hidden>
+        <div class="loading-card">
+          <span class="loading-spinner large" aria-hidden="true"></span>
+          <div>
+            <div id="loadingOverlayTitle" class="loading-title">Loading</div>
+            <div id="loadingOverlayBody" class="loading-body">Preparing CodeAtlas view...</div>
+          </div>
+        </div>
+      </div>
+      <div id="flowPlaybackHud" class="flow-playback-hud" hidden>
+        <div class="flow-playback-head">
+          <div>
+            <div class="flow-playback-kicker">Flow Playback</div>
+            <div id="flowPlaybackTitle" class="flow-playback-title">No flow selected</div>
+          </div>
+          <button id="flowPlaybackCloseBtn" type="button" aria-label="Close flow playback">x</button>
+        </div>
+        <div id="flowPlaybackStep" class="flow-playback-step">Step 0 of 0</div>
+        <div class="flow-playback-controls">
+          <button id="flowPlaybackPrevBtn" type="button" aria-label="Previous flow step">Prev</button>
+          <button id="flowPlaybackPlayBtn" type="button">Play</button>
+          <button id="flowPlaybackNextBtn" type="button" aria-label="Next flow step">Next</button>
+          <select id="flowPlaybackSpeedSelect" aria-label="Playback speed">
+            <option value="2400">Slow</option>
+            <option value="1600" selected>Normal</option>
+            <option value="900">Fast</option>
+          </select>
+        </div>
+        <input id="flowPlaybackScrubber" class="flow-playback-scrubber" type="range" min="0" max="0" value="0" aria-label="Flow playback step">
+      </div>
+      <div id="briefingOverlay" class="briefing-overlay" hidden>
+        <div class="briefing-shell">
+          <section class="briefing-hero">
+            <div>
+              <div class="briefing-kicker">First-Time Reader</div>
+              <h2 id="briefingTitle">Repository briefing</h2>
+              <p id="briefingSummary">Building an evidence-backed first read path...</p>
+            </div>
+            <div class="briefing-actions">
+              <button id="briefingRefreshBtn" type="button">Refresh briefing</button>
+              <button id="briefingCopyBtn" type="button">Copy agent brief</button>
+              <button id="briefingMapBtn" type="button">Open map path</button>
+            </div>
+          </section>
+          <div id="briefingStatus" class="briefing-status"></div>
+          <div id="briefingDashboard" class="briefing-dashboard"></div>
+          <section class="briefing-layout">
+            <nav id="briefingSteps" class="briefing-steps" aria-label="Briefing sections"></nav>
+            <div id="briefingContent" class="briefing-content"></div>
+          </section>
+        </div>
+      </div>
       <div id="edgeHoverTooltip" class="edge-hover-tooltip" hidden></div>
       <div id="mapLegend" class="legend">
         <button id="legendToggleBtn" class="legend-toggle" type="button" aria-expanded="true">Legend</button>

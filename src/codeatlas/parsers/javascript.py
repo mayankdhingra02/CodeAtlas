@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
+from typing import Any
 
 from codeatlas.models import (
     CallRecord,
@@ -13,18 +13,65 @@ from codeatlas.models import (
     SymbolRecord,
 )
 
+try:  # pragma: no cover - exercised in integration environments.
+    from tree_sitter import Node
+    from tree_sitter_language_pack import get_parser
+except Exception:  # pragma: no cover
+    Node = Any  # type: ignore[misc, assignment]
+    get_parser = None  # type: ignore[assignment]
+
 from .base import ParserPlugin
+
+
+CONTROL_FLOW_CALLEES = frozenset(
+    {
+        "catch",
+        "for",
+        "if",
+        "return",
+        "switch",
+        "while",
+        "with",
+    }
+)
+HTTP_ROUTE_OWNERS = frozenset({"app", "router"})
+HTTP_ROUTE_METHODS = frozenset({"delete", "get", "patch", "post", "put", "use"})
+TEST_CALLEES = frozenset({"describe", "it", "test"})
 
 
 class JavaScriptParser(ParserPlugin):
     language = "javascript"
     extensions = frozenset({".js", ".jsx", ".ts", ".tsx"})
 
+    def __init__(self) -> None:
+        if get_parser is None:
+            msg = "JavaScript parsing requires tree-sitter and tree-sitter-language-pack."
+            raise RuntimeError(msg)
+        self._parsers = {
+            "javascript": get_parser("javascript"),
+            "typescript": get_parser("typescript"),
+            "tsx": get_parser("tsx"),
+        }
+
     def parse(self, repo_root: Path, source_file: SourceFile) -> ParseResult:
-        source = source_file.path.read_text(encoding="utf-8", errors="replace")
+        content = source_file.path.read_bytes()
+        source_text = content.decode("utf-8", errors="replace")
+        parser = self._parser_for(source_file.path.suffix)
+        try:
+            tree = parser.parse(source_text)
+        except TypeError:
+            tree = parser.parse(content)
+        root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
         module_name = module_name_for_path(source_file.relative_path)
-        extractor = _JavaScriptRegexExtractor(source, module_name)
-        return extractor.extract(source_file)
+        extractor = _JavaScriptTreeSitterExtractor(content, module_name)
+        return extractor.extract(source_file, root_node)
+
+    def _parser_for(self, suffix: str) -> Any:
+        if suffix == ".ts":
+            return self._parsers["typescript"]
+        if suffix == ".tsx":
+            return self._parsers["tsx"]
+        return self._parsers["javascript"]
 
 
 def module_name_for_path(relative_path: str) -> str:
@@ -32,20 +79,20 @@ def module_name_for_path(relative_path: str) -> str:
     return ".".join(path.with_suffix("").parts) if path.parts else path.stem
 
 
-class _JavaScriptRegexExtractor:
-    def __init__(self, source: str, module_name: str) -> None:
-        self.source = source
-        self.lines = source.splitlines()
+class _JavaScriptTreeSitterExtractor:
+    def __init__(self, content: bytes, module_name: str) -> None:
+        self.content = content
+        self.source = content.decode("utf-8", errors="replace")
         self.module_name = module_name
         self.imports: list[ImportRecord] = []
         self.symbols: list[SymbolRecord] = []
         self.calls: list[CallRecord] = []
         self.references: list[ReferenceRecord] = []
 
-    def extract(self, source_file: SourceFile) -> ParseResult:
-        self._collect_imports()
-        self._collect_symbols()
-        self._collect_calls()
+    def extract(self, source_file: SourceFile, root: Node) -> ParseResult:
+        self._collect_imports(root)
+        self._process_block(root, ())
+        self._collect_route_and_test_symbols(root)
         return ParseResult(
             source_file=source_file,
             module_name=self.module_name,
@@ -55,234 +102,417 @@ class _JavaScriptRegexExtractor:
             references=tuple(self.references),
         )
 
-    def _collect_imports(self) -> None:
-        for line_number, line in enumerate(self.lines, start=1):
-            for match in re.finditer(r"\bimport\s+(?:type\s+)?(.+?)\s+from\s+['\"]([^'\"]+)['\"]", line):
-                imported, module = match.groups()
-                for name, alias in imported_names(imported):
-                    self.imports.append(
-                        ImportRecord(
-                            module=module,
-                            name=name,
-                            alias=alias,
-                            line_number=line_number,
-                            is_from=True,
-                        )
-                    )
-            for match in re.finditer(r"\bimport\s+['\"]([^'\"]+)['\"]", line):
-                self.imports.append(
+    def _collect_imports(self, root: Node) -> None:
+        for node in self._iter_nodes(root):
+            node_type = _node_type(node)
+            if node_type == "import_statement":
+                self.imports.extend(self._parse_import_statement(node))
+            elif node_type in {"lexical_declaration", "variable_declaration"}:
+                self.imports.extend(self._parse_require_declaration(node))
+
+    def _parse_import_statement(self, node: Node) -> tuple[ImportRecord, ...]:
+        module = self._module_string(node)
+        if not module:
+            return ()
+        line_number = self._line_start(node)
+        clause = next(
+            (child for child in _named_children(node) if _node_type(child) == "import_clause"),
+            None,
+        )
+        if clause is None:
+            return (
+                ImportRecord(
+                    module=module,
+                    name=None,
+                    alias=None,
+                    line_number=line_number,
+                    is_from=False,
+                ),
+            )
+
+        records: list[ImportRecord] = []
+        for child in _named_children(clause):
+            child_type = _node_type(child)
+            if child_type in {"identifier", "type_identifier"}:
+                records.append(
                     ImportRecord(
-                        module=match.group(1),
-                        name=None,
+                        module=module,
+                        name=self._text(child),
                         alias=None,
-                        line_number=line_number,
-                        is_from=False,
+                        line_number=self._line_start(child),
+                        is_from=True,
                     )
                 )
-            for match in re.finditer(
-                r"\bconst\s+(\w+)\s*=\s*require\(['\"]([^'\"]+)['\"]\)", line
-            ):
-                alias, module = match.groups()
-                self.imports.append(
+            elif child_type == "named_imports":
+                records.extend(self._named_import_records(module, child))
+            elif child_type == "namespace_import":
+                alias = self._first_identifier_text(child)
+                records.append(
                     ImportRecord(
                         module=module,
                         name=None,
                         alias=alias,
-                        line_number=line_number,
+                        line_number=self._line_start(child),
                         is_from=False,
                     )
                 )
+        return tuple(records)
 
-    def _collect_symbols(self) -> None:
-        class_ranges: list[tuple[str, int, int]] = []
-        class_pattern = re.compile(
-            r"^\s*(?:export\s+default\s+|export\s+)?class\s+(\w+)(?:\s+extends\s+([\w.]+))?",
-            re.MULTILINE,
-        )
-        for match in class_pattern.finditer(self.source):
-            name = match.group(1)
-            start = self._line_for_offset(match.start())
-            end = self._block_end_line(match.end())
-            class_ranges.append((name, start, end))
-            self._add_symbol(name, SymbolKind.CLASS, start, end, self._line_text(start))
-            if match.group(2):
-                self.references.append(
-                    ReferenceRecord(
-                        source_qualified_name=self._qualified_name(name),
-                        target_name=match.group(2).split(".")[-1],
-                        line_number=start,
+    def _named_import_records(self, module: str, node: Node) -> tuple[ImportRecord, ...]:
+        records: list[ImportRecord] = []
+        for specifier in _named_children(node):
+            if _node_type(specifier) != "import_specifier":
+                continue
+            identifiers = [
+                self._text(child)
+                for child in _named_children(specifier)
+                if _node_type(child) in {"identifier", "property_identifier", "type_identifier"}
+            ]
+            if not identifiers:
+                continue
+            records.append(
+                ImportRecord(
+                    module=module,
+                    name=identifiers[0],
+                    alias=identifiers[1] if len(identifiers) > 1 else None,
+                    line_number=self._line_start(specifier),
+                    is_from=True,
+                )
+            )
+        return tuple(records)
+
+    def _parse_require_declaration(self, node: Node) -> tuple[ImportRecord, ...]:
+        records: list[ImportRecord] = []
+        for declarator in _named_children(node):
+            if _node_type(declarator) != "variable_declarator":
+                continue
+            name = _field_child(declarator, "name")
+            value = _field_child(declarator, "value")
+            if name is None or value is None or _node_type(value) != "call_expression":
+                continue
+            function_node = _field_child(value, "function")
+            if self._text(function_node) != "require":
+                continue
+            module = self._first_argument_string(value)
+            if module:
+                records.append(
+                    ImportRecord(
+                        module=module,
+                        name=None,
+                        alias=self._text(name),
+                        line_number=self._line_start(declarator),
+                        is_from=False,
                     )
                 )
+        return tuple(records)
 
-        function_pattern = re.compile(
-            r"^\s*(?:export\s+default\s+|export\s+)?(?:async\s+)?function\s+(\w+)\s*\(",
-            re.MULTILINE,
+    def _process_block(self, node: Node, parent_parts: tuple[str, ...]) -> None:
+        for child in _named_children(node):
+            self._process_statement(child, parent_parts)
+
+    def _process_statement(self, node: Node, parent_parts: tuple[str, ...]) -> None:
+        node_type = _node_type(node)
+        if node_type == "export_statement":
+            self._process_block(node, parent_parts)
+            return
+        if node_type in {"class", "class_declaration"}:
+            self._handle_class(node, parent_parts)
+            return
+        if node_type in {"function", "function_declaration"}:
+            self._handle_function(node, parent_parts, SymbolKind.FUNCTION)
+            return
+        if node_type in {"lexical_declaration", "variable_declaration"}:
+            self._handle_variable_declaration(node, parent_parts)
+            return
+        self._process_block(node, parent_parts)
+
+    def _handle_class(self, node: Node, parent_parts: tuple[str, ...]) -> None:
+        name_node = _field_child(node, "name") or self._first_named_child_of_type(
+            node, {"identifier", "type_identifier"}
         )
-        for match in function_pattern.finditer(self.source):
-            name = match.group(1)
-            start = self._line_for_offset(match.start())
-            self._add_symbol(name, SymbolKind.FUNCTION, start, self._block_end_line(match.end()), self._line_text(start))
-
-        arrow_pattern = re.compile(
-            r"^\s*(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>",
-            re.MULTILINE,
+        if name_node is None:
+            return
+        name = self._text(name_node)
+        qualified_name = ".".join((self.module_name, *parent_parts, name))
+        self._add_symbol(
+            name,
+            qualified_name,
+            SymbolKind.CLASS,
+            node,
+            parent_qualified_name=self._parent_qualified_name(parent_parts),
         )
-        for match in arrow_pattern.finditer(self.source):
-            name = match.group(1)
-            start = self._line_for_offset(match.start())
-            self._add_symbol(name, SymbolKind.FUNCTION, start, self._block_end_line(match.end()), self._line_text(start))
+        for base_name in self._class_base_names(node):
+            self.references.append(
+                ReferenceRecord(
+                    source_qualified_name=qualified_name,
+                    target_name=base_name,
+                    line_number=self._line_start(node),
+                )
+            )
+        body = _field_child(node, "body")
+        if body is not None:
+            for child in _named_children(body):
+                if _node_type(child) == "method_definition":
+                    self._handle_method(child, (*parent_parts, name))
 
-        route_pattern = re.compile(
-            r"\b(?:app|router)\.(get|post|put|patch|delete|use)\s*\(\s*['\"]([^'\"]+)['\"]",
-            re.IGNORECASE,
+    def _handle_function(
+        self,
+        node: Node,
+        parent_parts: tuple[str, ...],
+        kind: SymbolKind,
+        *,
+        explicit_name: str | None = None,
+        symbol_node: Node | None = None,
+    ) -> None:
+        name_node = _field_child(node, "name")
+        name = explicit_name or (self._text(name_node) if name_node is not None else "")
+        if not name:
+            return
+        target_node = symbol_node or node
+        qualified_name = ".".join((self.module_name, *parent_parts, name))
+        self._add_symbol(
+            name,
+            qualified_name,
+            kind,
+            target_node,
+            parent_qualified_name=self._parent_qualified_name(parent_parts),
         )
-        for match in route_pattern.finditer(self.source):
-            method, route = match.groups()
-            start = self._line_for_offset(match.start())
-            name = "route_" + method.lower() + "_" + slug_name(route)
-            self._add_symbol(name, SymbolKind.FUNCTION, start, self._block_end_line(match.end()), self._line_text(start))
+        body = _field_child(node, "body") or target_node
+        self._collect_calls(owner_qualified_name=qualified_name, root=body)
 
-        test_pattern = re.compile(r"\b(describe|it|test)\s*\(\s*['\"]([^'\"]+)['\"]")
-        for match in test_pattern.finditer(self.source):
-            kind, title = match.groups()
-            start = self._line_for_offset(match.start())
-            name = kind + "_" + slug_name(title)
-            self._add_symbol(name, SymbolKind.FUNCTION, start, self._block_end_line(match.end()), self._line_text(start))
+    def _handle_method(self, node: Node, parent_parts: tuple[str, ...]) -> None:
+        name_node = _field_child(node, "name") or self._first_named_child_of_type(
+            node,
+            {"identifier", "private_property_identifier", "property_identifier"},
+        )
+        if name_node is None:
+            return
+        self._handle_function(
+            node,
+            parent_parts,
+            SymbolKind.METHOD,
+            explicit_name=self._text(name_node).removeprefix("#"),
+        )
 
-        method_pattern = re.compile(r"^\s{2,}(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{", re.MULTILINE)
-        for match in method_pattern.finditer(self.source):
-            name = match.group(1)
-            start = self._line_for_offset(match.start())
-            parent = class_parent_for_line(class_ranges, start)
-            if not parent:
+    def _handle_variable_declaration(self, node: Node, parent_parts: tuple[str, ...]) -> None:
+        for declarator in _named_children(node):
+            if _node_type(declarator) != "variable_declarator":
                 continue
-            self._add_symbol(
-                name,
-                SymbolKind.METHOD,
-                start,
-                self._block_end_line(match.end()),
-                self._line_text(start),
-                parent=parent,
+            name_node = _field_child(declarator, "name")
+            value_node = _field_child(declarator, "value")
+            if name_node is None or value_node is None:
+                continue
+            if _node_type(value_node) in {"arrow_function", "function", "function_expression"}:
+                self._handle_function(
+                    value_node,
+                    parent_parts,
+                    SymbolKind.FUNCTION,
+                    explicit_name=self._text(name_node),
+                    symbol_node=declarator,
+                )
+
+    def _collect_route_and_test_symbols(self, root: Node) -> None:
+        for call_node in self._iter_nodes(root):
+            if _node_type(call_node) != "call_expression":
+                continue
+            display, target_name = self._call_target(call_node)
+            route = route_symbol_name(display, self._first_argument_string(call_node))
+            if route:
+                self._add_synthetic_symbol(route, call_node)
+                continue
+            if target_name in TEST_CALLEES:
+                title = self._first_argument_string(call_node)
+                if title:
+                    self._add_synthetic_symbol(f"{target_name}_{slug_name(title)}", call_node)
+
+    def _add_synthetic_symbol(self, name: str, node: Node) -> None:
+        qualified_name = f"{self.module_name}.{name}"
+        if self._add_symbol(name, qualified_name, SymbolKind.FUNCTION, node):
+            self._collect_calls(owner_qualified_name=qualified_name, root=node)
+
+    def _collect_calls(self, *, owner_qualified_name: str, root: Node) -> None:
+        for call_node in self._iter_non_nested_nodes(root, {"call_expression"}):
+            display, target_name = self._call_target(call_node)
+            if not target_name or target_name in CONTROL_FLOW_CALLEES:
+                continue
+            self.calls.append(
+                CallRecord(
+                    source_qualified_name=owner_qualified_name,
+                    target_name=target_name,
+                    display_name=display,
+                    line_number=self._line_start(call_node),
+                    arguments=self._call_arguments(call_node),
+                )
             )
 
-    def _collect_calls(self) -> None:
-        symbols = sorted(self.symbols, key=lambda symbol: symbol.line_start)
-        if not symbols:
-            return
-        for symbol in symbols:
-            body = "\n".join(self.lines[symbol.line_start - 1 : symbol.line_end])
-            for match in re.finditer(r"(?<!function\s)\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\(", body):
-                display = match.group(1)
-                target = call_target_name(display)
-                if target in {"if", "for", "while", "switch", "catch", "return"}:
-                    continue
-                self.calls.append(
-                    CallRecord(
-                        source_qualified_name=symbol.qualified_name,
-                        target_name=target,
-                        display_name=display,
-                        line_number=symbol.line_start + body[: match.start()].count("\n"),
-                        arguments=(),
-                    )
-                )
+    def _call_target(self, call_node: Node) -> tuple[str, str]:
+        function_node = _field_child(call_node, "function")
+        if function_node is None:
+            return "", ""
+        display = self._text(function_node)
+        if _node_type(function_node) == "member_expression":
+            children = _named_children(function_node)
+            target = self._text(children[-1]) if children else display.rsplit(".", 1)[-1]
+            owner = self._text(children[0]) if children else ""
+            if owner in HTTP_ROUTE_OWNERS and target.lower() in HTTP_ROUTE_METHODS:
+                return display, "route_" + target.lower()
+            return display, target
+        return display, display
+
+    def _call_arguments(self, call_node: Node) -> tuple[str, ...]:
+        arguments_node = _field_child(call_node, "arguments")
+        if arguments_node is None:
+            return ()
+        arguments: list[str] = []
+        for child in _named_children(arguments_node):
+            text = self._text(child).strip()
+            if text:
+                arguments.append(text)
+        return tuple(arguments)
+
+    def _first_argument_string(self, call_node: Node) -> str:
+        arguments_node = _field_child(call_node, "arguments")
+        if arguments_node is None:
+            return ""
+        first = next(
+            (child for child in _named_children(arguments_node) if _node_type(child) == "string"),
+            None,
+        )
+        return self._string_value(first) if first is not None else ""
+
+    def _module_string(self, node: Node) -> str:
+        strings = [child for child in _named_children(node) if _node_type(child) == "string"]
+        return self._string_value(strings[-1]) if strings else ""
+
+    def _string_value(self, node: Node | None) -> str:
+        if node is None:
+            return ""
+        fragments = [
+            self._text(child)
+            for child in _named_children(node)
+            if _node_type(child) in {"string_fragment", "template_chars"}
+        ]
+        if fragments:
+            return "".join(fragments)
+        return self._text(node).strip("'\"`")
+
+    def _class_base_names(self, node: Node) -> tuple[str, ...]:
+        heritage = next(
+            (child for child in _named_children(node) if _node_type(child) == "class_heritage"),
+            None,
+        )
+        if heritage is None:
+            return ()
+        names: list[str] = []
+        for child in self._iter_nodes(heritage):
+            if _node_type(child) in {"identifier", "type_identifier"}:
+                names.append(self._text(child).rsplit(".", 1)[-1])
+        return tuple(dict.fromkeys(names))
 
     def _add_symbol(
         self,
         name: str,
+        qualified_name: str,
         kind: SymbolKind,
-        line_start: int,
-        line_end: int,
-        signature: str,
+        node: Node,
         *,
-        parent: str | None = None,
-    ) -> None:
-        qualified_name = self._qualified_name(name, parent=parent)
+        parent_qualified_name: str | None = None,
+    ) -> bool:
         if any(symbol.qualified_name == qualified_name for symbol in self.symbols):
-            return
+            return False
         self.symbols.append(
             SymbolRecord(
                 name=name,
                 qualified_name=qualified_name,
                 kind=kind,
                 module=self.module_name,
-                line_start=line_start,
-                line_end=max(line_start, line_end),
-                col_start=0,
-                col_end=len(signature),
-                signature=signature.strip() or None,
-                parent_qualified_name=self._qualified_name(parent) if parent else None,
+                line_start=self._line_start(node),
+                line_end=self._line_end(node),
+                col_start=self._col_start(node),
+                col_end=self._col_end(node),
+                signature=self._header(node),
+                parent_qualified_name=parent_qualified_name,
             )
         )
+        return True
 
-    def _qualified_name(self, name: str | None, *, parent: str | None = None) -> str:
-        if not name:
-            return self.module_name
-        if parent:
-            return ".".join((self.module_name, parent, name))
-        return ".".join((self.module_name, name))
+    def _header(self, node: Node) -> str:
+        body = _field_child(node, "body")
+        end_byte = _start_byte(body) if body is not None else _end_byte(node)
+        header = self.content[_start_byte(node) : end_byte].decode("utf-8", errors="replace")
+        first_line = header.splitlines()[0] if header.splitlines() else header
+        return first_line.strip().removesuffix("{").strip()
 
-    def _line_for_offset(self, offset: int) -> int:
-        return self.source.count("\n", 0, offset) + 1
+    def _parent_qualified_name(self, parent_parts: tuple[str, ...]) -> str | None:
+        if not parent_parts:
+            return None
+        return ".".join((self.module_name, *parent_parts))
 
-    def _line_text(self, line_number: int) -> str:
-        if line_number < 1 or line_number > len(self.lines):
-            return ""
-        return self.lines[line_number - 1].strip()
+    def _iter_nodes(self, node: Node) -> tuple[Node, ...]:
+        found: list[Node] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            found.append(current)
+            stack.extend(reversed(_named_children(current)))
+        return tuple(found)
 
-    def _block_end_line(self, offset: int) -> int:
-        depth = 0
-        started = False
-        for index in range(offset, len(self.source)):
-            char = self.source[index]
-            if char == "{":
-                depth += 1
-                started = True
-            elif char == "}":
-                depth -= 1
-                if started and depth <= 0:
-                    return self._line_for_offset(index)
-        return self._line_for_offset(offset)
-
-
-def imported_names(imported: str) -> list[tuple[str | None, str | None]]:
-    text = imported.strip()
-    if not text:
-        return [(None, None)]
-    results: list[tuple[str | None, str | None]] = []
-    default = text.split(",", 1)[0].strip()
-    if default and not default.startswith(("{", "*")):
-        results.append((default, None))
-    brace_match = re.search(r"\{([^}]+)\}", text)
-    if brace_match:
-        for part in brace_match.group(1).split(","):
-            clean = part.strip()
-            if not clean:
+    def _iter_non_nested_nodes(self, root: Node, wanted_types: set[str]) -> tuple[Node, ...]:
+        found: list[Node] = []
+        stack = list(reversed(_named_children(root)))
+        while stack:
+            current = stack.pop()
+            current_type = _node_type(current)
+            if current is not root and current_type in {
+                "arrow_function",
+                "class",
+                "class_declaration",
+                "function",
+                "function_declaration",
+                "function_expression",
+                "method_definition",
+            }:
                 continue
-            if " as " in clean:
-                name, alias = [piece.strip() for piece in clean.split(" as ", 1)]
-            else:
-                name, alias = clean, None
-            results.append((name, alias))
-    namespace_match = re.search(r"\*\s+as\s+(\w+)", text)
-    if namespace_match:
-        results.append((None, namespace_match.group(1)))
-    return results or [(None, None)]
+            if current_type in wanted_types:
+                found.append(current)
+            stack.extend(reversed(_named_children(current)))
+        return tuple(found)
+
+    def _first_identifier_text(self, node: Node) -> str | None:
+        child = self._first_named_child_of_type(
+            node,
+            {"identifier", "property_identifier", "type_identifier"},
+        )
+        return self._text(child) if child is not None else None
+
+    def _first_named_child_of_type(self, node: Node, node_types: set[str]) -> Node | None:
+        return next((child for child in _named_children(node) if _node_type(child) in node_types), None)
+
+    def _text(self, node: Node | None) -> str:
+        if node is None:
+            return ""
+        return self.content[_start_byte(node) : _end_byte(node)].decode("utf-8", errors="replace")
+
+    def _line_start(self, node: Node) -> int:
+        return _point_row(_start_point(node)) + 1
+
+    def _line_end(self, node: Node) -> int:
+        return _point_row(_end_point(node)) + 1
+
+    def _col_start(self, node: Node) -> int:
+        return _point_column(_start_point(node)) + 1
+
+    def _col_end(self, node: Node) -> int:
+        return _point_column(_end_point(node)) + 1
 
 
-def class_parent_for_line(class_ranges: list[tuple[str, int, int]], line_number: int) -> str | None:
-    for name, start, end in sorted(class_ranges, key=lambda item: item[1], reverse=True):
-        if start < line_number <= end:
-            return name
-    return None
-
-
-def call_target_name(display: str) -> str:
-    if "." not in display:
-        return display
+def route_symbol_name(display: str, first_argument: str) -> str:
+    if not first_argument or "." not in display:
+        return ""
     owner, method = display.rsplit(".", 1)
-    if owner in {"app", "router"} and method.lower() in {"get", "post", "put", "patch", "delete", "use"}:
-        return "route_" + method.lower()
-    return method
+    if owner not in HTTP_ROUTE_OWNERS or method.lower() not in HTTP_ROUTE_METHODS:
+        return ""
+    return "route_" + method.lower() + "_" + slug_name(first_argument)
 
 
 def slug_name(value: str) -> str:
@@ -294,3 +524,63 @@ def slug_name(value: str) -> str:
             pieces.append("_")
     slug = "".join(pieces).strip("_")
     return slug[:48] or "unnamed"
+
+
+def _field_child(node: Node, name: str) -> Node | None:
+    child_by_field_name = getattr(node, "child_by_field_name", None)
+    if child_by_field_name is None:
+        return None
+    return child_by_field_name(name)
+
+
+def _member_value(obj: Any, *names: str) -> Any:
+    for name in names:
+        if hasattr(obj, name):
+            value = getattr(obj, name)
+            return value() if callable(value) else value
+    return None
+
+
+def _node_type(node: Node) -> str:
+    return str(_member_value(node, "type", "kind") or "")
+
+
+def _named_children(node: Node) -> tuple[Node, ...]:
+    children = getattr(node, "named_children", None)
+    if children is not None:
+        value = children() if callable(children) else children
+        return tuple(value)
+    count = _member_value(node, "named_child_count") or 0
+    return tuple(node.named_child(index) for index in range(int(count)))
+
+
+def _start_byte(node: Node | None) -> int:
+    if node is None:
+        return 0
+    return int(_member_value(node, "start_byte") or 0)
+
+
+def _end_byte(node: Node | None) -> int:
+    if node is None:
+        return 0
+    return int(_member_value(node, "end_byte") or 0)
+
+
+def _start_point(node: Node) -> Any:
+    return _member_value(node, "start_point", "start_position")
+
+
+def _end_point(node: Node) -> Any:
+    return _member_value(node, "end_point", "end_position")
+
+
+def _point_row(point: Any) -> int:
+    if hasattr(point, "row"):
+        return int(point.row)
+    return int(point[0])
+
+
+def _point_column(point: Any) -> int:
+    if hasattr(point, "column"):
+        return int(point.column)
+    return int(point[1])

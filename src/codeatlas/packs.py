@@ -29,6 +29,8 @@ def context_pack(
     retrieval = RetrievalEngine()
     memory = MemoryQueryEngine()
     code_result = retrieval.retrieve(repo_path, query, depth=2, max_tokens=max_tokens)
+    warnings: list[str] = []
+    memory_unavailable: dict[str, str] | None = None
     snippets = [
         {
             "file_path": snippet.file_path,
@@ -44,9 +46,11 @@ def context_pack(
         memory_context = memory.compressed_context(repo_path, query, max_tokens=max_tokens)
         evidence = [asdict(ref) for ref in memory_context.evidence[:10]]
         ownership = [asdict(entry) for entry in memory_context.ownership[:5]]
-    except Exception:
+    except Exception as exc:
         evidence = []
         ownership = []
+        memory_unavailable = {"reason": str(exc)}
+        warnings.append(f"Repository memory context unavailable: {exc}")
 
     files = list(dict.fromkeys(snippet["file_path"] for snippet in snippets if snippet["file_path"]))
     pack = {
@@ -60,6 +64,8 @@ def context_pack(
         "verification": verification_plan(repo_path, task=query),
         "rule_findings": run_rule_checks(repo_path, limit=20)["findings"],
         "source_outline": source_outline(repo_path, query, limit=8),
+        "warnings": warnings,
+        "memory_unavailable": memory_unavailable,
         "token_report": code_result.token_report.__dict__
         | {"savings_percent": code_result.token_report.savings_percent},
     }
@@ -107,6 +113,8 @@ def render_context_pack_markdown(pack: dict[str, Any]) -> str:
         )
 
     lines.extend(["", "## Verification"])
+    for warning in pack.get("warnings", []):
+        lines.append(f"- Warning: {warning}")
     for command in pack.get("verification", {}).get("commands", []):
         lines.append(f"- `{command['command']}` - {command['reason']}")
 

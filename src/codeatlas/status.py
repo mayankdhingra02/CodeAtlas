@@ -21,10 +21,12 @@ def index_status(repo_path: str | Path) -> dict[str, Any]:
         "indexed": paths.database_path.exists(),
         "artifact_exists": paths.graph_artifact_path.exists(),
         "dirty_files": 0,
+        "dirty_files_count": 0,
         "new_files": 0,
         "deleted_files": 0,
         "stale": True,
         "last_indexed_at": None,
+        "index_age_seconds": None,
         "parser_errors": 0,
         "files_skipped": 0,
         "supported_languages": [],
@@ -47,10 +49,12 @@ def index_status(repo_path: str | Path) -> dict[str, Any]:
         new = len(set(current) - set(previous))
         deleted = len(set(previous) - set(current))
         last_indexed = stats.get("last_indexed_at")
+        index_age = index_age_seconds(last_indexed)
         payload.update(
             {
                 "indexed": True,
                 "last_indexed_at": last_indexed,
+                "index_age_seconds": index_age,
                 "files_indexed": int(stats.get("files_indexed") or 0),
                 "symbols": int(stats.get("classes") or 0)
                 + int(stats.get("functions") or 0)
@@ -58,6 +62,7 @@ def index_status(repo_path: str | Path) -> dict[str, Any]:
                 "graph_nodes": int(stats.get("graph_nodes") or 0),
                 "graph_edges": int(stats.get("graph_edges") or 0),
                 "dirty_files": dirty,
+                "dirty_files_count": dirty,
                 "new_files": new,
                 "deleted_files": deleted,
                 "stale": bool(dirty or new or deleted),
@@ -74,3 +79,15 @@ def index_status(repo_path: str | Path) -> dict[str, Any]:
     finally:
         store.close()
     return payload
+
+
+def index_age_seconds(last_indexed_at: Any) -> int | None:
+    if not last_indexed_at:
+        return None
+    try:
+        indexed_at = datetime.fromisoformat(str(last_indexed_at))
+    except ValueError:
+        return None
+    if indexed_at.tzinfo is None:
+        indexed_at = indexed_at.replace(tzinfo=UTC)
+    return max(0, int((datetime.now(UTC) - indexed_at).total_seconds()))

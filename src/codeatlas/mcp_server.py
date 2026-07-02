@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
 from .analysis import dead_code, http_confidence_summary, route_summary, structural_query
 from .artifacts import export_graph_artifact, import_graph_artifact
+from .config import CodeAtlasPaths, resolve_repo_root
 from .external_index import import_external_index
 from .memory import MemoryQueryEngine
 from .packs import context_pack, render_context_pack
@@ -17,7 +20,25 @@ from .verification import verification_plan
 from .visualization import VisualizationService
 
 
-def create_tool_handlers(repo_path: str | Path = ".") -> dict[str, Callable[..., Any]]:
+AGENT_TOOL_NAMES = (
+    "get_code_context",
+    "get_context_pack",
+    "query_code_graph",
+    "get_index_status",
+    "get_verification_plan",
+    "run_rules",
+    "get_source_outline",
+    "repository_stats",
+)
+STALENESS_CACHE_TTL_SECONDS = 15.0
+_STALENESS_CACHE: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+
+
+def create_tool_handlers(
+    repo_path: str | Path = ".",
+    *,
+    profile: str = "agent",
+) -> dict[str, Callable[..., Any]]:
     engine = RetrievalEngine()
     memory = MemoryQueryEngine()
     visualization = VisualizationService()
@@ -30,6 +51,9 @@ def create_tool_handlers(repo_path: str | Path = ".") -> dict[str, Callable[...,
             "token_report": result.token_report.__dict__
             | {"savings_percent": result.token_report.savings_percent},
             "timings": result.timings.__dict__,
+            "warm_retrieval_ms": result.timings.total_ms,
+            "warm_retrieval_budget_ms": 1000,
+            "warm_retrieval_status": "ok" if result.timings.total_ms <= 1000 else "slow",
         }
 
     def find_symbol(symbol_name: str) -> list[dict[str, Any]]:
@@ -167,7 +191,7 @@ def create_tool_handlers(repo_path: str | Path = ".") -> dict[str, Callable[...,
     def import_code_index(input_path: str, index_format: str = "auto") -> dict[str, Any]:
         return import_external_index(repo_path, input_path, index_format=index_format)
 
-    return {
+    handlers: dict[str, Callable[..., Any]] = {
         "get_code_context": get_code_context,
         "find_symbol": find_symbol,
         "explain_dependencies": explain_dependencies,
@@ -198,12 +222,83 @@ def create_tool_handlers(repo_path: str | Path = ".") -> dict[str, Callable[...,
         "get_source_outline": get_source_outline,
         "import_code_index": import_code_index,
     }
+    normalized_profile = profile.lower().strip()
+    if normalized_profile == "agent":
+        handlers = {name: handlers[name] for name in AGENT_TOOL_NAMES}
+    elif normalized_profile not in {"full", "legacy"}:
+        msg = "Unknown MCP profile. Use 'agent' or 'full'."
+        raise ValueError(msg)
+    return {
+        name: with_agent_staleness_contract(repo_path, handler)
+        for name, handler in handlers.items()
+    }
 
 
-def run_mcp_server(repo_path: str | Path = ".") -> None:
+def with_agent_staleness_contract(
+    repo_path: str | Path,
+    handler: Callable[..., Any],
+) -> Callable[..., Any]:
+    @wraps(handler)
+    def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = handler(*args, **kwargs)
+        return attach_agent_staleness(repo_path, payload)
+
+    return wrapped
+
+
+def attach_agent_staleness(repo_path: str | Path, payload: Any) -> dict[str, Any]:
+    freshness = agent_staleness_payload(repo_path)
+    if isinstance(payload, dict):
+        return payload | freshness
+    return {"items": payload, **freshness}
+
+
+def agent_staleness_payload(repo_path: str | Path) -> dict[str, Any]:
+    cache_key = staleness_cache_key(repo_path)
+    now = time.monotonic()
+    cached = _STALENESS_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, payload = cached
+        if now - cached_at <= STALENESS_CACHE_TTL_SECONDS:
+            return dict(payload)
+    try:
+        status = index_status(repo_path)
+    except Exception as exc:
+        payload = {
+            "index_age_seconds": None,
+            "dirty_files_count": None,
+            "index_stale": True,
+            "index_status_error": str(exc),
+        }
+    else:
+        payload = {
+            "index_age_seconds": status.get("index_age_seconds"),
+            "dirty_files_count": status.get("dirty_files_count", status.get("dirty_files")),
+            "index_stale": bool(status.get("stale", True)),
+            "index_checked_at": status.get("checked_at"),
+        }
+    _STALENESS_CACHE[cache_key] = (now, dict(payload))
+    return payload
+
+
+def staleness_cache_key(repo_path: str | Path) -> tuple[str, int]:
+    repo_root = resolve_repo_root(repo_path)
+    database_path = CodeAtlasPaths(repo_root).database_path
+    try:
+        database_mtime_ns = database_path.stat().st_mtime_ns
+    except FileNotFoundError:
+        database_mtime_ns = 0
+    return (str(repo_root), database_mtime_ns)
+
+
+def clear_agent_staleness_cache() -> None:
+    _STALENESS_CACHE.clear()
+
+
+def run_mcp_server(repo_path: str | Path = ".", *, profile: str = "agent") -> None:
     FastMCP = _load_fastmcp()
     mcp = FastMCP("CodeAtlas")
-    handlers = create_tool_handlers(repo_path)
+    handlers = create_tool_handlers(repo_path, profile=profile)
 
     for name, handler in handlers.items():
         mcp.tool(name=name)(handler)

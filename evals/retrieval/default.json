@@ -1,0 +1,407 @@
+{
+  "version": 1,
+  "repositories": [
+    {
+      "id": "codeatlas-self",
+      "path": "../..",
+      "required": true
+    },
+    {
+      "id": "requests",
+      "path": "../../.codeatlas/eval-repos/requests",
+      "git_url": "https://github.com/psf/requests.git",
+      "ref": "v2.32.3",
+      "required": false
+    },
+    {
+      "id": "click",
+      "path": "../../.codeatlas/eval-repos/click",
+      "git_url": "https://github.com/pallets/click.git",
+      "ref": "8.1.7",
+      "required": false
+    },
+    {
+      "id": "rich",
+      "path": "../../.codeatlas/eval-repos/rich",
+      "git_url": "https://github.com/Textualize/rich.git",
+      "ref": "v13.7.1",
+      "required": false
+    }
+  ],
+  "suites": [
+    {
+      "id": "codeatlas-core",
+      "repository": "codeatlas-self",
+      "k": 5,
+      "depth": 2,
+      "max_tokens": 10000,
+      "min_file_recall": 1.0,
+      "min_symbol_recall": 1.0,
+      "queries": [
+        {
+          "query": "RepositoryIndexer",
+          "expected_files": ["src/codeatlas/indexer.py"]
+        },
+        {
+          "query": "GraphStore",
+          "expected_files": ["src/codeatlas/storage.py"],
+          "expected_symbols": ["src.codeatlas.storage.GraphStore"]
+        },
+        {
+          "query": "RetrievalEngine",
+          "expected_files": ["src/codeatlas/retrieval.py"]
+        },
+        {
+          "query": "JavaScriptParser",
+          "expected_files": ["src/codeatlas/parsers/javascript.py"],
+          "expected_symbols": ["src.codeatlas.parsers.javascript.JavaScriptParser"]
+        },
+        {
+          "query": "PythonParser",
+          "expected_files": ["src/codeatlas/parsers/python.py"],
+          "expected_symbols": ["src.codeatlas.parsers.python.PythonParser"]
+        },
+        {
+          "query": "context_pack",
+          "expected_files": ["src/codeatlas/packs.py"],
+          "expected_symbols": ["src.codeatlas.packs.context_pack"]
+        },
+        {
+          "query": "repo_briefing",
+          "expected_files": ["src/codeatlas/briefing.py"],
+          "expected_symbols": ["src.codeatlas.briefing.repo_briefing"]
+        },
+        {
+          "query": "VisualizationService",
+          "expected_files": ["src/codeatlas/visualization.py"]
+        },
+        {
+          "query": "create_tool_handlers",
+          "expected_files": ["src/codeatlas/mcp_server.py"],
+          "expected_symbols": ["src.codeatlas.mcp_server.create_tool_handlers"]
+        },
+        {
+          "query": "dead_code",
+          "expected_files": ["src/codeatlas/analysis.py"],
+          "expected_symbols": ["src.codeatlas.analysis.dead_code"]
+        },
+        {
+          "query": "iter_source_files",
+          "expected_files": ["src/codeatlas/scanner.py"],
+          "expected_symbols": ["src.codeatlas.scanner.iter_source_files"]
+        },
+        {
+          "query": "import_external_index",
+          "expected_files": ["src/codeatlas/external_index.py"],
+          "expected_symbols": ["src.codeatlas.external_index.import_external_index"]
+        },
+        {
+          "query": "verification_plan",
+          "expected_files": ["src/codeatlas/verification.py"],
+          "expected_symbols": ["src.codeatlas.verification.verification_plan"]
+        },
+        {
+          "query": "source_outline",
+          "expected_files": ["src/codeatlas/source.py"],
+          "expected_symbols": ["src.codeatlas.source.source_outline"]
+        },
+        {
+          "query": "run_rule_checks",
+          "expected_files": ["src/codeatlas/rules.py"],
+          "expected_symbols": ["src.codeatlas.rules.run_rule_checks"]
+        },
+        {
+          "query": "index_status",
+          "expected_files": ["src/codeatlas/status.py"],
+          "expected_symbols": ["src.codeatlas.status.index_status"]
+        },
+        {
+          "query": "export_graph_artifact",
+          "expected_files": ["src/codeatlas/artifacts.py"],
+          "expected_symbols": ["src.codeatlas.artifacts.export_graph_artifact"]
+        },
+        {
+          "query": "import_graph_artifact",
+          "expected_files": ["src/codeatlas/artifacts.py"],
+          "expected_symbols": ["src.codeatlas.artifacts.import_graph_artifact"]
+        },
+        {
+          "query": "cached_workflow",
+          "expected_files": ["src/codeatlas/workflow_cache.py"],
+          "expected_symbols": ["src.codeatlas.workflow_cache.cached_workflow"]
+        },
+        {
+          "query": "MemoryQueryEngine",
+          "expected_files": ["src/codeatlas/memory.py"]
+        },
+        {
+          "query": "Benchmarker",
+          "expected_files": ["src/codeatlas/benchmark.py"]
+        },
+        {
+          "query": "render_context_pack",
+          "expected_files": ["src/codeatlas/packs.py"],
+          "expected_symbols": ["src.codeatlas.packs.render_context_pack"]
+        },
+        {
+          "query": "CodeAtlasPaths",
+          "expected_files": ["src/codeatlas/config.py"],
+          "expected_symbols": ["src.codeatlas.config.CodeAtlasPaths"]
+        },
+        {
+          "query": "ParserRegistry",
+          "expected_files": ["src/codeatlas/parsers/registry.py"],
+          "expected_symbols": ["src.codeatlas.parsers.registry.ParserRegistry"]
+        },
+        {
+          "query": "GraphService",
+          "expected_files": ["src/codeatlas/graph.py"]
+        },
+        {
+          "query": "route_summary",
+          "expected_files": ["src/codeatlas/analysis.py"],
+          "expected_symbols": ["src.codeatlas.analysis.route_summary"]
+        },
+        {
+          "query": "http_confidence_summary",
+          "expected_files": ["src/codeatlas/analysis.py"],
+          "expected_symbols": ["src.codeatlas.analysis.http_confidence_summary"]
+        },
+        {
+          "query": "structural_query",
+          "expected_files": ["src/codeatlas/analysis.py"],
+          "expected_symbols": ["src.codeatlas.analysis.structural_query"]
+        },
+        {
+          "query": "render_visualization_app",
+          "expected_files": ["src/codeatlas/visualization.py"],
+          "expected_symbols": ["src.codeatlas.visualization.render_visualization_app"]
+        },
+        {
+          "query": "create_visualization_server",
+          "expected_files": ["src/codeatlas/visualization.py"]
+        },
+        {
+          "query": "find_available_port",
+          "expected_files": ["src/codeatlas/visualization.py"],
+          "expected_symbols": ["src.codeatlas.visualization.find_available_port"]
+        },
+        {
+          "query": "build_agent_context_markdown",
+          "expected_files": ["src/codeatlas/visualization.py"],
+          "expected_symbols": ["src.codeatlas.visualization.build_agent_context_markdown"]
+        },
+        {
+          "query": "SymbolResolutionIndex",
+          "expected_files": ["src/codeatlas/storage.py"]
+        },
+        {
+          "query": "normalize_import_module",
+          "expected_files": ["src/codeatlas/storage.py"],
+          "expected_symbols": ["src.codeatlas.storage.normalize_import_module"]
+        },
+        {
+          "query": "edge_occurrence_count",
+          "expected_files": ["src/codeatlas/visualization.py"],
+          "expected_symbols": ["src.codeatlas.visualization.edge_occurrence_count"]
+        },
+        {
+          "query": "edge_occurrence_metadata",
+          "expected_files": ["src/codeatlas/storage.py"],
+          "expected_symbols": ["src.codeatlas.storage.edge_occurrence_metadata"]
+        },
+        {
+          "query": "files_by_paths",
+          "expected_files": ["src/codeatlas/storage.py"],
+          "expected_symbols": ["src.codeatlas.storage.GraphStore.files_by_paths"]
+        },
+        {
+          "query": "estimate_tokens_for_size",
+          "expected_files": ["src/codeatlas/models.py"],
+          "expected_symbols": ["src.codeatlas.models.estimate_tokens_for_size"]
+        },
+        {
+          "query": "RepositoryMemoryIndexer",
+          "expected_files": ["src/codeatlas/memory.py"]
+        },
+        {
+          "query": "compressed_context",
+          "expected_files": ["src/codeatlas/memory.py"],
+          "expected_symbols": ["src.codeatlas.memory.MemoryQueryEngine.compressed_context"]
+        },
+        {
+          "query": "agent_context",
+          "expected_files": ["src/codeatlas/visualization.py"],
+          "expected_symbols": ["src.codeatlas.visualization.VisualizationService.agent_context"]
+        },
+        {
+          "query": "_write_resolution_edges",
+          "expected_files": ["src/codeatlas/indexer.py"],
+          "expected_symbols": ["src.codeatlas.indexer.RepositoryIndexer._write_resolution_edges"]
+        },
+        {
+          "query": "_rank_and_snippet",
+          "expected_files": ["src/codeatlas/retrieval.py"],
+          "expected_symbols": ["src.codeatlas.retrieval.RetrievalEngine._rank_and_snippet"]
+        },
+        {
+          "query": "_text_search_snippets",
+          "expected_files": ["src/codeatlas/retrieval.py"],
+          "expected_symbols": ["src.codeatlas.retrieval.RetrievalEngine._text_search_snippets"]
+        },
+        {
+          "query": "detect_query_intent",
+          "expected_files": ["src/codeatlas/retrieval.py"],
+          "expected_symbols": ["src.codeatlas.retrieval.detect_query_intent"]
+        },
+        {
+          "query": "query_terms",
+          "expected_files": ["src/codeatlas/retrieval.py"],
+          "expected_symbols": ["src.codeatlas.retrieval.query_terms"]
+        },
+        {
+          "query": "read_line_range",
+          "expected_files": ["src/codeatlas/retrieval.py"],
+          "expected_symbols": ["src.codeatlas.retrieval.read_line_range"]
+        },
+        {
+          "query": "trim_to_tokens",
+          "expected_files": ["src/codeatlas/retrieval.py"],
+          "expected_symbols": ["src.codeatlas.retrieval.trim_to_tokens"]
+        },
+        {
+          "query": "schema version mismatch",
+          "expected_files": ["src/codeatlas/storage.py", "src/codeatlas/indexer.py"]
+        },
+        {
+          "query": "minified javascript scanner",
+          "expected_files": ["src/codeatlas/scanner.py", "tests/test_parsers.py"]
+        },
+        {
+          "query": "memory_unavailable context pack",
+          "expected_files": ["src/codeatlas/packs.py", "tests/test_index_retrieval.py"]
+        },
+        {
+          "query": "token baseline snippets files",
+          "expected_files": ["src/codeatlas/retrieval.py", "tests/test_index_retrieval.py"]
+        },
+        {
+          "query": "edge aggregation metadata lines",
+          "expected_files": ["src/codeatlas/storage.py", "tests/test_index_retrieval.py"]
+        },
+        {
+          "query": "dead code ambiguous unresolved references",
+          "expected_files": ["src/codeatlas/analysis.py"]
+        }
+      ]
+    },
+    {
+      "id": "requests-core",
+      "repository": "requests",
+      "k": 10,
+      "depth": 2,
+      "max_tokens": 10000,
+      "min_file_recall": 0.8,
+      "min_symbol_recall": 0.8,
+      "queries": [
+        {
+          "query": "Session.request",
+          "expected_files": ["src/requests/sessions.py"],
+          "expected_symbols": ["src.requests.sessions.Session.request"]
+        },
+        {
+          "query": "HTTPAdapter.send",
+          "expected_files": ["src/requests/adapters.py"],
+          "expected_symbols": ["src.requests.adapters.HTTPAdapter.send"]
+        },
+        {
+          "query": "PreparedRequest.prepare_url",
+          "expected_files": ["src/requests/models.py"],
+          "expected_symbols": ["src.requests.models.PreparedRequest.prepare_url"]
+        },
+        {
+          "query": "request",
+          "expected_files": ["src/requests/api.py"],
+          "expected_symbols": ["src.requests.api.request"]
+        },
+        {
+          "query": "Response.json",
+          "expected_files": ["src/requests/models.py"],
+          "expected_symbols": ["src.requests.models.Response.json"]
+        }
+      ]
+    },
+    {
+      "id": "click-core",
+      "repository": "click",
+      "k": 10,
+      "depth": 2,
+      "max_tokens": 10000,
+      "min_file_recall": 0.8,
+      "min_symbol_recall": 0.8,
+      "queries": [
+        {
+          "query": "Command.invoke",
+          "expected_files": ["src/click/core.py"],
+          "expected_symbols": ["src.click.core.Command.invoke"]
+        },
+        {
+          "query": "Group.command",
+          "expected_files": ["src/click/core.py"],
+          "expected_symbols": ["src.click.core.Group.command"]
+        },
+        {
+          "query": "Context.invoke",
+          "expected_files": ["src/click/core.py"],
+          "expected_symbols": ["src.click.core.Context.invoke"]
+        },
+        {
+          "query": "echo",
+          "expected_files": ["src/click/utils.py"],
+          "expected_symbols": ["src.click.utils.echo"]
+        },
+        {
+          "query": "Path.convert",
+          "expected_files": ["src/click/types.py"],
+          "expected_symbols": ["src.click.types.Path.convert"]
+        }
+      ]
+    },
+    {
+      "id": "rich-core",
+      "repository": "rich",
+      "k": 10,
+      "depth": 2,
+      "max_tokens": 10000,
+      "min_file_recall": 0.8,
+      "min_symbol_recall": 0.8,
+      "queries": [
+        {
+          "query": "Console.print",
+          "expected_files": ["rich/console.py"],
+          "expected_symbols": ["rich.console.Console.print"]
+        },
+        {
+          "query": "Table.add_row",
+          "expected_files": ["rich/table.py"],
+          "expected_symbols": ["rich.table.Table.add_row"]
+        },
+        {
+          "query": "Progress.add_task",
+          "expected_files": ["rich/progress.py"],
+          "expected_symbols": ["rich.progress.Progress.add_task"]
+        },
+        {
+          "query": "Syntax.highlight",
+          "expected_files": ["rich/syntax.py"],
+          "expected_symbols": ["rich.syntax.Syntax.highlight"]
+        },
+        {
+          "query": "Text.append",
+          "expected_files": ["rich/text.py"],
+          "expected_symbols": ["rich.text.Text.append"]
+        }
+      ]
+    }
+  ]
+}

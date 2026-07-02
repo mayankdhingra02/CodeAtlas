@@ -6,17 +6,16 @@ The goal is to reduce repeated repository reads, improve warm-start retrieval sp
 
 ## Status
 
-This repository contains a working Python-first implementation with early JavaScript and TypeScript support:
+This repository contains a working local-first implementation with Python, JavaScript, and TypeScript support:
 
-- Tree-sitter parser plugin for Python
-- Regex-backed JavaScript and TypeScript parser plugin for components, functions, imports, tests, and route-like handlers
+- Tree-sitter parser plugins for Python, JavaScript, and TypeScript/TSX
 - SQLite graph store under `.codeatlas/index.db`
 - Incremental indexing by file hash
 - Graph-aware context retrieval with token estimates
 - Repository Memory Engine for git history, README/docs, ADRs, RFCs, release notes, and design docs
 - Commit intelligence heuristics for purpose, motivation, impacted components, risk, and architectural impact
 - Repository Time Machine, ownership intelligence, decision lookup, architecture findings, and compressed repository context
-- Local browser visualization for evidence-first architecture, commit-history, compare, diagnostics, and workflow maps
+- Local browser visualization scoped to an evidence-first briefing page and architecture map
 - Agent context packs, verification plans, built-in rule checks, source outlines, graph artifacts, and external index import
 - Typer CLI with Rich output
 - Watchdog-based watch mode
@@ -40,7 +39,7 @@ Repository
   -> Claude Code / Codex
 ```
 
-The core design keeps expensive work in the indexing phase. Retrieval uses the persisted SQLite index, graph traversal, memory evidence, and selected snippet reads. It does not re-scan or re-parse the full repository for normal queries.
+The core design keeps expensive work in the indexing phase. Retrieval uses the persisted SQLite index, graph traversal, memory evidence, and DB-cached snippets. It does not re-scan or re-parse the full repository for normal queries.
 
 ## Project Structure
 
@@ -166,6 +165,9 @@ Artifacts are written into the target repository:
   cache/
 ```
 
+`stats.json` includes parse-quality signals for regression checks, including per-file
+`symbols_per_kloc` and `unresolved_call_ratio` plus repository-level summaries.
+
 Ignored directories include `.git`, `node_modules`, `build`, `dist`, `.venv`, `venv`, `__pycache__`, `coverage`, and `target`.
 
 Run an incremental update:
@@ -180,7 +182,7 @@ Watch for changes:
 codeatlas watch /path/to/repo
 ```
 
-Incremental indexing compares file hashes and only reparses changed files. Deleted files are removed from the SQLite graph.
+Incremental indexing compares file hashes and only reparses changed files. Deleted files are removed from the SQLite graph. Indexed file text and symbol snippets are cached in SQLite, so graph artifacts can still return exact snippets after export/import or source-file moves.
 
 ## Repository Memory Workflow
 
@@ -222,7 +224,7 @@ CodeAtlas also builds a lightweight git nexus from commit co-change history:
 - component hotspots from churn, authors, and files touched
 - ownership links from authors to files/components
 - FTS5-backed evidence search over commit and document memory
-- a local browser map with architecture and commit-history views
+- a local browser map that keeps git evidence available in the briefing and architecture workflows
 
 Review local changes against historical context:
 
@@ -286,13 +288,27 @@ codeatlas export-graph /path/to/repo
 codeatlas import-graph /path/to/repo --overwrite
 ```
 
-Import an external code-intelligence JSON index:
+Import a precise external code-intelligence index:
 
 ```bash
-codeatlas import-index scip-index.json --repo-path /path/to/repo --format scip-json
+scip-python index --project-root /path/to/repo --output /path/to/repo/.codeatlas/index.scip \
+  && codeatlas import-index /path/to/repo/.codeatlas/index.scip \
+    --repo-path /path/to/repo --format scip
+
+scip-typescript index --project-root /path/to/repo --output /path/to/repo/.codeatlas/index.scip \
+  && codeatlas import-index /path/to/repo/.codeatlas/index.scip \
+    --repo-path /path/to/repo --format scip
 ```
 
-The importer accepts a simple generic JSON shape with `symbols` and `edges`, plus SCIP-style JSON with `documents`, document-level `symbols`, relationships, and definition occurrences.
+SCIP protobuf import is the precision layer: imported edges are tagged `resolution_tier=scip`
+with high confidence and can upgrade duplicate fallback edges. The built-in parser still
+creates local fallback edges tagged by provenance such as `exact_qualified`,
+`import_scoped`, `same_module`, `unique_name`, or `unresolved`; these remain useful when no
+external index is available.
+
+The importer also accepts a simple generic JSON shape with `symbols` and `edges`, plus
+SCIP-style JSON with `documents`, document-level `symbols`, relationships, and definition
+occurrences.
 
 ## Local Architecture And Commit Map
 
@@ -302,21 +318,29 @@ Open a repository map in your browser:
 codeatlas serve /path/to/repo
 ```
 
-The command refreshes the code graph and repository memory, starts a local server, and opens a webpage by default. The map has three views:
+The command refreshes the code graph and repository memory, starts a local server, and opens a webpage by default. The browser UI is intentionally scoped to two first-class views:
 
+- Briefing view: a first-time-reader guide that uses README/docs/package metadata when available, but falls back to code-inferred purpose and start-here anchors when a repo has no docs. It turns the index into a start-here path, readable architecture chapters (API, services, scheduler/orchestration, data/model, integrations, tests, docs/config), API/request, startup/config, data/model, test, and git/change flows, glossary-like concepts, and an agent-ready orientation brief. Each item cites repo-owned prose, indexed files, symbols, routes, component edges, or commits.
 - Architecture view: major components, internal imports/calls, external modules/services, service-like nodes, and git co-change links.
-- Commit view: developers, commits, and the components each commit touched.
-- Compare view: two git refs or commits are archived into temporary snapshots, indexed side by side, and annotated with added, removed, or changed architecture. Compare defaults to a change-first view, can reveal unchanged context on demand, can sync or unlock before/after pan and zoom, and includes before/after evidence cards plus a ranked Compare Impact queue.
 
-Use the 2D/3D toggle to switch between a flat force map and a lightweight depth view. Use the left filter rail to hide/show components, common library nodes, and compare specific commit refs. For terminal-only workflows:
+The CLI and MCP surfaces remain the primary interface for deeper workflows such as impact review, context packs, verification plans, rule checks, history, ownership, and external-index import. Use the left filter rail to hide/show components, common library nodes, and connection types. For terminal-only workflows:
 
 ```bash
 codeatlas serve /path/to/repo --no-open --port 8765
 ```
 
-The right rail exposes product workflows for "Where start?", recent changes, risky code, API/data flow, routes, dead code, owners, context packs, rule checks, source outlines, and verification plans. Workflow results render as compact evidence cards so the graph stays a navigation layer instead of the only source of truth. Selecting a node, edge, saved path, or compare impact item centers the camera on that evidence. In compare mode, the Explain action writes a concise diff brief with the most important changed nodes/edges and suggested verification focus. Right-click classification changes show an Undo toast before the config edit becomes old news. Dense maps use level-of-detail rendering: noisy import/reference/dependency edges are bundled with x-count labels while exact edges remain available from the bundle detail panel.
+The right rail exposes product workflows for "First-time brief", "Where start?", recent changes, risky code, API/data flow, routes, dead code, owners, context packs, rule checks, source outlines, and verification plans. Workflow results render as compact evidence cards so the graph stays a navigation layer instead of the only source of truth. Selecting a node, edge, saved path, or briefing item centers the camera on that evidence. Right-click classification changes show an Undo toast before the config edit becomes old news. Dense maps use level-of-detail rendering: noisy import/reference/dependency edges are bundled with x-count labels while exact edges remain available from the bundle detail panel.
+
+The Briefing start screen includes a New Engineer Dashboard with four first-read blocks: "Read these first," "Understand these flows," "Avoid this noise," and "High-risk areas." Briefing cards expose explicit "Why?", "Evidence", and "Open files" sections. Flow cards also include Play flow, which switches to the architecture map, keeps the flow nodes visible through large-repo filters, animates the current edge/node, and syncs each step with evidence in the details panel. File buttons copy the exact path/line and jump back to the owning architecture component when the map can match it.
 
 Workflow results include export buttons for JSON and rendered text/Markdown. Slow workflows are cached under `.codeatlas/cache/workflows/`; the cache is invalidated when the index DB mtime or `.codeatlas.yml` fingerprint changes.
+
+Generate the same first-time-reader briefing in the terminal:
+
+```bash
+codeatlas briefing /path/to/repo
+codeatlas briefing /path/to/repo --json
+```
 
 ## Retrieval Flow
 
@@ -337,7 +361,7 @@ Retrieval:
 1. Finds matching symbols in SQLite.
 2. Traverses nearby graph nodes.
 3. Scores exact matches, callers, callees, inheritance, references, and containment.
-4. Reads only selected snippets.
+4. Reads only selected DB-cached snippets, with live disk reads only as a compatibility fallback.
 5. Stops at the approximate token budget.
 6. Prints baseline, optimized, and savings estimates.
 
@@ -347,7 +371,7 @@ Token estimation uses:
 1 token ~= 4 characters
 ```
 
-The baseline is calculated from indexed files in the same related directories as the returned snippets. The optimized count is calculated from the snippets actually returned.
+The baseline is calculated from the full indexed files that contain the returned snippets. The optimized count is calculated from the snippets actually returned.
 
 ## Graph Design
 
@@ -396,11 +420,12 @@ codeatlas context-pack "task" --repo-path /path/to/repo --format markdown
 codeatlas export-graph /path/to/repo
 codeatlas import-graph /path/to/repo
 codeatlas index-status /path/to/repo
+codeatlas doctor /path/to/repo
 codeatlas query "callers:symbol" --repo-path /path/to/repo
 codeatlas dead-code /path/to/repo
 codeatlas routes /path/to/repo
 codeatlas http-confidence /path/to/repo
-codeatlas install-agent /path/to/repo
+codeatlas install-agent /path/to/repo --agent all
 codeatlas rules /path/to/repo
 codeatlas verify-plan /path/to/repo --base-ref HEAD
 codeatlas outline /path/to/repo --query "query"
@@ -413,50 +438,49 @@ codeatlas serve /path/to/repo
 codeatlas benchmark /path/to/repo --query "query"
 codeatlas watch /path/to/repo
 codeatlas stats /path/to/repo
-codeatlas mcp --repo-path /path/to/repo
+codeatlas mcp --repo-path /path/to/repo --profile agent
 ```
 
 ## MCP Integration
 
-Run:
+Run the reduced agent-facing surface:
 
 ```bash
-codeatlas mcp --repo-path /path/to/repo
+codeatlas mcp --repo-path /path/to/repo --profile agent
 ```
 
 Exposed tools:
 
-- `get_context(query, max_tokens)`
-- `get_history(topic, limit)`
-- `get_architecture(topic, limit)`
-- `get_ownership(topic, limit)`
-- `get_dependencies(symbol_name)`
-- `get_api_flow(query)`
-- `get_decisions(question, limit)`
-- `search_memory(query, limit)`
-- `get_impact(base_ref)`
-- `get_hotspots(limit)`
-- `get_nexus(topic)`
-- `get_visual_map()`
-- `get_index_status()`
-- `query_code_graph(expression, limit)`
-- `find_dead_code(limit)`
-- `get_routes(limit)`
-- `get_http_confidence(limit)`
-- `export_graph()`
-- `import_graph(overwrite)`
+- `get_code_context(query, max_tokens, depth)`
 - `get_context_pack(task, max_tokens, output_format)`
+- `query_code_graph(expression, limit)`
+- `get_index_status()`
 - `get_verification_plan(base_ref, task)`
 - `run_rules(limit, severity)`
 - `get_source_outline(query, limit)`
-- `import_code_index(input_path, index_format)`
-- `get_code_context(query, max_tokens, depth)`
-- `find_symbol(symbol_name)`
-- `explain_dependencies(symbol_name)`
-- `token_report(query)`
 - `repository_stats()`
 
-The MCP adapter uses FastMCP when installed. The underlying tool handlers are plain Python functions, which keeps them easy to test and reuse.
+Every MCP tool response carries agent staleness fields:
+
+- `index_age_seconds`
+- `dirty_files_count`
+- `index_stale`
+
+Tools that naturally return a list use an envelope: `{ "items": [...], ...staleness }`.
+This lets agents decide whether to trust context, warn, or trigger `codeatlas index`.
+`get_code_context` also reports `warm_retrieval_ms`, `warm_retrieval_budget_ms`, and `warm_retrieval_status` so agents can fall back to targeted grep when retrieval is slow.
+
+Use `--profile full` for the legacy broad tool set while debugging or migrating older agent prompts. The MCP adapter uses FastMCP when installed. The underlying tool handlers are plain Python functions, which keeps them easy to test and reuse.
+
+Install prompt-side guidance:
+
+```bash
+codeatlas install-agent /path/to/repo --agent codex
+codeatlas install-agent /path/to/repo --agent claude
+codeatlas install-agent /path/to/repo --agent all
+```
+
+The Codex installer writes `.codex/mcp.json` and a CodeAtlas section in `.codex/AGENTS.md`. The Claude installer writes a CodeAtlas section in `CLAUDE.md` plus `.claude/skills/codeatlas/SKILL.md`. Both tell the agent when to call CodeAtlas instead of grep, how to handle stale indexes, and to treat warm retrieval over roughly 1 second as a reason to narrow the lookup.
 
 ## Benchmarking
 
@@ -480,12 +504,22 @@ Measured values include:
 
 CodeAtlas does not hardcode performance claims. Benchmark output is calculated from the repository being measured.
 
+## Retrieval Evals
+
+Run labeled retrieval expectations:
+
+```bash
+codeatlas eval-retrieval evals/retrieval/default.json --repo-id codeatlas-self
+```
+
+The default manifest contains a CodeAtlas self-eval with 50+ hand-labeled queries and expected files/symbols. It also declares optional pinned OSS suites for Requests, Click, and Rich under `.codeatlas/eval-repos/`; check those repositories out at the manifest refs and omit `--repo-id` to score every available suite. The evaluator indexes each repo, retrieves top-k snippets, and asserts recall@k instead of reporting only latency.
+
 ## Implementation Plan
 
 The implementation is organized in layers:
 
 1. Storage layer: durable SQLite schema and graph operations.
-2. Parser layer: Tree-sitter plugin interface, currently Python.
+2. Parser layer: Tree-sitter plugin interface for Python, JavaScript, and TypeScript/TSX.
 3. Indexer: scan, parse, persist, and update graph sections.
 4. Retrieval engine: lookup, traversal, ranking, snippets, token reporting.
 5. Memory engine: git/document evidence extraction, memory entities, relationships, and history queries.
@@ -495,29 +529,29 @@ The implementation is organized in layers:
 
 ## Limitations
 
-- Python has the strongest parser support today. JavaScript and TypeScript support exists, but it is currently regex-backed and less precise than a full Tree-sitter/LSP implementation.
+- JavaScript and TypeScript parsing is Tree-sitter-backed, but cross-file reference resolution is still intentionally conservative and not type-aware.
 - Pyright/BasedPyright integration is currently an optional diagnostics hook; deeper type-aware reference resolution is a future extension.
-- Retrieval reads selected snippets from disk. It does not re-parse the repository, but it expects files to remain present after indexing.
-- Call resolution is name-based and prefers same-module matches before shortest qualified names.
+- Retrieval prefers DB-cached snippets and falls back to disk only for legacy or partial indexes.
+- Built-in call resolution is name-based, but its edges distinguish exact-qualified, import-scoped, same-module, unique-name, and unresolved matches. Ambiguous names remain unresolved. SCIP imports are the preferred precision tier when a language-specific indexer is available.
 - Token counts are estimates, not tokenizer-specific counts.
 - PR review comments and approvals are not fetched from GitHub yet; PullRequest entities are currently inferred from commit messages.
 - Commit intelligence uses deterministic local heuristics, not an LLM. It cites evidence but should be treated as an initial signal.
 - API-flow and infrastructure intelligence have conservative MCP surfaces, but deep endpoint/runtime topology extraction is still roadmap work.
 - Impact radius is conservative and based on local git diff, file names, ownership, co-change history, and indexed evidence. It is not a substitute for test execution.
 - Built-in rule checks are review aids, not a full security scanner or CodeQL/Semgrep replacement.
-- External index import currently supports generic JSON and SCIP-like JSON shapes; exact SCIP protobuf ingestion is not implemented yet.
+- External index import supports generic JSON, SCIP-style JSON, and binary SCIP protobuf indexes.
 
 ## Roadmap
 
-- Replace regex-backed JavaScript and TypeScript extraction with Tree-sitter/LSP-backed symbol import.
+- Deepen JavaScript and TypeScript semantic import with optional LSP/external-index evidence.
 - Add Go and Java parser plugins.
-- Deepen Pyright/BasedPyright semantic integration for exact cross-file references.
-- Add exact SCIP protobuf import and richer external index validation.
+- Deepen Pyright/BasedPyright diagnostics integration without replacing SCIP as the precision edge layer.
+- Add richer SCIP/external-index validation and generator-specific diagnostics.
 - Add configurable rule packs and project-owned suppressions.
 - Render issue/PR context directly into context packs when GitHub/GitLab ingestion is enabled.
-- Store optional snippet cache for fully DB-backed retrieval.
 - Add graph export formats such as GraphML and JSON.
-- Add richer benchmark suites with labeled expected contexts.
+- Expand retrieval eval labels across more pinned repositories and task-shaped queries.
+- Replace headline token-savings claims with labeled-eval metrics that compare files an agent would open with plain grep versus CodeAtlas.
 - Add package-aware import resolution for monorepos.
 - Add GitHub/GitLab PR ingestion for review comments, approvals, and requested changes.
 - Add exact architecture evolution diffing between graph snapshots.
@@ -546,4 +580,4 @@ python -m playwright install chromium
 codeatlas ui-smoke http://127.0.0.1:8852/ --screenshot-dir /tmp/codeatlas-ui
 ```
 
-This requires Playwright and a running CodeAtlas server. Restart the server after frontend asset edits so stale browser/server UI warnings clear. The smoke wrapper sets `CODEATLAS_UI_URL`; `--screenshot-dir` keeps map and command-palette screenshots from the visual smoke. It verifies that the graph canvas, build badge, edge contrast and bundling controls, compare mode controls, fit/undo controls, workflow buttons, workflow result cards, export buttons, and visual-regression surfaces render.
+This requires Playwright and a running CodeAtlas server. Restart the server after frontend asset edits so stale browser/server UI warnings clear. The smoke wrapper sets `CODEATLAS_UI_URL`; `--screenshot-dir` keeps map and command-palette screenshots from the visual smoke. It verifies that the graph canvas, build badge, edge contrast and bundling controls, fit/undo controls, workflow buttons, workflow result cards, export buttons, and visual-regression surfaces render.

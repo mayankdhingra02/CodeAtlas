@@ -173,6 +173,7 @@ class IndexReport:
     edges_indexed: int
     parser_errors: tuple[str, ...] = ()
     file_results: tuple[IndexedFileResult, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -437,3 +438,11 @@ def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, (len(text) + 3) // 4)
+
+
+def estimate_tokens_for_size(size_bytes: int) -> int:
+    """Estimate tokens from a byte count without allocating placeholder text."""
+
+    if size_bytes <= 0:
+        return 0
+    return max(1, (size_bytes + 3) // 4)

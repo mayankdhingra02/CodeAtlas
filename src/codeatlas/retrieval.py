@@ -15,6 +15,7 @@ from .models import (
     RetrievalTimings,
     TokenReport,
     estimate_tokens,
+    estimate_tokens_for_size,
 )
 from .storage import GraphStore, symbol_node_key
 
@@ -47,6 +48,7 @@ class RetrievalEngine:
             if not symbol_rows:
                 symbol_rows = matches
             snippets = self._rank_and_snippet(
+                store,
                 repo_root,
                 query,
                 symbol_rows,
@@ -152,6 +154,7 @@ class RetrievalEngine:
 
     def _rank_and_snippet(
         self,
+        store: GraphStore,
         repo_root: Path,
         query: str,
         symbol_rows: list[Any],
@@ -165,7 +168,7 @@ class RetrievalEngine:
         terms = query_terms(query)
         exact_keys = {symbol_node_key(str(row["qualified_name"])) for row in matches}
         edge_bonus = self._edge_bonus(edges)
-        edge_types = self._edge_types_by_key(edges)
+        edge_reasons = self._edge_reasons_by_key(edges)
         ranked: list[tuple[float, str, Any]] = []
         seen: set[str] = set()
         for row in symbol_rows:
@@ -181,10 +184,10 @@ class RetrievalEngine:
                 score += 80
                 reasons.append("symbol match")
             if name.lower() == query_lower:
-                score += 100
+                score += 1600
                 reasons.append("exact name")
             elif qualified_name.lower() == query_lower:
-                score += 110
+                score += 1700
                 reasons.append("exact qualified name")
             elif query_lower in name.lower():
                 score += 55
@@ -209,7 +212,7 @@ class RetrievalEngine:
                 reasons.append("architecture/documentation path")
             score += edge_bonus.get(key, 0.0)
             if key in edge_bonus:
-                related = ", ".join(sorted(edge_types.get(key, ())))
+                related = ", ".join(sorted(edge_reasons.get(key, ())))
                 reasons.append("graph neighbor" + (f" via {related}" if related else ""))
             ranked.append((score, ", ".join(reasons) or "graph context", row))
 
@@ -224,10 +227,20 @@ class RetrievalEngine:
         snippets: list[ContextSnippet] = []
         used_tokens = 0
         for score, reason, row in ranked:
-            code = read_line_range(
-                repo_root / str(row["file_path"]),
-                int(row["line_start"]),
-                int(row["line_end"]),
+            file_path = str(row["file_path"])
+            qualified_name = str(row["qualified_name"])
+            code = (
+                store.cached_symbol_snippet(qualified_name)
+                or store.cached_line_range(
+                    file_path,
+                    int(row["line_start"]),
+                    int(row["line_end"]),
+                )
+                or read_line_range(
+                    repo_root / file_path,
+                    int(row["line_start"]),
+                    int(row["line_end"]),
+                )
             )
             if not code:
                 continue
@@ -272,11 +285,14 @@ class RetrievalEngine:
             candidate_paths = [str(row["path"]) for row in store.file_rows()]
         ranked: list[tuple[float, ContextSnippet]] = []
         for relative_path in candidate_paths:
-            path = repo_root / relative_path
-            try:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
+            cached_content = store.cached_file_content(relative_path)
+            if cached_content is None:
+                path = repo_root / relative_path
+                try:
+                    cached_content = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+            lines = cached_content.splitlines()
             haystack_path = relative_path.lower()
             path_hits = sum(1 for term in terms if term in haystack_path)
             best_line = 0
@@ -366,19 +382,19 @@ class RetrievalEngine:
             bonuses[str(edge["target_key"])] = bonuses.get(str(edge["target_key"]), 0.0) + bonus
         return bonuses
 
-    def _edge_types_by_key(self, edges: list[Any]) -> dict[str, set[str]]:
-        edge_types: dict[str, set[str]] = {}
+    def _edge_reasons_by_key(self, edges: list[Any]) -> dict[str, set[str]]:
+        edge_reasons: dict[str, set[str]] = {}
         for edge in edges:
-            edge_type = str(edge["edge_type"]).lower()
-            edge_types.setdefault(str(edge["source_key"]), set()).add(edge_type)
-            edge_types.setdefault(str(edge["target_key"]), set()).add(edge_type)
-        return edge_types
+            reason = edge_provenance_label(edge)
+            edge_reasons.setdefault(str(edge["source_key"]), set()).add(reason)
+            edge_reasons.setdefault(str(edge["target_key"]), set()).add(reason)
+        return edge_reasons
 
     def _token_report(self, store: GraphStore, snippets: list[ContextSnippet]) -> TokenReport:
         optimized = sum(snippet.estimated_tokens for snippet in snippets)
-        directories = {str(Path(snippet.file_path).parent) for snippet in snippets}
-        file_rows = store.files_in_directories(directories)
-        baseline = sum(estimate_tokens("x" * int(row["size_bytes"])) for row in file_rows)
+        snippet_paths = {snippet.file_path for snippet in snippets}
+        file_rows = store.files_by_paths(snippet_paths)
+        baseline = sum(estimate_tokens_for_size(int(row["size_bytes"])) for row in file_rows)
         if baseline < optimized:
             baseline = optimized
         return TokenReport(baseline_tokens=baseline, optimized_tokens=optimized)
@@ -491,6 +507,38 @@ def edge_label(key: Any) -> str:
         if text.startswith(prefix):
             return text.removeprefix(prefix)
     return text
+
+
+def edge_provenance_label(edge: Any) -> str:
+    edge_type = str(edge["edge_type"]).lower()
+    metadata = parse_metadata(edge["metadata_json"] if "metadata_json" in edge.keys() else {})
+    tier = str(metadata.get("resolution_tier") or "").strip()
+    confidence = metadata.get("confidence")
+    if tier and confidence is not None:
+        return f"{edge_type}[{tier} {confidence_percent(confidence)}]"
+    if tier:
+        return f"{edge_type}[{tier}]"
+    return edge_type
+
+
+def parse_metadata(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        decoded = json.loads(str(value))
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def confidence_percent(value: Any) -> str:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    return f"{round(confidence * 100)}%"
 
 
 def record_import(row: Any) -> str:
