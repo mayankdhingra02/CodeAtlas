@@ -7,6 +7,7 @@ from pathlib import Path
 
 from codeatlas.evaluation import (
     RetrievalBenchmarkCase,
+    SymbolLocation,
     evaluate_retriever,
     load_benchmark_cases,
 )
@@ -99,24 +100,135 @@ class RetrievalEvaluationTests(unittest.TestCase):
             expected_files=("app/orders.py", "app/payments.py"),
             expected_symbols=("app.orders.create_order", "app.payments.charge"),
         )
+        locations = {
+            "app.orders.create_order": SymbolLocation(
+                qualified_name="app.orders.create_order",
+                file_path="app/orders.py",
+                line_start=1,
+                line_end=2,
+            ),
+            "app.payments.charge": SymbolLocation(
+                qualified_name="app.payments.charge",
+                file_path="app/payments.py",
+                line_start=1,
+                line_end=2,
+            ),
+        }
 
         report = evaluate_retriever(
             ".",
             (case,),
             retriever=FakeRetriever(result=result),
             strategy="fake",
+            symbol_locations=locations,
         )
 
         evaluation = report.cases[0]
         self.assertEqual(evaluation.file_recall, 1.0)
         self.assertEqual(evaluation.symbol_recall, 1.0)
+        self.assertEqual(evaluation.symbol_location_recall, 1.0)
+        self.assertEqual(evaluation.symbol_body_coverage, 1.0)
         self.assertEqual(evaluation.file_reciprocal_rank, 1.0)
         self.assertEqual(evaluation.symbol_reciprocal_rank, 1.0)
+        self.assertEqual(evaluation.symbol_location_reciprocal_rank, 1.0)
         self.assertTrue(evaluation.all_targets_found)
+        self.assertTrue(evaluation.all_target_locations_found)
         self.assertEqual(evaluation.context_tokens, 250)
         self.assertEqual(evaluation.token_savings_percent, 75.0)
         self.assertEqual(evaluation.latency_ms, 6.0)
         self.assertEqual(report.summary.all_targets_rate, 1.0)
+        self.assertEqual(report.summary.all_target_locations_rate, 1.0)
+
+    def test_file_chunk_gets_location_credit_without_ast_identity(self) -> None:
+        result = RetrievalResult(
+            query="find order creation",
+            snippets=(
+                snippet(
+                    "app/orders.py",
+                    "app/orders.py",
+                    "orders.py:8-20",
+                    kind="FILE_CHUNK",
+                    line_start=8,
+                    line_end=20,
+                    code="\n".join(f"line {number}" for number in range(8, 21)),
+                ),
+            ),
+            token_report=TokenReport(baseline_tokens=1000, optimized_tokens=100),
+            timings=RetrievalTimings(
+                symbol_lookup_ms=0.0,
+                graph_traversal_ms=0.0,
+                ranking_ms=4.0,
+                total_ms=4.0,
+            ),
+        )
+        case = RetrievalBenchmarkCase(
+            case_id="file-chunk",
+            query="find order creation",
+            expected_files=("app/orders.py",),
+            expected_symbols=("app.orders.create_order",),
+        )
+        locations = {
+            "app.orders.create_order": SymbolLocation(
+                qualified_name="app.orders.create_order",
+                file_path="app/orders.py",
+                line_start=10,
+                line_end=15,
+            )
+        }
+
+        report = evaluate_retriever(
+            ".",
+            (case,),
+            retriever=FakeRetriever(result=result),
+            strategy="file-chunk",
+            symbol_locations=locations,
+        )
+
+        evaluation = report.cases[0]
+        self.assertEqual(evaluation.symbol_recall, 0.0)
+        self.assertEqual(evaluation.symbol_location_recall, 1.0)
+        self.assertEqual(evaluation.symbol_body_coverage, 1.0)
+        self.assertEqual(evaluation.symbol_location_reciprocal_rank, 1.0)
+        self.assertFalse(evaluation.all_targets_found)
+        self.assertTrue(evaluation.all_target_locations_found)
+        self.assertEqual(report.summary.mean_symbol_recall, 0.0)
+        self.assertEqual(report.summary.mean_symbol_location_recall, 1.0)
+        self.assertEqual(report.summary.all_target_locations_rate, 1.0)
+
+    def test_evaluator_reports_unresolved_gold_symbols(self) -> None:
+        result = RetrievalResult(
+            query="find missing symbol",
+            snippets=(),
+            token_report=TokenReport(baseline_tokens=100, optimized_tokens=0),
+            timings=RetrievalTimings(
+                symbol_lookup_ms=0.0,
+                graph_traversal_ms=0.0,
+                ranking_ms=0.0,
+                total_ms=0.0,
+            ),
+        )
+        case = RetrievalBenchmarkCase(
+            case_id="missing-label",
+            query="find missing symbol",
+            expected_symbols=("app.missing.symbol",),
+        )
+
+        report = evaluate_retriever(
+            ".",
+            (case,),
+            retriever=FakeRetriever(result=result),
+            strategy="missing-label",
+            symbol_locations={},
+        )
+
+        evaluation = report.cases[0]
+        self.assertEqual(
+            evaluation.unresolved_expected_symbols,
+            ("app.missing.symbol",),
+        )
+        self.assertEqual(evaluation.symbol_location_recall, 0.0)
+        self.assertEqual(evaluation.symbol_body_coverage, 0.0)
+        self.assertFalse(evaluation.all_target_locations_found)
 
     def test_evaluator_records_retriever_errors_instead_of_aborting_dataset(self) -> None:
         case = RetrievalBenchmarkCase(
@@ -130,12 +242,14 @@ class RetrievalEvaluationTests(unittest.TestCase):
             (case,),
             retriever=FakeRetriever(error=RuntimeError("index unavailable")),
             strategy="broken",
+            symbol_locations={},
         )
 
         self.assertEqual(report.summary.completed_cases, 0)
         self.assertEqual(report.summary.errored_cases, 1)
         self.assertEqual(report.summary.completion_rate, 0.0)
         self.assertEqual(report.summary.all_targets_rate, 0.0)
+        self.assertEqual(report.summary.all_target_locations_rate, 0.0)
         self.assertEqual(report.summary.mean_file_recall, 0.0)
         self.assertIn("index unavailable", report.cases[0].error or "")
 
@@ -146,17 +260,20 @@ def snippet(
     symbol_name: str,
     *,
     kind: str = "FUNCTION",
+    line_start: int = 1,
+    line_end: int = 2,
+    code: str = "pass",
 ) -> ContextSnippet:
     return ContextSnippet(
         file_path=file_path,
         symbol_name=symbol_name,
         qualified_name=qualified_name,
         kind=kind,
-        line_start=1,
-        line_end=2,
+        line_start=line_start,
+        line_end=line_end,
         score=1.0,
         reason="fixture",
-        code="pass",
+        code=code,
     )
 
 
