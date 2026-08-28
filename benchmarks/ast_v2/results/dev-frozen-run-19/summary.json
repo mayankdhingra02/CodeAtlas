@@ -1,0 +1,49 @@
+{
+  "experiment": "AST Core V2 frozen development smoke",
+  "status": "development-only; not publication evidence",
+  "repository": "mayankdhingra02/CodeAtlas",
+  "research_branch": "research/ast-core-v2",
+  "implementation_commit": "0b4c936549bc8a60fa231734ffe5629bb2f21ad0",
+  "subject_commit": "1ab5c09e3cd58d276c2ca253c3ca9ff03f211611",
+  "github_actions_run_id": 33202017139,
+  "artifact_id": 9698152924,
+  "artifact_digest": "sha256:8d0a00fec0a5ab4f3aa2176587c20aee2eae652d677cde7e66702e096213e4e2",
+  "dataset": "benchmarks/ast_v2/codeatlas_smoke.jsonl",
+  "case_count": 5,
+  "primary_metric": "symbol_location_recall",
+  "strategies": {
+    "codeatlas-current": {
+      "all_target_locations_rate": 0.2,
+      "mean_symbol_location_recall": 0.2,
+      "mean_symbol_body_coverage": 0.32790791599353797,
+      "mean_symbol_location_reciprocal_rank": 0.2,
+      "mean_file_recall": 0.8,
+      "mean_context_tokens": 1055.8,
+      "mean_latency_ms": 13.434402000001455
+    },
+    "lexical-chunk-v1": {
+      "all_target_locations_rate": 0.4,
+      "mean_symbol_location_recall": 0.4,
+      "mean_symbol_body_coverage": 0.4103392568659127,
+      "mean_symbol_location_reciprocal_rank": 0.3,
+      "mean_file_recall": 0.6,
+      "mean_context_tokens": 1774.0,
+      "mean_latency_ms": 162.7336688000014
+    },
+    "ast-symbol-v1": {
+      "all_target_locations_rate": 1.0,
+      "mean_symbol_location_recall": 1.0,
+      "mean_symbol_body_coverage": 0.8468497576736672,
+      "mean_symbol_location_reciprocal_rank": 0.65,
+      "mean_file_recall": 1.0,
+      "mean_context_tokens": 1767.8,
+      "mean_latency_ms": 272.31452780000325
+    }
+  },
+  "raw_report_sha256": {
+    "ast-symbol.json": "0745b973f34c6276965b3f0bd2632775927a2ca726a02eab8b73e945640d1891",
+    "current.json": "739663fab39842fbab5f852193e67c4fc63f88a9df1c396bdc810bc27215b85c",
+    "lexical.json": "b3a45496ae3dfcd88c4b5d91f9263a449b3eafb3951e279d55c5ca6b9bb79619"
+  },
+  "interpretation": "The evaluation pipeline and syntax-aware retrieval are technically feasible. The five cases were used during development, belong to one repository, and cannot establish generalization or paper-level novelty. The next decision must be based on a frozen algorithm and held-out external repositories."
+}
