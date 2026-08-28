@@ -1,8 +1,12 @@
 version: 1
 
+# Phase 0 of the AST research branch is intentionally Python-only.
+# The legacy JavaScript/TypeScript parser is regex-backed and caused a native
+# process crash during the first repository-wide smoke run. It remains enabled
+# on main; this branch excludes it until a real AST implementation is evaluated.
 languages:
   python: true
-  javascript: true
+  javascript: false
 
 ignore:
   dirs:
