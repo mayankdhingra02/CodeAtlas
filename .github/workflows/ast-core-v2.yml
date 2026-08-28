@@ -11,6 +11,7 @@ on:
       - docs/research/ast-core-v2.md
       - src/codeatlas/**
       - tests/test_ast_evaluation.py
+      - tests/test_lexical_baseline.py
       - tests/test_python_parser_runtime.py
   workflow_dispatch:
 
@@ -39,6 +40,7 @@ jobs:
         run: |
           python -m unittest \
             tests/test_ast_evaluation.py \
+            tests/test_lexical_baseline.py \
             tests/test_python_parser_runtime.py \
             -v
 
@@ -48,25 +50,37 @@ jobs:
             . \
             benchmarks/ast_v2/codeatlas_smoke.jsonl \
             --reindex \
-            --output .codeatlas/ast-v2-smoke-report.json
+            --output .codeatlas/ast-v2-current-report.json
 
-      - name: Print benchmark summary
+      - name: Run lexical baseline smoke benchmark
+        run: |
+          python -m codeatlas.lexical_baseline \
+            . \
+            benchmarks/ast_v2/codeatlas_smoke.jsonl \
+            --output .codeatlas/ast-v2-lexical-report.json
+
+      - name: Print benchmark comparison
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
 
-          report = json.loads(
-              Path(".codeatlas/ast-v2-smoke-report.json").read_text(encoding="utf-8")
-          )
-          print(json.dumps(report["summary"], indent=2, sort_keys=True))
+          for label, path in (
+              ("current", Path(".codeatlas/ast-v2-current-report.json")),
+              ("lexical", Path(".codeatlas/ast-v2-lexical-report.json")),
+          ):
+              report = json.loads(path.read_text(encoding="utf-8"))
+              print(f"\n=== {label} ===")
+              print(json.dumps(report["summary"], indent=2, sort_keys=True))
           PY
 
-      - name: Upload raw benchmark report
+      - name: Upload raw benchmark reports
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: ast-v2-smoke-report
-          path: .codeatlas/ast-v2-smoke-report.json
+          name: ast-v2-smoke-reports
+          path: |
+            .codeatlas/ast-v2-current-report.json
+            .codeatlas/ast-v2-lexical-report.json
           if-no-files-found: error
           retention-days: 14
