@@ -58,10 +58,18 @@ class AstSymbolRetriever:
     later experiments can attribute gains to each component separately.
     """
 
-    def __init__(self, *, max_symbols_per_file: int = 3) -> None:
+    def __init__(
+        self,
+        *,
+        max_symbols_per_file: int = 3,
+        max_symbol_fraction: float = 0.5,
+    ) -> None:
         if max_symbols_per_file <= 0:
             raise ValueError("max_symbols_per_file must be positive")
+        if not 0.0 < max_symbol_fraction <= 1.0:
+            raise ValueError("max_symbol_fraction must be in (0, 1]")
         self.max_symbols_per_file = max_symbols_per_file
+        self.max_symbol_fraction = max_symbol_fraction
 
     def retrieve(
         self,
@@ -262,6 +270,7 @@ class AstSymbolRetriever:
         selected: list[ContextSnippet] = []
         per_file: dict[str, int] = defaultdict(int)
         used_tokens = 0
+        per_symbol_cap = max(64, int(max_tokens * self.max_symbol_fraction))
 
         for candidate in scored:
             row = candidate.symbol.row
@@ -275,12 +284,14 @@ class AstSymbolRetriever:
             code = candidate.symbol.code
             if not code.strip():
                 continue
+            original_tokens = estimate_tokens(code)
+            allocation = min(remaining, per_symbol_cap)
+            if allocation < 32:
+                continue
+            truncated = original_tokens > allocation
+            if truncated:
+                code = trim_to_tokens(code, allocation)
             tokens = estimate_tokens(code)
-            if tokens > remaining:
-                if selected or remaining < 32:
-                    continue
-                code = trim_to_tokens(code, remaining)
-                tokens = estimate_tokens(code)
             if tokens <= 0 or used_tokens + tokens > max_tokens:
                 continue
 
@@ -293,15 +304,23 @@ class AstSymbolRetriever:
                 reasons.append(
                     "content matched " + ", ".join(candidate.matched_query_terms[:6])
                 )
+            if truncated:
+                reasons.append("symbol body capped for context diversity")
 
+            line_start = int(row["line_start"])
+            original_line_end = int(row["line_end"])
+            returned_line_end = min(
+                original_line_end,
+                line_start + max(code.count("\n"), 0),
+            )
             selected.append(
                 ContextSnippet(
                     file_path=file_path,
                     symbol_name=str(row["name"]),
                     qualified_name=str(row["qualified_name"]),
                     kind=str(row["kind"]),
-                    line_start=int(row["line_start"]),
-                    line_end=int(row["line_end"]),
+                    line_start=line_start,
+                    line_end=returned_line_end,
                     score=candidate.score,
                     reason="; ".join(reasons),
                     code=code,
@@ -387,6 +406,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--max-symbols-per-file", type=int, default=3)
+    parser.add_argument("--max-symbol-fraction", type=float, default=0.5)
     return parser
 
 
@@ -394,6 +414,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     retriever = AstSymbolRetriever(
         max_symbols_per_file=args.max_symbols_per_file,
+        max_symbol_fraction=args.max_symbol_fraction,
     )
     report = evaluate_dataset(
         args.repo,
