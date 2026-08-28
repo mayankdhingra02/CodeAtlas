@@ -37,11 +37,9 @@ class PythonParser(ParserPlugin):
 
     def parse(self, repo_root: Path, source_file: SourceFile) -> ParseResult:
         content = source_file.path.read_bytes()
-        source_text = content.decode("utf-8", errors="replace")
-        try:
-            tree = self._parser.parse(source_text)
-        except TypeError:
-            tree = self._parser.parse(content)
+        # Upstream tree_sitter.Parser.parse expects bytes. Passing str can crash
+        # inside native bindings before Python has a chance to raise TypeError.
+        tree = self._parser.parse(content)
         root_node = tree.root_node() if callable(tree.root_node) else tree.root_node
         module_name = module_name_for_path(source_file.relative_path)
         extractor = _PythonTreeSitterExtractor(content, module_name)
