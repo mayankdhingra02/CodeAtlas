@@ -8,9 +8,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from .config import CodeAtlasPaths
 from .indexer import RepositoryIndexer
-from .models import RetrievalResult
+from .models import ContextSnippet, RetrievalResult
 from .retrieval import RetrievalEngine
+from .storage import GraphStore
 
 
 class Retriever(Protocol):
@@ -24,6 +26,14 @@ class Retriever(Protocol):
         depth: int = 2,
         max_tokens: int = 8000,
     ) -> RetrievalResult: ...
+
+
+@dataclass(frozen=True)
+class SymbolLocation:
+    qualified_name: str
+    file_path: str
+    line_start: int
+    line_end: int
 
 
 @dataclass(frozen=True)
@@ -80,13 +90,18 @@ class RetrievalCaseEvaluation:
     query: str
     expected_files: tuple[str, ...]
     expected_symbols: tuple[str, ...]
+    unresolved_expected_symbols: tuple[str, ...]
     retrieved_files: tuple[str, ...]
     retrieved_symbols: tuple[str, ...]
     file_recall: float | None
     symbol_recall: float | None
+    symbol_location_recall: float | None
+    symbol_body_coverage: float | None
     file_reciprocal_rank: float | None
     symbol_reciprocal_rank: float | None
+    symbol_location_reciprocal_rank: float | None
     all_targets_found: bool
+    all_target_locations_found: bool
     baseline_tokens: int
     context_tokens: int
     token_savings_percent: float
@@ -102,10 +117,14 @@ class RetrievalBenchmarkSummary:
     errored_cases: int
     completion_rate: float
     all_targets_rate: float
+    all_target_locations_rate: float
     mean_file_recall: float | None
     mean_symbol_recall: float | None
+    mean_symbol_location_recall: float | None
+    mean_symbol_body_coverage: float | None
     mean_file_reciprocal_rank: float | None
     mean_symbol_reciprocal_rank: float | None
+    mean_symbol_location_reciprocal_rank: float | None
     mean_context_tokens: float
     median_context_tokens: float
     mean_token_savings_percent: float
@@ -152,6 +171,28 @@ def load_benchmark_cases(path: str | Path) -> tuple[RetrievalBenchmarkCase, ...]
     return tuple(cases)
 
 
+def load_symbol_locations(repo_path: str | Path) -> dict[str, SymbolLocation]:
+    repo_root = Path(repo_path).expanduser().resolve()
+    database_path = CodeAtlasPaths(repo_root).database_path
+    if not database_path.exists():
+        return {}
+
+    store = GraphStore(database_path)
+    store.initialize()
+    try:
+        return {
+            str(row["qualified_name"]): SymbolLocation(
+                qualified_name=str(row["qualified_name"]),
+                file_path=_normalize_path(str(row["file_path"])),
+                line_start=int(row["line_start"]),
+                line_end=int(row["line_end"]),
+            )
+            for row in store.all_symbols()
+        }
+    finally:
+        store.close()
+
+
 def evaluate_retriever(
     repo_path: str | Path,
     cases: Sequence[RetrievalBenchmarkCase],
@@ -159,10 +200,18 @@ def evaluate_retriever(
     retriever: Retriever | None = None,
     strategy: str = "codeatlas-current",
     dataset: str = "in-memory",
+    symbol_locations: Mapping[str, SymbolLocation] | None = None,
 ) -> RetrievalBenchmarkReport:
     repo_root = Path(repo_path).expanduser().resolve()
     engine = retriever or RetrievalEngine()
-    evaluations = tuple(_evaluate_case(repo_root, case, engine) for case in cases)
+    resolved_locations = (
+        dict(symbol_locations)
+        if symbol_locations is not None
+        else load_symbol_locations(repo_root)
+    )
+    evaluations = tuple(
+        _evaluate_case(repo_root, case, engine, resolved_locations) for case in cases
+    )
     summary = summarize_evaluations(evaluations, strategy=strategy)
     return RetrievalBenchmarkReport(
         strategy=strategy,
@@ -209,17 +258,34 @@ def summarize_evaluations(
             sum(1 for evaluation in evaluations if evaluation.all_targets_found),
             total_cases,
         ),
+        all_target_locations_rate=_safe_ratio(
+            sum(
+                1
+                for evaluation in evaluations
+                if evaluation.all_target_locations_found
+            ),
+            total_cases,
+        ),
         mean_file_recall=_mean_optional(
             evaluation.file_recall for evaluation in evaluations
         ),
         mean_symbol_recall=_mean_optional(
             evaluation.symbol_recall for evaluation in evaluations
         ),
+        mean_symbol_location_recall=_mean_optional(
+            evaluation.symbol_location_recall for evaluation in evaluations
+        ),
+        mean_symbol_body_coverage=_mean_optional(
+            evaluation.symbol_body_coverage for evaluation in evaluations
+        ),
         mean_file_reciprocal_rank=_mean_optional(
             evaluation.file_reciprocal_rank for evaluation in evaluations
         ),
         mean_symbol_reciprocal_rank=_mean_optional(
             evaluation.symbol_reciprocal_rank for evaluation in evaluations
+        ),
+        mean_symbol_location_reciprocal_rank=_mean_optional(
+            evaluation.symbol_location_reciprocal_rank for evaluation in evaluations
         ),
         mean_context_tokens=statistics.fmean(context_tokens) if context_tokens else 0.0,
         median_context_tokens=float(statistics.median(context_tokens)) if context_tokens else 0.0,
@@ -247,6 +313,7 @@ def _evaluate_case(
     repo_root: Path,
     case: RetrievalBenchmarkCase,
     retriever: Retriever,
+    symbol_locations: Mapping[str, SymbolLocation],
 ) -> RetrievalCaseEvaluation:
     try:
         result = retriever.retrieve(
@@ -261,13 +328,22 @@ def _evaluate_case(
             query=case.query,
             expected_files=case.expected_files,
             expected_symbols=case.expected_symbols,
+            unresolved_expected_symbols=tuple(
+                symbol
+                for symbol in case.expected_symbols
+                if symbol not in symbol_locations
+            ),
             retrieved_files=(),
             retrieved_symbols=(),
             file_recall=0.0 if case.expected_files else None,
             symbol_recall=0.0 if case.expected_symbols else None,
+            symbol_location_recall=0.0 if case.expected_symbols else None,
+            symbol_body_coverage=0.0 if case.expected_symbols else None,
             file_reciprocal_rank=0.0 if case.expected_files else None,
             symbol_reciprocal_rank=0.0 if case.expected_symbols else None,
+            symbol_location_reciprocal_rank=0.0 if case.expected_symbols else None,
             all_targets_found=False,
+            all_target_locations_found=False,
             baseline_tokens=0,
             context_tokens=0,
             token_savings_percent=0.0,
@@ -285,27 +361,127 @@ def _evaluate_case(
     symbol_recall = _recall(case.expected_symbols, retrieved_symbols)
     file_rr = _reciprocal_rank(case.expected_files, retrieved_files)
     symbol_rr = _reciprocal_rank(case.expected_symbols, retrieved_symbols)
+    (
+        symbol_location_recall,
+        symbol_body_coverage,
+        symbol_location_rr,
+        unresolved_symbols,
+    ) = _symbol_region_metrics(
+        case.expected_symbols,
+        symbol_locations,
+        result.snippets,
+    )
     files_found = _all_expected_found(case.expected_files, retrieved_files)
     symbols_found = _all_expected_found(case.expected_symbols, retrieved_symbols)
-    all_targets_found = files_found and symbols_found
+    all_target_locations_found = files_found and (
+        symbol_location_recall is None or symbol_location_recall == 1.0
+    )
 
     return RetrievalCaseEvaluation(
         case_id=case.case_id,
         query=case.query,
         expected_files=case.expected_files,
         expected_symbols=case.expected_symbols,
+        unresolved_expected_symbols=unresolved_symbols,
         retrieved_files=retrieved_files,
         retrieved_symbols=retrieved_symbols,
         file_recall=file_recall,
         symbol_recall=symbol_recall,
+        symbol_location_recall=symbol_location_recall,
+        symbol_body_coverage=symbol_body_coverage,
         file_reciprocal_rank=file_rr,
         symbol_reciprocal_rank=symbol_rr,
-        all_targets_found=all_targets_found,
+        symbol_location_reciprocal_rank=symbol_location_rr,
+        all_targets_found=files_found and symbols_found,
+        all_target_locations_found=all_target_locations_found,
         baseline_tokens=result.token_report.baseline_tokens,
         context_tokens=result.token_report.optimized_tokens,
         token_savings_percent=result.token_report.savings_percent,
         latency_ms=result.timings.total_ms,
     )
+
+
+def _symbol_region_metrics(
+    expected_symbols: Sequence[str],
+    symbol_locations: Mapping[str, SymbolLocation],
+    snippets: Sequence[ContextSnippet],
+) -> tuple[float | None, float | None, float | None, tuple[str, ...]]:
+    if not expected_symbols:
+        return None, None, None, ()
+
+    unresolved = tuple(
+        symbol for symbol in expected_symbols if symbol not in symbol_locations
+    )
+    location_hits = 0
+    coverage_values: list[float] = []
+    expected_location_keys: set[tuple[str, int]] = set()
+
+    for symbol in expected_symbols:
+        location = symbol_locations.get(symbol)
+        if location is None:
+            coverage_values.append(0.0)
+            continue
+        expected_location_keys.add((location.file_path, location.line_start))
+        if any(_snippet_covers_definition(snippet, location) for snippet in snippets):
+            location_hits += 1
+        coverage_values.append(_symbol_body_coverage(location, snippets))
+
+    reciprocal_rank = 0.0
+    for rank, snippet in enumerate(snippets, start=1):
+        snippet_path = _normalize_path(snippet.file_path)
+        if any(
+            snippet_path == file_path
+            and snippet.line_start <= definition_line <= snippet.line_end
+            for file_path, definition_line in expected_location_keys
+        ):
+            reciprocal_rank = 1.0 / rank
+            break
+
+    return (
+        location_hits / len(expected_symbols),
+        statistics.fmean(coverage_values),
+        reciprocal_rank,
+        unresolved,
+    )
+
+
+def _snippet_covers_definition(
+    snippet: ContextSnippet,
+    location: SymbolLocation,
+) -> bool:
+    return (
+        _normalize_path(snippet.file_path) == location.file_path
+        and snippet.line_start <= location.line_start <= snippet.line_end
+    )
+
+
+def _symbol_body_coverage(
+    location: SymbolLocation,
+    snippets: Sequence[ContextSnippet],
+) -> float:
+    intervals: list[tuple[int, int]] = []
+    for snippet in snippets:
+        if _normalize_path(snippet.file_path) != location.file_path:
+            continue
+        start = max(location.line_start, int(snippet.line_start))
+        end = min(location.line_end, int(snippet.line_end))
+        if start <= end:
+            intervals.append((start, end))
+    if not intervals:
+        return 0.0
+
+    intervals.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in intervals:
+        if not merged or start > merged[-1][1] + 1:
+            merged.append((start, end))
+        else:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+
+    covered_lines = sum(end - start + 1 for start, end in merged)
+    target_lines = max(1, location.line_end - location.line_start + 1)
+    return min(1.0, covered_lines / target_lines)
 
 
 def _normalized_strings(value: Any, *, paths: bool = False) -> tuple[str, ...]:
