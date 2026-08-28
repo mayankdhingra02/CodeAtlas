@@ -18,12 +18,27 @@ It does **not** contain the old visualization server, HTML/JavaScript assets, re
 - Python 3.11+
 - Git
 
-## Clone only this branch
+## Fresh clone of only this branch
 
 ```bash
-git clone --branch research/ast-only --single-branch \
+git clone --branch research/ast-only-clean --single-branch \
   https://github.com/mayankdhingra02/CodeAtlas.git CodeAtlas-AST
 cd CodeAtlas-AST
+```
+
+## Use it from an existing CodeAtlas clone
+
+```bash
+cd /path/to/CodeAtlas
+git fetch origin
+git switch --track origin/research/ast-only-clean
+```
+
+If that local tracking branch already exists:
+
+```bash
+git switch research/ast-only-clean
+git pull --ff-only origin research/ast-only-clean
 ```
 
 ## Install
