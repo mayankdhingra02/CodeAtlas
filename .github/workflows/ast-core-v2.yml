@@ -19,6 +19,12 @@ on:
 permissions:
   contents: read
 
+env:
+  SUBJECT_COMMIT: 1ab5c09e3cd58d276c2ca253c3ca9ff03f211611
+  SUBJECT_DIR: /tmp/codeatlas-ast-v2-subject
+  DATASET_PATH: ${{ github.workspace }}/benchmarks/ast_v2/codeatlas_smoke.jsonl
+  REPORT_DIR: ${{ github.workspace }}/.codeatlas/ast-v2-reports
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
@@ -27,6 +33,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
@@ -46,40 +54,66 @@ jobs:
             tests/test_python_parser_runtime.py \
             -v
 
+      - name: Prepare frozen benchmark subject
+        run: |
+          rm -rf "$SUBJECT_DIR" "$REPORT_DIR"
+          mkdir -p "$SUBJECT_DIR" "$REPORT_DIR"
+          git cat-file -e "$SUBJECT_COMMIT^{commit}"
+          git archive "$SUBJECT_COMMIT" | tar -x -C "$SUBJECT_DIR"
+          cat > "$SUBJECT_DIR/.codeatlas.yml" <<'YAML'
+          version: 1
+          languages:
+            python: true
+            javascript: false
+          ignore:
+            dirs:
+              - .tox
+              - .nox
+            paths:
+              - generated/**
+              - vendor/**
+          YAML
+          test ! -e "$SUBJECT_DIR/src/codeatlas/ast_retrieval.py"
+          test ! -e "$SUBJECT_DIR/tests/test_ast_retrieval.py"
+          echo "subject_commit=$SUBJECT_COMMIT"
+          echo "subject_tree=$(git rev-parse "$SUBJECT_COMMIT^{tree}")"
+
       - name: Run current-retriever smoke benchmark
         run: |
           python -X faulthandler -m codeatlas.evaluation \
-            . \
-            benchmarks/ast_v2/codeatlas_smoke.jsonl \
+            "$SUBJECT_DIR" \
+            "$DATASET_PATH" \
             --reindex \
-            --output .codeatlas/ast-v2-current-report.json
+            --output "$REPORT_DIR/current.json"
 
       - name: Run lexical baseline smoke benchmark
         run: |
           python -m codeatlas.lexical_baseline \
-            . \
-            benchmarks/ast_v2/codeatlas_smoke.jsonl \
-            --output .codeatlas/ast-v2-lexical-report.json
+            "$SUBJECT_DIR" \
+            "$DATASET_PATH" \
+            --output "$REPORT_DIR/lexical.json"
 
       - name: Run syntax-only AST smoke benchmark
         run: |
           python -m codeatlas.ast_retrieval \
-            . \
-            benchmarks/ast_v2/codeatlas_smoke.jsonl \
-            --output .codeatlas/ast-v2-symbol-report.json
+            "$SUBJECT_DIR" \
+            "$DATASET_PATH" \
+            --output "$REPORT_DIR/ast-symbol.json"
 
       - name: Print benchmark comparison
         run: |
           python - <<'PY'
           import json
+          import os
           from pathlib import Path
 
-          for label, path in (
-              ("current", Path(".codeatlas/ast-v2-current-report.json")),
-              ("lexical", Path(".codeatlas/ast-v2-lexical-report.json")),
-              ("ast-symbol", Path(".codeatlas/ast-v2-symbol-report.json")),
+          report_dir = Path(os.environ["REPORT_DIR"])
+          for label, name in (
+              ("current", "current.json"),
+              ("lexical", "lexical.json"),
+              ("ast-symbol", "ast-symbol.json"),
           ):
-              report = json.loads(path.read_text(encoding="utf-8"))
+              report = json.loads((report_dir / name).read_text(encoding="utf-8"))
               print(f"\n=== {label} ===")
               print(json.dumps(report["summary"], indent=2, sort_keys=True))
           PY
@@ -88,10 +122,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: ast-v2-smoke-reports
-          path: |
-            .codeatlas/ast-v2-current-report.json
-            .codeatlas/ast-v2-lexical-report.json
-            .codeatlas/ast-v2-symbol-report.json
+          name: ast-v2-frozen-subject-reports
+          path: ${{ env.REPORT_DIR }}/*.json
           if-no-files-found: error
           retention-days: 14
