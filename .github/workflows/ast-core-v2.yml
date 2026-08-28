@@ -5,6 +5,7 @@ on:
     branches:
       - research/ast-core-v2
     paths:
+      - .codeatlas.yml
       - .github/workflows/ast-core-v2.yml
       - benchmarks/ast_v2/**
       - docs/research/ast-core-v2.md
