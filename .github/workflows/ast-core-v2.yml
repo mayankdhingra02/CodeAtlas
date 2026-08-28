@@ -10,6 +10,7 @@ on:
       - docs/research/ast-core-v2.md
       - src/codeatlas/**
       - tests/test_ast_evaluation.py
+      - tests/test_python_parser_runtime.py
   workflow_dispatch:
 
 permissions:
@@ -33,12 +34,16 @@ jobs:
       - name: Install CodeAtlas
         run: python -m pip install -e .
 
-      - name: Run evaluator unit tests
-        run: python -m unittest tests/test_ast_evaluation.py -v
+      - name: Run focused unit tests
+        run: |
+          python -m unittest \
+            tests/test_ast_evaluation.py \
+            tests/test_python_parser_runtime.py \
+            -v
 
       - name: Run current-retriever smoke benchmark
         run: |
-          python -m codeatlas.evaluation \
+          python -X faulthandler -m codeatlas.evaluation \
             . \
             benchmarks/ast_v2/codeatlas_smoke.jsonl \
             --reindex \
