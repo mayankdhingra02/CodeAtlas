@@ -102,6 +102,40 @@ class AstSymbolRetrieverTests(unittest.TestCase):
         self.assertEqual(graph_store.kind, "CLASS")
         self.assertNotEqual(graph_store.qualified_name, graph_store.file_path)
 
+    def test_large_matching_symbol_is_capped_instead_of_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            (root / ".codeatlas.yml").write_text(
+                "languages:\n  python: true\n  javascript: false\n",
+                encoding="utf-8",
+            )
+            methods = "\n".join(
+                f"    def archive_step_{index}(self):\n        return {index}\n"
+                for index in range(80)
+            )
+            (root / "archive.py").write_text(
+                "class ArchiveCoordinator:\n"
+                "    \"\"\"Coordinate archive retention and cleanup policies.\"\"\"\n"
+                + methods,
+                encoding="utf-8",
+            )
+            RepositoryIndexer().index(root, incremental=False)
+
+            result = AstSymbolRetriever(max_symbol_fraction=0.4).retrieve(
+                root,
+                "Which ArchiveCoordinator class coordinates archive retention?",
+                max_tokens=300,
+            )
+
+        target = next(
+            snippet
+            for snippet in result.snippets
+            if snippet.qualified_name == "archive.ArchiveCoordinator"
+        )
+        self.assertIn("capped for context diversity", target.reason)
+        self.assertLess(target.estimated_tokens, 160)
+        self.assertLessEqual(result.token_report.optimized_tokens, 300)
+
     def test_ast_retriever_integrates_with_labeled_evaluator(self) -> None:
         case = RetrievalBenchmarkCase(
             case_id="token-report",
@@ -127,6 +161,12 @@ class AstSymbolRetrieverTests(unittest.TestCase):
         self.assertTrue(_terms_match("calculate", "calculated"))
         self.assertFalse(_terms_match("call", "class"))
         self.assertFalse(_terms_match("edge", "editor"))
+
+    def test_invalid_symbol_fraction_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            AstSymbolRetriever(max_symbol_fraction=0.0)
+        with self.assertRaises(ValueError):
+            AstSymbolRetriever(max_symbol_fraction=1.1)
 
 
 if __name__ == "__main__":
