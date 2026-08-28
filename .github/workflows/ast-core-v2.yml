@@ -11,6 +11,7 @@ on:
       - docs/research/ast-core-v2.md
       - src/codeatlas/**
       - tests/test_ast_evaluation.py
+      - tests/test_ast_retrieval.py
       - tests/test_lexical_baseline.py
       - tests/test_python_parser_runtime.py
   workflow_dispatch:
@@ -40,6 +41,7 @@ jobs:
         run: |
           python -m unittest \
             tests/test_ast_evaluation.py \
+            tests/test_ast_retrieval.py \
             tests/test_lexical_baseline.py \
             tests/test_python_parser_runtime.py \
             -v
@@ -59,6 +61,13 @@ jobs:
             benchmarks/ast_v2/codeatlas_smoke.jsonl \
             --output .codeatlas/ast-v2-lexical-report.json
 
+      - name: Run syntax-only AST smoke benchmark
+        run: |
+          python -m codeatlas.ast_retrieval \
+            . \
+            benchmarks/ast_v2/codeatlas_smoke.jsonl \
+            --output .codeatlas/ast-v2-symbol-report.json
+
       - name: Print benchmark comparison
         run: |
           python - <<'PY'
@@ -68,6 +77,7 @@ jobs:
           for label, path in (
               ("current", Path(".codeatlas/ast-v2-current-report.json")),
               ("lexical", Path(".codeatlas/ast-v2-lexical-report.json")),
+              ("ast-symbol", Path(".codeatlas/ast-v2-symbol-report.json")),
           ):
               report = json.loads(path.read_text(encoding="utf-8"))
               print(f"\n=== {label} ===")
@@ -82,5 +92,6 @@ jobs:
           path: |
             .codeatlas/ast-v2-current-report.json
             .codeatlas/ast-v2-lexical-report.json
+            .codeatlas/ast-v2-symbol-report.json
           if-no-files-found: error
           retention-days: 14
