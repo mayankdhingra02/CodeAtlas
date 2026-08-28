@@ -5,6 +5,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from codeatlas_ast.cli import _render
 from codeatlas_ast.core import build_index, load_index, retrieve, terms
 
 
@@ -86,6 +87,20 @@ class AstOnlyTests(unittest.TestCase):
         names = [snippet.qualified_name for snippet in result.snippets]
         self.assertIn("app.indexer.RepositoryIndexer.write_resolution_edges", names)
         self.assertTrue(any(name.startswith("app.storage.GraphStore") for name in names))
+
+    def test_human_readable_renderer_accepts_retrieval_tuple(self) -> None:
+        with self.make_repo() as repo:
+            build_index(repo)
+            payload = retrieve(
+                repo,
+                "Which class stores graph nodes and edges in SQLite?",
+                max_tokens=500,
+            ).to_dict()
+
+        rendered = _render(payload)
+        self.assertIn("app.storage.GraphStore", rendered)
+        self.assertIn("Retrieval summary", rendered)
+        self.assertIn("context_tokens", rendered)
 
     def test_identifier_tokenization(self) -> None:
         values = terms("writeResolutionEdges graph_nodes persisted")
