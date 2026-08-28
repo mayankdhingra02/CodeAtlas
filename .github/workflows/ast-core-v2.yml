@@ -1,0 +1,66 @@
+name: AST Core V2 Feasibility
+
+on:
+  push:
+    branches:
+      - research/ast-core-v2
+    paths:
+      - .github/workflows/ast-core-v2.yml
+      - benchmarks/ast_v2/**
+      - docs/research/ast-core-v2.md
+      - src/codeatlas/**
+      - tests/test_ast_evaluation.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CodeAtlas
+        run: python -m pip install -e .
+
+      - name: Run evaluator unit tests
+        run: python -m unittest tests/test_ast_evaluation.py -v
+
+      - name: Run current-retriever smoke benchmark
+        run: |
+          python -m codeatlas.evaluation \
+            . \
+            benchmarks/ast_v2/codeatlas_smoke.jsonl \
+            --reindex \
+            --output .codeatlas/ast-v2-smoke-report.json
+
+      - name: Print benchmark summary
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(
+              Path(".codeatlas/ast-v2-smoke-report.json").read_text(encoding="utf-8")
+          )
+          print(json.dumps(report["summary"], indent=2, sort_keys=True))
+          PY
+
+      - name: Upload raw benchmark report
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ast-v2-smoke-report
+          path: .codeatlas/ast-v2-smoke-report.json
+          if-no-files-found: error
+          retention-days: 14
