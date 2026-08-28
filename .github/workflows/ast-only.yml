@@ -2,7 +2,7 @@ name: AST-only tests
 
 on:
   push:
-    branches: [research/ast-only]
+    branches: [research/ast-only-clean]
   pull_request:
 
 permissions:
