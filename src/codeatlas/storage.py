@@ -723,6 +723,70 @@ class GraphStore:
             ).fetchall()
         )
 
+    def outgoing_edges(
+        self,
+        key: str,
+        *,
+        edge_types: tuple[str, ...] = (),
+    ) -> list[sqlite3.Row]:
+        """Return only edges whose persisted direction starts at ``key``."""
+        normalized_types = tuple(str(edge_type) for edge_type in edge_types)
+        if not normalized_types:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT * FROM edges
+                    WHERE source_key = ?
+                    ORDER BY edge_type, target_key, id
+                    """,
+                    (key,),
+                ).fetchall()
+            )
+        placeholders = ",".join("?" for _ in normalized_types)
+        return list(
+            self.connection.execute(
+                f"""
+                SELECT * FROM edges
+                WHERE source_key = ?
+                  AND edge_type IN ({placeholders})
+                ORDER BY edge_type, target_key, id
+                """,
+                (key, *normalized_types),
+            ).fetchall()
+        )
+
+    def incoming_edges(
+        self,
+        key: str,
+        *,
+        edge_types: tuple[str, ...] = (),
+    ) -> list[sqlite3.Row]:
+        """Return only edges whose persisted direction ends at ``key``."""
+        normalized_types = tuple(str(edge_type) for edge_type in edge_types)
+        if not normalized_types:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT * FROM edges
+                    WHERE target_key = ?
+                    ORDER BY edge_type, source_key, id
+                    """,
+                    (key,),
+                ).fetchall()
+            )
+        placeholders = ",".join("?" for _ in normalized_types)
+        return list(
+            self.connection.execute(
+                f"""
+                SELECT * FROM edges
+                WHERE target_key = ?
+                  AND edge_type IN ({placeholders})
+                ORDER BY edge_type, source_key, id
+                """,
+                (key, *normalized_types),
+            ).fetchall()
+        )
+
     def nodes_by_keys(self, keys: Iterable[str]) -> list[sqlite3.Row]:
         key_list = list(keys)
         if not key_list:

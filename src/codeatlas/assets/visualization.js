@@ -91,6 +91,8 @@
     };
     const CANVAS_ZOOM_MIN = 0.12;
     const CANVAS_ZOOM_MAX = 18;
+    const FLOW_TRACE_MAX_HOPS = 12;
+    const INFERRED_FLOW_NOTICE = 'Canonical static trace unavailable. Showing inferred reading path.';
     const URL_STATE_KEYS = [
       'state', 'view', 'brief', 'file', 'filePath', 'fileDepth', 'lens', 'cat', 'conn', 'hidden', 'selected', 'side', 'detailTab', 'trace', 'flow', 'flowStep', 'pin', 'focus',
       'hops', 'budget', 'min', 'connected', 'contrast', 'bundles', 'z', 'pan',
@@ -182,6 +184,7 @@
       traceMode: null,
       pinnedTrace: null,
       flowPlayback: null,
+      flowTraceRequestId: 0,
       pendingFlowPlaybackUrl: null,
       performanceGuardActive: false,
       pendingUrlState: null,
@@ -2990,7 +2993,7 @@
         play.type = 'button';
         play.className = 'briefing-chip';
         play.textContent = 'Play flow';
-        setHelp(play, 'Animates this flow on the architecture map and syncs each step with evidence in the details panel.');
+        setHelp(play, 'Requests a canonical static trace for an exact route entrypoint, then animates it on the existing map and evidence panel. If no canonical trace is available, the inferred reading path is clearly labelled.');
         play.onclick = () => startFlowPlayback(flow, { playing: true });
         actions.appendChild(play);
         const steps = card.querySelector('.briefing-flow-steps');
@@ -3379,11 +3382,51 @@
 
     function startFlowPlayback(flow, options) {
       options = options || {};
-      if (!flow) return;
+      if (!flow) return Promise.resolve(false);
+      const requestId = ++state.flowTraceRequestId;
+      const entrypoint = briefingFlowEntrypoint(flow);
+      if (!entrypoint) {
+        clearLoadingTask('flowTrace');
+        return Promise.resolve(startInferredFlowPlayback(flow, options));
+      }
+      setLoadingTask(
+        'flowTrace',
+        'Tracing static flow',
+        'Following the exact directed route, handler, call, and outbound HTTP evidence.',
+        { blocking: false }
+      );
+      return requestCanonicalFlowTrace(entrypoint, options.maxHops || FLOW_TRACE_MAX_HOPS)
+        .then(trace => {
+          if (requestId !== state.flowTraceRequestId) return false;
+          const playback = buildCanonicalFlowPlayback(flow, trace, options);
+          if (!playback || !playback.steps.length) {
+            const traceGap = trace && Array.isArray(trace.gaps) ? trace.gaps.find(Boolean) : '';
+            throw new Error(traceGap || 'Canonical trace did not contain a valid directed primary path.');
+          }
+          return activateFlowPlayback(playback, options);
+        })
+        .catch(error => {
+          if (requestId !== state.flowTraceRequestId) return false;
+          return startInferredFlowPlayback(flow, {
+            ...options,
+            canonicalError: error && error.message ? error.message : 'Canonical trace request failed.'
+          });
+        })
+        .finally(() => {
+          if (requestId === state.flowTraceRequestId) clearLoadingTask('flowTrace');
+        });
+    }
+
+    function startInferredFlowPlayback(flow, options) {
+      const playback = buildFlowPlayback(flow, options || {});
+      return activateFlowPlayback(playback, options || {});
+    }
+
+    function activateFlowPlayback(playback, options) {
+      options = options || {};
+      if (!playback || !playback.steps.length) return false;
       if (state.view !== 'architecture') setGraph('architecture');
-      applyMapLens(flowPlaybackLensForFlow(flow));
-      const playback = buildFlowPlayback(flow, options);
-      if (!playback.steps.length) return;
+      applyMapLens(playback.lens || 'subway');
       state.flowPlayback = playback;
       state.selected = { kind: 'flowPlayback', playback };
       ensureFlowPlaybackVisibility(playback);
@@ -3395,6 +3438,7 @@
       renderSelection(state.selected);
       window.requestAnimationFrame(() => focusCameraOnFlowStep());
       scheduleUrlStateUpdate();
+      return true;
     }
 
     function flowPlaybackLensForFlow(flow) {
@@ -3406,6 +3450,225 @@
       if (id.includes('git') || id.includes('change')) return 'git';
       if (id.includes('request') || id.includes('api') || id.includes('startup')) return 'apis';
       return 'subway';
+    }
+
+    function exactRouteEntrypoint(value) {
+      const match = String(value || '').trim().match(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT|USE|ROUTE|API_ROUTE)\s+(\/\S*)$/i);
+      return match ? match[1].toUpperCase() + ' ' + match[2] : '';
+    }
+
+    function briefingFlowEntrypoint(flow) {
+      for (const step of (flow && flow.steps) || []) {
+        const candidates = [step.title];
+        for (const proof of step.evidence || []) {
+          candidates.push(proof.title, proof.label, proof.detail);
+        }
+        for (const candidate of candidates) {
+          const entrypoint = exactRouteEntrypoint(candidate);
+          if (entrypoint) return entrypoint;
+        }
+      }
+      return '';
+    }
+
+    function requestCanonicalFlowTrace(entrypoint, maxHops) {
+      return fetch('/api/flow-trace', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entrypoint,
+          max_hops: clamp(Math.round(Number(maxHops || FLOW_TRACE_MAX_HOPS)), 1, 64)
+        })
+      }).then(async response => {
+        const payload = await response.json();
+        if (!response.ok || payload.ok === false) throw new Error(payload.error || 'Canonical static trace unavailable.');
+        return payload.trace || payload.flow_trace || payload;
+      });
+    }
+
+    function canonicalTracePrimaryPath(trace) {
+      if (!trace || String(trace.trace_kind || '') !== 'static') return null;
+      const stepById = new Map();
+      for (const step of trace.steps || []) {
+        const id = String(step && step.id || '');
+        if (id) stepById.set(id, step);
+      }
+      const pathIds = Array.isArray(trace.primary_path) ? trace.primary_path.map(id => String(id || '')) : [];
+      if (!pathIds.length || pathIds.some(id => !id || !stepById.has(id))) return null;
+      const allowedEdgeTypes = new Set(['HANDLES', 'CALLS', 'HTTP_CALLS']);
+      const links = Array.isArray(trace.links) ? trace.links : [];
+      const pathLinks = [];
+      for (let index = 1; index < pathIds.length; index += 1) {
+        const sourceStepId = pathIds[index - 1];
+        const targetStepId = pathIds[index];
+        const link = links.find(item =>
+          String(item && item.source_step_id || '') === sourceStepId &&
+          String(item && item.target_step_id || '') === targetStepId &&
+          allowedEdgeTypes.has(String(item && item.edge_type || '').toUpperCase())
+        );
+        if (!link) return null;
+        pathLinks.push(link);
+      }
+      return {
+        ids: pathIds,
+        steps: pathIds.map(id => stepById.get(id)),
+        links: pathLinks
+      };
+    }
+
+    function buildCanonicalFlowPlayback(flow, trace, options) {
+      options = options || {};
+      const primary = canonicalTracePrimaryPath(trace);
+      if (!primary) return null;
+      const mappedNodeIds = primary.steps.map(step => canonicalFlowPlaybackNodeId(step));
+      const steps = primary.steps.map((traceStep, index) => {
+        const link = index > 0 ? primary.links[index - 1] : null;
+        const sourceTraceStep = index > 0 ? primary.steps[index - 1] : null;
+        const sourceId = index > 0 ? mappedNodeIds[index - 1] : '';
+        const targetId = mappedNodeIds[index] || '';
+        const edge = link && sourceId && targetId && sourceId !== targetId
+          ? flowPlaybackDirectedEdge(sourceId, targetId, link.edge_type)
+          : null;
+        const nodeIds = new Set();
+        if (sourceId) nodeIds.add(sourceId);
+        if (targetId) nodeIds.add(targetId);
+        return {
+          index,
+          title: String(traceStep.label || traceStep.qualified_name || traceStep.node_key || traceStep.id || 'Trace step'),
+          detail: canonicalFlowPlaybackDetail(traceStep, link),
+          component: targetId,
+          confidence: link && Number.isFinite(Number(link.confidence)) ? Number(link.confidence) : 0,
+          evidence: canonicalTraceEvidence(traceStep, link, sourceTraceStep),
+          sourceId,
+          targetId,
+          nodeIds: [...nodeIds],
+          edge,
+          edgeKey: edge ? edgeKeyForSide(edge, null) : '',
+          edgeType: link ? String(link.edge_type || '').toLowerCase() : '',
+          mode: 'canonical',
+          traceStepId: String(traceStep.id || ''),
+          nodeKey: String(traceStep.node_key || ''),
+          filePath: String(traceStep.file_path || ''),
+          qualifiedName: String(traceStep.qualified_name || ''),
+          signature: String(traceStep.signature || ''),
+          lineStart: traceStep.line_start,
+          lineEnd: traceStep.line_end,
+          role: String(traceStep.role || ''),
+          status: String(traceStep.status || ''),
+          isSink: Boolean(traceStep.is_sink),
+          canonicalLink: link || null
+        };
+      });
+      const nodeIds = new Set();
+      const edgeKeys = new Set();
+      for (const step of steps) {
+        for (const id of step.nodeIds) nodeIds.add(id);
+        if (step.edgeKey) edgeKeys.add(step.edgeKey);
+      }
+      return {
+        flowId: String(flow.id || 'flow'),
+        title: String(flow.title || trace.entrypoint || 'Repository flow'),
+        intent: String(flow.intent || ''),
+        lens: flowPlaybackLensForFlow(flow),
+        mode: 'canonical',
+        notice: 'Evidence-backed canonical static trace. Static ordering does not prove runtime execution order.',
+        traceKind: 'static',
+        schemaVersion: trace.schema_version,
+        orderingBasis: String(trace.ordering_basis || ''),
+        entrypoint: String(trace.entrypoint || ''),
+        complete: Boolean(trace.complete),
+        gaps: Array.isArray(trace.gaps) ? trace.gaps.map(String) : [],
+        warnings: Array.isArray(trace.warnings) ? trace.warnings.map(String) : [],
+        branchLinkCount: Math.max(0, (Array.isArray(trace.links) ? trace.links.length : 0) - primary.links.length),
+        primaryPath: primary.ids,
+        traceLinks: Array.isArray(trace.links) ? trace.links : [],
+        steps,
+        stepIndex: clamp(Math.round(Number(options.stepIndex || 0)), 0, Math.max(0, steps.length - 1)),
+        playing: Boolean(options.playing),
+        speedMs: Number(options.speedMs || 1600),
+        lastAdvanceAt: performance.now(),
+        nodeIds,
+        edgeKeys
+      };
+    }
+
+    function canonicalFlowPlaybackNodeId(step) {
+      if (!step) return '';
+      const nodeKey = String(step.node_key || '').trim();
+      if (String(step.status || '') === 'unresolved' || String(step.role || '') === 'unresolved') return '';
+      if (nodeKey && state.nodeIndex.has(nodeKey)) return nodeKey;
+      if (nodeKey && String(step.role || '') === 'external_http') {
+        for (const edge of state.allEdges || []) {
+          for (const example of edge.examples || []) {
+            const sourceKey = String(example && example.source && example.source.key || '');
+            const targetKey = String(example && example.target && example.target.key || '');
+            if (sourceKey === nodeKey && state.nodeIndex.has(edge.source)) return edge.source;
+            if (targetKey === nodeKey && state.nodeIndex.has(edge.target)) return edge.target;
+          }
+        }
+      }
+      const filePath = String(step.file_path || '').trim();
+      if (filePath) {
+        const component = briefingComponentFromPath(filePath);
+        if (component && state.nodeIndex.has(component)) return component;
+      }
+      const label = String(step.label || '').trim();
+      if (!label) return '';
+      const exact = allKnownNodes().find(node => String(node.id || '') === label || String(node.label || '') === label);
+      return exact ? exact.id : '';
+    }
+
+    function flowPlaybackDirectedEdge(sourceId, targetId, edgeType) {
+      if (!sourceId || !targetId) return null;
+      const expectedType = String(edgeType || '').toLowerCase();
+      return (state.allEdges || []).find(edge =>
+        edge.source === sourceId &&
+        edge.target === targetId &&
+        String(edge.type || '').toLowerCase() === expectedType
+      ) || null;
+    }
+
+    function canonicalFlowPlaybackDetail(step, link) {
+      const parts = [];
+      if (step.role) parts.push(String(step.role).replace(/_/g, ' '));
+      if (step.status) parts.push('status ' + step.status);
+      if (link) parts.push(canonicalTraceLinkDetail(link));
+      if (step.is_sink) parts.push('sink');
+      return parts.filter(Boolean).join(' / ') || 'Canonical static trace step.';
+    }
+
+    function canonicalTraceLinkDetail(link) {
+      const parts = [String(link.edge_type || '').toUpperCase()];
+      if (link.source_line !== undefined && link.source_line !== null) parts.push('line ' + link.source_line);
+      const args = Array.isArray(link.arguments) ? link.arguments : [];
+      if (args.length) parts.push('arguments: ' + args.join(', '));
+      if (link.resolution_tier) parts.push('tier: ' + link.resolution_tier);
+      if (link.ordering_basis) parts.push('ordering: ' + link.ordering_basis);
+      return parts.filter(Boolean).join(' / ');
+    }
+
+    function canonicalTraceEvidence(step, link, sourceStep) {
+      const sourceLabel = sourceStep && (sourceStep.label || sourceStep.qualified_name || sourceStep.node_key);
+      const evidence = [{
+        kind: 'canonical trace node',
+        title: String(step.label || step.node_key || step.id || 'Trace step'),
+        path: String(step.file_path || ''),
+        line: step.line_start,
+        detail: [step.qualified_name, step.role, step.status].filter(Boolean).join(' / ') || 'static trace node',
+        component: canonicalFlowPlaybackNodeId(step)
+      }];
+      if (link) {
+        evidence.unshift({
+          kind: 'canonical ' + String(link.edge_type || '').toLowerCase(),
+          title: String(sourceLabel || 'trace step') + ' -> ' + String(step.label || step.node_key || step.id || 'trace step'),
+          path: String(link.source_file_path || link.file_path || (sourceStep && sourceStep.file_path) || ''),
+          line: link.source_line,
+          detail: canonicalTraceLinkDetail(link),
+          confidence: Number.isFinite(Number(link.confidence)) ? Number(link.confidence) : undefined,
+          component: canonicalFlowPlaybackNodeId(sourceStep)
+        });
+      }
+      return evidence;
     }
 
     function buildFlowPlayback(flow, options) {
@@ -3428,6 +3691,9 @@
         title: String(flow.title || 'Repository flow'),
         intent: String(flow.intent || ''),
         lens: flowPlaybackLensForFlow(flow),
+        mode: 'inferred',
+        notice: INFERRED_FLOW_NOTICE,
+        canonicalError: String(options.canonicalError || ''),
         steps,
         stepIndex: clamp(Math.round(Number(options.stepIndex || 0)), 0, Math.max(0, steps.length - 1)),
         playing: Boolean(options.playing),
@@ -3721,9 +3987,10 @@
       const step = flowPlaybackCurrentStep();
       const count = playback.steps.length;
       hud.hidden = false;
-      document.getElementById('flowPlaybackTitle').textContent = playback.title;
+      const modeLabel = playback.mode === 'canonical' ? 'Canonical static trace' : 'Inferred reading path';
+      document.getElementById('flowPlaybackTitle').textContent = playback.title + ' — ' + modeLabel;
       document.getElementById('flowPlaybackStep').textContent = step
-        ? 'Step ' + (playback.stepIndex + 1) + ' of ' + count + ': ' + step.title
+        ? (playback.notice ? playback.notice + ' ' : '') + 'Step ' + (playback.stepIndex + 1) + ' of ' + count + ': ' + step.title
         : 'Step 0 of 0';
       document.getElementById('flowPlaybackPrevBtn').disabled = playback.stepIndex <= 0;
       document.getElementById('flowPlaybackNextBtn').disabled = playback.stepIndex >= count - 1;
@@ -3735,6 +4002,8 @@
     }
 
     function stopFlowPlayback() {
+      state.flowTraceRequestId += 1;
+      clearLoadingTask('flowTrace');
       state.flowPlayback = null;
       state.pendingFlowPlaybackUrl = null;
       if (state.selected && state.selected.kind === 'flowPlayback') state.selected = null;
@@ -3929,11 +4198,19 @@
         return;
       }
       appendDetailSection(stack, 'Flow Playback', [
+        playback.notice || '',
         playback.intent || 'Animated evidence path through the repository.',
+        playback.mode === 'canonical' ? 'trace kind: static' : 'trace kind: inferred reading path',
+        playback.schemaVersion !== undefined ? 'schema version: ' + playback.schemaVersion : '',
+        playback.orderingBasis ? 'ordering basis: ' + playback.orderingBasis : '',
+        playback.entrypoint ? 'entrypoint: ' + playback.entrypoint : '',
+        playback.mode === 'canonical' ? 'complete: ' + String(Boolean(playback.complete)) : '',
+        playback.branchLinkCount ? 'additional branch links retained by trace: ' + playback.branchLinkCount : '',
         'step: ' + (playback.stepIndex + 1) + ' of ' + playback.steps.length,
         'lens: ' + (LENS_LABELS[playback.lens] || playback.lens || 'Overview'),
-        playback.playing ? 'status: playing' : 'status: paused'
-      ], true);
+        playback.playing ? 'status: playing' : 'status: paused',
+        playback.canonicalError ? 'canonical trace error: ' + playback.canonicalError : ''
+      ].filter(Boolean), true);
       const controls = appendDetailSection(stack, 'Playback Controls', [], false);
       const row = document.createElement('div');
       row.className = 'flow-playback-selection-controls';
@@ -3951,9 +4228,46 @@
         step.sourceId ? 'source: ' + labelForNode(step.sourceId) : '',
         step.targetId ? 'target: ' + labelForNode(step.targetId) : '',
         step.edgeType ? 'connection: ' + step.edgeType : '',
+        step.traceStepId ? 'trace step: ' + step.traceStepId : '',
+        step.nodeKey ? 'node key: ' + step.nodeKey : '',
+        step.qualifiedName ? 'qualified name: ' + step.qualifiedName : '',
+        step.signature ? 'signature: ' + step.signature : '',
+        step.filePath ? 'file: ' + step.filePath + (step.lineStart ? ':' + step.lineStart : '') : '',
+        step.lineEnd ? 'line end: ' + step.lineEnd : '',
+        step.role ? 'role: ' + step.role : '',
+        step.status ? 'resolution: ' + step.status : '',
+        step.canonicalLink && step.canonicalLink.source_line !== undefined && step.canonicalLink.source_line !== null
+          ? 'source line: ' + step.canonicalLink.source_line
+          : '',
+        step.canonicalLink && Array.isArray(step.canonicalLink.arguments) && step.canonicalLink.arguments.length
+          ? 'arguments: ' + step.canonicalLink.arguments.join(', ')
+          : '',
+        step.canonicalLink && step.canonicalLink.resolution_tier
+          ? 'resolution tier: ' + step.canonicalLink.resolution_tier
+          : '',
+        step.canonicalLink && step.canonicalLink.ordering_basis
+          ? 'ordering basis: ' + step.canonicalLink.ordering_basis
+          : '',
+        step.canonicalLink && step.canonicalLink.display
+          ? 'call display: ' + step.canonicalLink.display
+          : '',
+        step.canonicalLink && (
+          step.canonicalLink.source_node_key ||
+          step.canonicalLink.target_node_key ||
+          step.canonicalLink.source_key ||
+          step.canonicalLink.target_key
+        )
+          ? 'edge keys: ' + [
+            step.canonicalLink.source_node_key || step.canonicalLink.source_key,
+            step.canonicalLink.target_node_key || step.canonicalLink.target_key
+          ].filter(Boolean).join(' -> ')
+          : '',
+        step.isSink ? 'sink: yes' : '',
         step.confidence ? 'confidence: ' + Math.round(step.confidence * 100) + '%' : ''
       ].filter(Boolean), true);
       current.appendChild(briefingEvidenceBlock(step.detail || playback.intent || 'Flow step evidence.', step.evidence || []));
+      if (playback.gaps && playback.gaps.length) appendDetailSection(stack, 'Trace Gaps', playback.gaps, true);
+      if (playback.warnings && playback.warnings.length) appendDetailSection(stack, 'Trace Warnings', playback.warnings, false);
       const timelineBody = appendDetailSection(stack, 'Flow Timeline', [], false);
       timelineBody.appendChild(flowPlaybackTimeline(playback));
     }
@@ -3985,6 +4299,8 @@
         meta.textContent = [
           step.component || '',
           step.edgeType || '',
+          step.role || '',
+          step.status || '',
           step.confidence ? Math.round(step.confidence * 100) + '% confidence' : ''
         ].filter(Boolean).join(' / ');
         copy.append(title, meta);
@@ -8586,7 +8902,7 @@
     }
 
     function drawFlowPlaybackPathOverlay(nodesById, transform, rect, side) {
-      if (side || !state.flowPlayback) return;
+      if (side || !state.flowPlayback || state.flowPlayback.mode === 'canonical') return;
       const points = flowPlaybackRevealedPathPoints(flowPlaybackPathPoints(nodesById, transform, rect));
       if (points.length < 2) return;
       ctx.save();
@@ -8645,7 +8961,7 @@
     }
 
     function drawFlowPlaybackVirtualEdge(nodesById, transform, rect, side) {
-      if (side || !state.flowPlayback) return;
+      if (side || !state.flowPlayback || state.flowPlayback.mode === 'canonical') return;
       const step = flowPlaybackCurrentStep();
       if (!step || step.edge || !step.sourceId || !step.targetId || step.sourceId === step.targetId) return;
       const source = nodesById.get(step.sourceId);

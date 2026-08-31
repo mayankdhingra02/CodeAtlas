@@ -20,10 +20,15 @@ from urllib.parse import parse_qs, urlparse
 from .analysis import dead_code, http_confidence_summary, route_summary, structural_query
 from .briefing import repo_briefing
 from .config import CodeAtlasPaths, resolve_repo_root
+from .flow_trace import trace_flow
 from .indexer import RepositoryIndexer
 from .memory import MemoryQueryEngine, MemoryStore, component_for_path, metadata_files, parse_json
 from .packs import context_pack, render_context_pack
-from .project_config import load_project_config, restore_classification_config, update_classification_config
+from .project_config import (
+    load_project_config,
+    restore_classification_config,
+    update_classification_config,
+)
 from .retrieval import RetrievalEngine
 from .rules import run_rule_checks
 from .source import source_outline
@@ -793,6 +798,24 @@ def create_visualization_server(
                     task = str(payload.get("task", ""))
                     max_tokens = int(payload.get("max_tokens", 5000))
                     result = service.agent_context(repo_root, task, max_tokens=max_tokens)
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+                    return
+                self._send_json({"ok": True, **result})
+                return
+
+            if parsed.path == "/api/flow-trace":
+                try:
+                    payload = self._read_json()
+                    entrypoint = str(payload.get("entrypoint", ""))
+                    if not entrypoint.strip():
+                        raise ValueError("entrypoint is required")
+                    max_hops = int(payload.get("max_hops", 12))
+                    result = trace_flow(
+                        repo_root,
+                        entrypoint,
+                        max_hops=max_hops,
+                    ).to_dict()
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
                     return
