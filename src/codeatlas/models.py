@@ -174,6 +174,12 @@ class IndexReport:
     parser_errors: tuple[str, ...] = ()
     file_results: tuple[IndexedFileResult, ...] = ()
     warnings: tuple[str, ...] = ()
+    files_content_parsed: int = 0
+    files_semantically_reresolved: int = 0
+    relationships_removed: int = 0
+    relationships_replaced: int = 0
+    conservative_fallback_used: bool = False
+    conservative_fallback_reason: str | None = None
 
 
 @dataclass(frozen=True)

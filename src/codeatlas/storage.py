@@ -15,6 +15,13 @@ from .models import EdgeType, ImportRecord, NodeType, SourceFile, SymbolKind, Sy
 SCHEMA_VERSION = 3
 MAX_EDGE_EXAMPLES = 20
 MAX_EDGE_LINES = 1000
+PRECISE_RESOLUTION_TIERS = {"external", "scip"}
+EDGE_AGGREGATE_METADATA_KEYS = {
+    "count",
+    "examples",
+    "lines",
+    "resolution_tier_counts",
+}
 RESOLUTION_TIER_PRIORITY = {
     "unresolved": 0,
     "heuristic": 1,
@@ -243,7 +250,13 @@ class GraphStore:
         ).fetchone()
         return int(row["id"])
 
-    def delete_file(self, relative_path: str, replacement_keys: set[str] | None = None) -> bool:
+    def delete_file(
+        self,
+        relative_path: str,
+        replacement_keys: set[str] | None = None,
+        *,
+        commit: bool = True,
+    ) -> bool:
         row = self.connection.execute(
             "SELECT id FROM files WHERE path = ?", (relative_path,)
         ).fetchone()
@@ -277,12 +290,266 @@ class GraphStore:
             )
         self.connection.execute("DELETE FROM files WHERE id = ?", (int(row["id"]),))
         self.connection.execute("DELETE FROM files_fts WHERE path = ?", (relative_path,))
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
+        self._symbol_resolution_index = None
         return True
 
     def previous_file_hashes(self) -> dict[str, str]:
         rows = self.connection.execute("SELECT path, sha256 FROM files").fetchall()
         return {str(row["path"]): str(row["sha256"]) for row in rows}
+
+    def semantic_symbols_for_files(self, file_paths: Iterable[str]) -> list[sqlite3.Row]:
+        paths = sorted(set(file_paths))
+        if not paths:
+            return []
+        placeholders = ",".join("?" for _ in paths)
+        return list(
+            self.connection.execute(
+                f"""
+                SELECT
+                  f.path AS file_path,
+                  s.name,
+                  s.qualified_name,
+                  s.module,
+                  s.kind
+                FROM symbols s
+                JOIN files f ON f.id = s.file_id
+                WHERE f.path IN ({placeholders})
+                ORDER BY f.path, s.qualified_name
+                """,
+                tuple(paths),
+            ).fetchall()
+        )
+
+    def semantic_imports_for_files(self, file_paths: Iterable[str]) -> list[sqlite3.Row]:
+        paths = sorted(set(file_paths))
+        if not paths:
+            return []
+        placeholders = ",".join("?" for _ in paths)
+        return list(
+            self.connection.execute(
+                f"""
+                SELECT
+                  f.path AS file_path,
+                  (
+                    SELECT n.label
+                    FROM nodes n
+                    WHERE n.file_path = f.path AND n.type = 'MODULE'
+                    ORDER BY n.key
+                    LIMIT 1
+                  ) AS source_module,
+                  i.module,
+                  i.name,
+                  i.alias,
+                  i.line_number,
+                  i.is_from
+                FROM imports i
+                JOIN files f ON f.id = i.file_id
+                WHERE f.path IN ({placeholders})
+                ORDER BY f.path, i.line_number
+                """,
+                tuple(paths),
+            ).fetchall()
+        )
+
+    def semantic_dependent_files(
+        self,
+        *,
+        symbol_names: Iterable[str],
+        symbol_keys: Iterable[str],
+        module_names: Iterable[str],
+    ) -> set[str]:
+        """Find files that may resolve differently after a symbol-universe change."""
+        names = sorted({name for name in symbol_names if name})
+        modules = sorted({module for module in module_names if module})
+        target_keys = {key for key in symbol_keys if key}
+        target_keys.update(unresolved_symbol_node_key(name) for name in names)
+
+        if names:
+            placeholders = ",".join("?" for _ in names)
+            rows = self.connection.execute(
+                f"SELECT qualified_name FROM symbols WHERE name IN ({placeholders})",
+                tuple(names),
+            ).fetchall()
+            target_keys.update(symbol_node_key(str(row["qualified_name"])) for row in rows)
+
+        dependent_paths: set[str] = set()
+        if target_keys:
+            keys = sorted(target_keys)
+            placeholders = ",".join("?" for _ in keys)
+            rows = self.connection.execute(
+                f"""
+                SELECT DISTINCT source.file_path
+                FROM edges e
+                JOIN nodes source ON source.key = e.source_key
+                WHERE e.edge_type IN ('CALLS', 'INHERITS', 'REFERENCES')
+                  AND e.target_key IN ({placeholders})
+                  AND source.file_path IS NOT NULL
+                """,
+                tuple(keys),
+            ).fetchall()
+            dependent_paths.update(str(row["file_path"]) for row in rows)
+
+        # Follow importers in reverse until the closure stops growing.  Import
+        # modules are stored exactly as parsed (including Python ``.facade`` and
+        # JS/TS ``../facade`` spellings), so normalize them relative to the
+        # importing module before comparing them with graph module names.
+        affected_modules = set(modules)
+        import_rows = self.all_semantic_imports()
+        changed = True
+        while changed:
+            changed = False
+            for row in import_rows:
+                source_module = str(row["source_module"] or "")
+                imported_module = normalize_import_module(
+                    str(row["module"] or ""),
+                    source_module,
+                    source_file_path=str(row["file_path"] or ""),
+                )
+                imported_name = str(row["name"] or "")
+                local_name = str(row["alias"] or imported_name)
+                imported_target = (
+                    f"{imported_module}.{imported_name}"
+                    if imported_module and imported_name
+                    else imported_module
+                )
+                imports_affected_value = (
+                    imported_module in affected_modules
+                    or imported_target in affected_modules
+                    or imported_name in names
+                    or local_name in names
+                )
+                if not imports_affected_value:
+                    continue
+                dependent_paths.add(str(row["file_path"]))
+                if source_module and source_module not in affected_modules:
+                    affected_modules.add(source_module)
+                    changed = True
+
+        for name in names:
+            rows = self.connection.execute(
+                """
+                SELECT DISTINCT file_path
+                FROM snippets
+                WHERE symbol_id IS NULL
+                  AND INSTR(code, ?) > 0
+                """,
+                (name,),
+            ).fetchall()
+            dependent_paths.update(str(row["file_path"]) for row in rows)
+        return dependent_paths
+
+    def resolution_edge_counts_for_files(
+        self,
+        file_paths: Iterable[str],
+    ) -> dict[str, int]:
+        paths = sorted(set(file_paths))
+        if not paths:
+            return {}
+        placeholders = ",".join("?" for _ in paths)
+        rows = self.connection.execute(
+            f"""
+            SELECT n.file_path, COUNT(e.id) AS edge_count
+            FROM nodes n
+            JOIN edges e ON e.source_key = n.key
+            WHERE n.file_path IN ({placeholders})
+              AND e.edge_type IN ('CALLS', 'INHERITS', 'REFERENCES', 'HTTP_CALLS')
+              AND COALESCE(json_extract(e.metadata_json, '$.resolution_tier'), '')
+                  NOT IN ('scip', 'external')
+            GROUP BY n.file_path
+            """,
+            tuple(paths),
+        ).fetchall()
+        counts = {path: 0 for path in paths}
+        counts.update({str(row["file_path"]): int(row["edge_count"]) for row in rows})
+        return counts
+
+    def delete_resolution_edges_for_files(self, file_paths: Iterable[str]) -> int:
+        paths = sorted(set(file_paths))
+        if not paths:
+            return 0
+        placeholders = ",".join("?" for _ in paths)
+        node_rows = self.connection.execute(
+            f"SELECT key FROM nodes WHERE file_path IN ({placeholders})",
+            tuple(paths),
+        ).fetchall()
+        source_keys = [str(row["key"]) for row in node_rows]
+        if not source_keys:
+            return 0
+        key_placeholders = ",".join("?" for _ in source_keys)
+        cursor = self.connection.execute(
+            f"""
+            DELETE FROM edges
+            WHERE source_key IN ({key_placeholders})
+              AND edge_type IN ('CALLS', 'INHERITS', 'REFERENCES', 'HTTP_CALLS')
+              AND COALESCE(json_extract(metadata_json, '$.resolution_tier'), '')
+                  NOT IN ('scip', 'external')
+            """,
+            tuple(source_keys),
+        )
+        self._retain_precise_outgoing_edge_evidence(
+            source_keys,
+            edge_types=(
+                EdgeType.CALLS.value,
+                EdgeType.INHERITS.value,
+                EdgeType.REFERENCES.value,
+                EdgeType.HTTP_CALLS.value,
+            ),
+        )
+        return max(int(cursor.rowcount), 0)
+
+    def _retain_precise_outgoing_edge_evidence(
+        self,
+        source_keys: Iterable[str],
+        *,
+        edge_types: tuple[str, ...] = (),
+    ) -> None:
+        keys = sorted(set(source_keys))
+        if not keys:
+            return
+        key_placeholders = ",".join("?" for _ in keys)
+        clauses = [f"source_key IN ({key_placeholders})"]
+        params: list[str] = list(keys)
+        if edge_types:
+            type_placeholders = ",".join("?" for _ in edge_types)
+            clauses.append(f"edge_type IN ({type_placeholders})")
+            params.extend(edge_types)
+        tier_placeholders = ",".join("?" for _ in PRECISE_RESOLUTION_TIERS)
+        clauses.append(
+            "json_extract(metadata_json, '$.resolution_tier') "
+            f"IN ({tier_placeholders})"
+        )
+        params.extend(sorted(PRECISE_RESOLUTION_TIERS))
+        rows = self.connection.execute(
+            f"""
+            SELECT id, metadata_json
+            FROM edges
+            WHERE {' AND '.join(clauses)}
+            """,
+            tuple(params),
+        ).fetchall()
+        for row in rows:
+            metadata = json.loads(str(row["metadata_json"] or "{}"))
+            retained = retain_precise_edge_metadata(metadata)
+            self.connection.execute(
+                "UPDATE edges SET metadata_json = ? WHERE id = ?",
+                (json.dumps(retained, sort_keys=True), int(row["id"])),
+            )
+
+    def prune_orphan_symbol_references(self) -> int:
+        cursor = self.connection.execute(
+            """
+            DELETE FROM nodes
+            WHERE key LIKE 'symbol_ref:%'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM edges e
+                WHERE e.source_key = nodes.key OR e.target_key = nodes.key
+              )
+            """
+        )
+        return max(int(cursor.rowcount), 0)
 
     def insert_node(
         self,
@@ -393,6 +660,7 @@ class GraphStore:
                 1 if record.is_from else 0,
             ),
         )
+        self._symbol_resolution_index = None
 
     def upsert_file_search(self, source_file: SourceFile, content: str) -> None:
         self.connection.execute("DELETE FROM files_fts WHERE path = ?", (source_file.relative_path,))
@@ -596,6 +864,10 @@ class GraphStore:
     def commit(self) -> None:
         self.connection.commit()
 
+    def rollback(self) -> None:
+        self.connection.rollback()
+        self._symbol_resolution_index = None
+
     def count_edges(self) -> int:
         row = self.connection.execute("SELECT COUNT(*) AS count FROM edges").fetchone()
         return int(row["count"])
@@ -673,8 +945,15 @@ class GraphStore:
         name: str,
         source_module: str | None = None,
         imports: Iterable[ImportRecord] = (),
+        *,
+        source_file_path: str | None = None,
     ) -> str | None:
-        resolved = self.resolve_symbol(name, source_module, imports)
+        resolved = self.resolve_symbol(
+            name,
+            source_module,
+            imports,
+            source_file_path=source_file_path,
+        )
         return resolved.node_key if resolved else None
 
     def resolve_symbol(
@@ -682,13 +961,48 @@ class GraphStore:
         name: str,
         source_module: str | None = None,
         imports: Iterable[ImportRecord] = (),
+        *,
+        source_file_path: str | None = None,
     ) -> SymbolResolution | None:
-        return self.symbol_resolution_index().resolve(name, source_module, imports)
+        return self.symbol_resolution_index().resolve(
+            name,
+            source_module,
+            imports,
+            source_file_path=source_file_path,
+        )
 
     def symbol_resolution_index(self) -> SymbolResolutionIndex:
         if self._symbol_resolution_index is None:
-            self._symbol_resolution_index = SymbolResolutionIndex(self.all_symbols())
+            self._symbol_resolution_index = SymbolResolutionIndex(
+                self.all_symbols(),
+                self.all_semantic_imports(),
+            )
         return self._symbol_resolution_index
+
+    def all_semantic_imports(self) -> list[sqlite3.Row]:
+        return list(
+            self.connection.execute(
+                """
+                SELECT
+                  f.path AS file_path,
+                  (
+                    SELECT n.label
+                    FROM nodes n
+                    WHERE n.file_path = f.path AND n.type = 'MODULE'
+                    ORDER BY n.key
+                    LIMIT 1
+                  ) AS source_module,
+                  i.module,
+                  i.name,
+                  i.alias,
+                  i.line_number,
+                  i.is_from
+                FROM imports i
+                JOIN files f ON f.id = i.file_id
+                ORDER BY f.path, i.line_number
+                """
+            ).fetchall()
+        )
 
     def traverse(self, start_keys: Iterable[str], depth: int) -> tuple[set[str], list[sqlite3.Row]]:
         start = set(start_keys)
@@ -1012,7 +1326,138 @@ def merge_edge_metadata(existing: dict[str, Any], incoming: dict[str, Any]) -> d
     if examples:
         merged["examples"] = examples[:MAX_EDGE_EXAMPLES]
     merged["count"] = existing_count + incoming_count
+    resolution_tier_counts = _merge_resolution_tier_counts(existing, incoming)
+    if resolution_tier_counts:
+        merged["resolution_tier_counts"] = resolution_tier_counts
     return merged
+
+
+def retain_precise_edge_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Drop replaceable parser evidence from a row that also carries precise evidence."""
+    top_tier = str(metadata.get("resolution_tier") or "")
+    if top_tier not in PRECISE_RESOLUTION_TIERS:
+        return dict(metadata)
+    raw_examples = metadata.get("examples")
+    if not isinstance(raw_examples, list):
+        return dict(metadata)
+
+    precise_examples: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for example in raw_examples:
+        if not isinstance(example, dict):
+            continue
+        tier = str(example.get("resolution_tier") or "")
+        if not tier:
+            example = dict(example)
+            example["resolution_tier"] = top_tier
+            for key in ("confidence", "source"):
+                if key in metadata:
+                    example.setdefault(key, metadata[key])
+            tier = top_tier
+        if tier not in PRECISE_RESOLUTION_TIERS:
+            continue
+        _append_edge_example(precise_examples, seen, example)
+    raw_counts = metadata.get("resolution_tier_counts")
+    precise_counts: dict[str, int]
+    if isinstance(raw_counts, dict):
+        precise_counts = {
+            str(tier): max(0, int(count))
+            for tier, count in raw_counts.items()
+            if str(tier) in PRECISE_RESOLUTION_TIERS and _is_int_like(count)
+        }
+    else:
+        precise_counts = {}
+        tagged_count = 0
+        for example in raw_examples:
+            if not isinstance(example, dict):
+                continue
+            count = _edge_count(example)
+            tier = str(example.get("resolution_tier") or "")
+            if tier:
+                tagged_count += count
+            if tier in PRECISE_RESOLUTION_TIERS:
+                precise_counts[tier] = precise_counts.get(tier, 0) + count
+        untagged_count = max(0, _edge_count(metadata) - tagged_count)
+        if untagged_count:
+            precise_counts[top_tier] = precise_counts.get(top_tier, 0) + untagged_count
+
+    if not precise_examples:
+        # The bounded example list can be filled by parser occurrences before
+        # precise evidence is merged.  The top-level tier/count still proves
+        # that precise evidence exists, but its line/arguments are no longer
+        # attributable.  Preserve a minimal provenance-only occurrence.
+        synthetic_example: dict[str, Any] = {"resolution_tier": top_tier}
+        for key in ("confidence", "source"):
+            if key in metadata:
+                synthetic_example[key] = metadata[key]
+        precise_examples.append(synthetic_example)
+        if not precise_counts:
+            precise_counts[top_tier] = 1
+
+    representative = max(
+        precise_examples,
+        key=lambda example: (
+            RESOLUTION_TIER_PRIORITY.get(str(example.get("resolution_tier") or ""), -1),
+            _edge_confidence(example),
+        ),
+    )
+    retained = {
+        key: value
+        for key, value in representative.items()
+        if key not in EDGE_AGGREGATE_METADATA_KEYS
+    }
+    # SCIP relationship payloads describe the precise evidence itself and are
+    # safe to retain even when their occurrence was capped out.  Do not copy
+    # generic top-level occurrence fields here: on a mixed row, line/display/
+    # arguments can belong to the replaceable parser evidence.
+    if "relationship" in metadata:
+        retained["relationship"] = metadata["relationship"]
+    for key in ("resolution_tier", "confidence", "source"):
+        if key in metadata:
+            retained[key] = metadata[key]
+    lines = merge_edge_lines(*precise_examples)
+    if lines:
+        retained["line"] = lines[0]
+        retained["lines"] = lines[:MAX_EDGE_LINES]
+    retained["examples"] = precise_examples[:MAX_EDGE_EXAMPLES]
+    precise_count = sum(precise_counts.values())
+    retained["count"] = max(1, precise_count)
+    if precise_counts:
+        retained["resolution_tier_counts"] = precise_counts
+    return retained
+
+
+def _merge_resolution_tier_counts(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for metadata in (existing, incoming):
+        for tier, count in _resolution_tier_counts(metadata).items():
+            merged[tier] = merged.get(tier, 0) + count
+    return merged
+
+
+def _resolution_tier_counts(metadata: dict[str, Any]) -> dict[str, int]:
+    raw_counts = metadata.get("resolution_tier_counts")
+    if isinstance(raw_counts, dict):
+        counts = {
+            str(tier): max(0, int(count))
+            for tier, count in raw_counts.items()
+            if str(tier) and _is_int_like(count)
+        }
+        if counts:
+            return counts
+    tier = str(metadata.get("resolution_tier") or "")
+    return {tier: _edge_count(metadata)} if tier else {}
+
+
+def _is_int_like(value: Any) -> bool:
+    try:
+        int(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def preferred_resolution_metadata(
@@ -1122,7 +1567,7 @@ def edge_occurrence_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in metadata.items()
-        if key not in {"count", "examples", "lines"} and value not in (None, "", [])
+        if key not in EDGE_AGGREGATE_METADATA_KEYS and value not in (None, "", [])
     }
 
 
@@ -1133,9 +1578,14 @@ class SymbolResolution:
 
 
 class SymbolResolutionIndex:
-    def __init__(self, rows: Iterable[sqlite3.Row]) -> None:
+    def __init__(
+        self,
+        rows: Iterable[sqlite3.Row],
+        import_rows: Iterable[sqlite3.Row] = (),
+    ) -> None:
         self.by_name: dict[str, list[sqlite3.Row]] = {}
         self.by_qualified_name: dict[str, sqlite3.Row] = {}
+        self.imports_by_module: dict[str, list[sqlite3.Row]] = {}
         for row in rows:
             name = str(row["name"])
             qualified_name = str(row["qualified_name"])
@@ -1143,12 +1593,18 @@ class SymbolResolutionIndex:
             self.by_qualified_name[qualified_name] = row
         for candidates in self.by_name.values():
             candidates.sort(key=_symbol_candidate_sort_key)
+        for row in import_rows:
+            source_module = str(row["source_module"] or "")
+            if source_module:
+                self.imports_by_module.setdefault(source_module, []).append(row)
 
     def resolve(
         self,
         name: str,
         source_module: str | None,
         imports: Iterable[ImportRecord],
+        *,
+        source_file_path: str | None = None,
     ) -> SymbolResolution | None:
         cleaned = name.strip()
         if not cleaned:
@@ -1159,7 +1615,12 @@ class SymbolResolutionIndex:
                 symbol_node_key(str(exact["qualified_name"])),
                 "exact_qualified",
             )
-        imported = self._resolve_import(cleaned, source_module, imports)
+        imported = self._resolve_import(
+            cleaned,
+            source_module,
+            imports,
+            source_file_path=source_file_path,
+        )
         if imported is not None:
             return imported
         if source_module:
@@ -1182,9 +1643,15 @@ class SymbolResolutionIndex:
         name: str,
         source_module: str | None,
         imports: Iterable[ImportRecord],
+        *,
+        source_file_path: str | None,
     ) -> SymbolResolution | None:
         for record in imports:
-            imported_module = normalize_import_module(record.module, source_module)
+            imported_module = normalize_import_module(
+                record.module,
+                source_module,
+                source_file_path=source_file_path,
+            )
             if record.is_from and record.name:
                 local_name = record.alias or record.name
                 if name != local_name:
@@ -1208,6 +1675,13 @@ class SymbolResolutionIndex:
                         symbol_node_key(str(candidates[0]["qualified_name"])),
                         "import_scoped",
                     )
+                reexported = self._resolve_reexport(
+                    imported_module,
+                    record.name,
+                    visited=set(),
+                )
+                if reexported is not None:
+                    return reexported
             elif not record.is_from:
                 local_module_name = record.alias or record.module.rsplit(".", 1)[-1]
                 if name == local_module_name and imported_module in self.by_qualified_name:
@@ -1223,6 +1697,59 @@ class SymbolResolutionIndex:
                         symbol_node_key(str(candidates[0]["qualified_name"])),
                         "import_scoped",
                     )
+        return None
+
+    def _resolve_reexport(
+        self,
+        source_module: str,
+        exported_name: str,
+        *,
+        visited: set[tuple[str, str]],
+    ) -> SymbolResolution | None:
+        identity = (source_module, exported_name)
+        if identity in visited:
+            return None
+        visited.add(identity)
+        for record in self.imports_by_module.get(source_module, []):
+            if not str(record["file_path"] or "").endswith(".py"):
+                continue
+            if not bool(record["is_from"]) or record["name"] is None:
+                continue
+            imported_name = str(record["name"])
+            local_name = str(record["alias"] or imported_name)
+            if local_name != exported_name:
+                continue
+            imported_module = normalize_import_module(
+                str(record["module"]),
+                source_module,
+                source_file_path=str(record["file_path"] or ""),
+            )
+            qualified_name = (
+                f"{imported_module}.{imported_name}" if imported_module else imported_name
+            )
+            symbol = self.by_qualified_name.get(qualified_name)
+            if symbol is not None:
+                return SymbolResolution(
+                    symbol_node_key(str(symbol["qualified_name"])),
+                    "import_scoped",
+                )
+            candidates = [
+                candidate
+                for candidate in self.by_name.get(imported_name, [])
+                if str(candidate["module"]) == imported_module
+            ]
+            if len(candidates) == 1:
+                return SymbolResolution(
+                    symbol_node_key(str(candidates[0]["qualified_name"])),
+                    "import_scoped",
+                )
+            nested = self._resolve_reexport(
+                imported_module,
+                imported_name,
+                visited=visited,
+            )
+            if nested is not None:
+                return nested
         return None
 
     def _same_module_candidate(
@@ -1259,14 +1786,40 @@ def _symbol_candidate_sort_key(row: sqlite3.Row) -> tuple[int, str]:
     return (qualified_name.count("."), qualified_name)
 
 
-def normalize_import_module(module: str, source_module: str | None) -> str:
+def normalize_import_module(
+    module: str,
+    source_module: str | None,
+    *,
+    source_file_path: str | None = None,
+) -> str:
+    normalized_path = module.replace("\\", "/")
+    if normalized_path.startswith(("./", "../")):
+        base_parts = source_module.split(".")[:-1] if source_module else []
+        remainder = normalized_path
+        while remainder.startswith("../"):
+            base_parts = base_parts[:-1]
+            remainder = remainder[3:]
+        if remainder.startswith("./"):
+            remainder = remainder[2:]
+        suffix = Path(remainder).suffix
+        if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            remainder = remainder[: -len(suffix)]
+        relative_parts = [part for part in remainder.split("/") if part]
+        return ".".join((*base_parts, *relative_parts))
     if not module.startswith("."):
         return module
     if not source_module:
         return module.lstrip(".")
     leading_dots = len(module) - len(module.lstrip("."))
     remainder = module[leading_dots:].replace("/", ".").strip(".")
-    base_parts = source_module.split(".")[:-1]
+    source_parts = source_module.split(".")
+    source_name = (
+        Path(source_file_path.replace("\\", "/")).name
+        if source_file_path
+        else ""
+    )
+    is_package_init = source_name in {"__init__.py", "__init__.pyi"}
+    base_parts = source_parts if is_package_init else source_parts[:-1]
     if leading_dots > 1:
         base_parts = base_parts[: max(0, len(base_parts) - (leading_dots - 1))]
     parts = [*base_parts]

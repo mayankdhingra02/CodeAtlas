@@ -53,7 +53,11 @@ def index_cmd(
     ] = Path("."),
     incremental: Annotated[
         bool,
-        typer.Option("--incremental", "-i", help="Only reprocess changed files."),
+        typer.Option(
+            "--incremental",
+            "-i",
+            help="Reparse changed files and re-resolve affected semantic relationships.",
+        ),
     ] = False,
 ) -> None:
     report = RepositoryIndexer().index(repo_path, incremental=incremental)
@@ -66,8 +70,21 @@ def index_cmd(
     table.add_row("Duration", f"{report.duration_seconds:.3f}s")
     table.add_row("Files scanned", str(report.files_scanned))
     table.add_row("Files indexed", str(report.files_indexed))
+    table.add_row("Files content-parsed", str(report.files_content_parsed))
+    table.add_row(
+        "Files semantically re-resolved",
+        str(report.files_semantically_reresolved),
+    )
     table.add_row("Files skipped", str(report.files_skipped))
     table.add_row("Files deleted", str(report.files_deleted))
+    table.add_row("Relationships removed", str(report.relationships_removed))
+    table.add_row("Relationships replaced", str(report.relationships_replaced))
+    table.add_row(
+        "Conservative fallback",
+        "yes" if report.conservative_fallback_used else "no",
+    )
+    if report.conservative_fallback_reason:
+        table.add_row("Fallback reason", report.conservative_fallback_reason)
     table.add_row("Symbols indexed", str(report.symbols_indexed))
     table.add_row("Graph edges", str(report.edges_indexed))
     console.print(table)
@@ -335,6 +352,13 @@ def index_status_cmd(
         "indexed",
         "last_indexed_at",
         "files_indexed",
+        "files_content_parsed",
+        "files_semantically_reresolved",
+        "files_skipped",
+        "relationships_removed",
+        "relationships_replaced",
+        "conservative_fallback_used",
+        "conservative_fallback_reason",
         "symbols",
         "graph_nodes",
         "graph_edges",
@@ -345,7 +369,9 @@ def index_status_cmd(
         "parser_errors",
         "artifact_exists",
     ):
-        if key in status:
+        if key in status and (
+            key != "conservative_fallback_reason" or status[key]
+        ):
             table.add_row(key.replace("_", " ").title(), str(status[key]))
     console.print(table)
 

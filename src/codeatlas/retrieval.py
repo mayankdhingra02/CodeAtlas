@@ -169,7 +169,7 @@ class RetrievalEngine:
         exact_keys = {symbol_node_key(str(row["qualified_name"])) for row in matches}
         edge_bonus = self._edge_bonus(edges)
         edge_reasons = self._edge_reasons_by_key(edges)
-        ranked: list[tuple[float, str, Any]] = []
+        ranked: list[tuple[int, float, str, Any]] = []
         seen: set[str] = set()
         for row in symbol_rows:
             qualified_name = str(row["qualified_name"])
@@ -178,15 +178,18 @@ class RetrievalEngine:
             seen.add(qualified_name)
             key = symbol_node_key(qualified_name)
             name = str(row["name"])
+            qualified_name_exact = qualified_name.lower() == query_lower
+            name_exact = name.lower() == query_lower
+            match_priority = 2 if qualified_name_exact else 1 if name_exact else 0
             score = 0.0
             reasons: list[str] = []
             if key in exact_keys:
                 score += 80
                 reasons.append("symbol match")
-            if name.lower() == query_lower:
+            if name_exact:
                 score += 1600
                 reasons.append("exact name")
-            elif qualified_name.lower() == query_lower:
+            elif qualified_name_exact:
                 score += 1700
                 reasons.append("exact qualified name")
             elif query_lower in name.lower():
@@ -214,19 +217,27 @@ class RetrievalEngine:
             if key in edge_bonus:
                 related = ", ".join(sorted(edge_reasons.get(key, ())))
                 reasons.append("graph neighbor" + (f" via {related}" if related else ""))
-            ranked.append((score, ", ".join(reasons) or "graph context", row))
+            ranked.append(
+                (
+                    match_priority,
+                    score,
+                    ", ".join(reasons) or "graph context",
+                    row,
+                )
+            )
 
         ranked.sort(
             key=lambda item: (
                 -item[0],
-                str(item[2]["file_path"]),
-                int(item[2]["line_start"]),
+                -item[1],
+                str(item[3]["file_path"]),
+                int(item[3]["line_start"]),
             )
         )
 
         snippets: list[ContextSnippet] = []
         used_tokens = 0
-        for score, reason, row in ranked:
+        for _, score, reason, row in ranked:
             file_path = str(row["file_path"])
             qualified_name = str(row["qualified_name"])
             code = (
@@ -308,7 +319,9 @@ class RetrievalEngine:
             start = max(1, best_line - 6) if best_line else 1
             end = min(len(lines), (best_line + 8) if best_line else 28)
             code = "\n".join(lines[start - 1 : end])
-            score = path_hits * 18 + best_hits * 12 + (4 if path_hits and best_hits else 0)
+            score = float(
+                path_hits * 18 + best_hits * 12 + (4 if path_hits and best_hits else 0)
+            )
             if relative_path in fts_rank_by_path:
                 score += 40 + min(20, abs(fts_rank_by_path[relative_path]))
             if intent == "test" and is_test_path(relative_path):
@@ -429,7 +442,10 @@ def trim_to_tokens(code: str, max_tokens: int) -> str:
     max_chars = max_tokens * 4
     if len(code) <= max_chars:
         return code
-    return code[:max_chars].rstrip() + "\n# ... truncated by CodeAtlas token limit"
+    suffix = "\n# ... truncated by CodeAtlas token limit"
+    if len(suffix) >= max_chars:
+        return code[:max_chars]
+    return code[: max_chars - len(suffix)].rstrip() + suffix
 
 
 def query_terms(query: str) -> tuple[str, ...]:

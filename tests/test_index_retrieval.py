@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
-import threading
 import textwrap
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -19,13 +19,17 @@ from codeatlas.config import CodeAtlasPaths
 from codeatlas.doctor import doctor_report
 from codeatlas.external_index import import_external_index
 from codeatlas.indexer import RepositoryIndexer
-from codeatlas.memory import MemoryQueryEngine
 from codeatlas.mcp_server import create_tool_handlers
+from codeatlas.memory import MemoryQueryEngine
 from codeatlas.models import SourceFile, estimate_tokens, estimate_tokens_for_size
 from codeatlas.packs import context_pack, render_context_pack
 from codeatlas.parsers.javascript import JavaScriptParser
 from codeatlas.parsers.python import PythonParser
-from codeatlas.project_config import load_project_config, restore_classification_config, update_classification_config
+from codeatlas.project_config import (
+    load_project_config,
+    restore_classification_config,
+    update_classification_config,
+)
 from codeatlas.retrieval import RetrievalEngine
 from codeatlas.rules import run_rule_checks
 from codeatlas.scanner import iter_source_files
@@ -42,8 +46,8 @@ from codeatlas.visualization import (
     render_visualization_app,
 )
 from codeatlas.workflow_cache import cached_workflow
-
 from tests.helpers import CodeAtlasTestCase, run_git
+
 
 class IndexAndRetrievalTests(CodeAtlasTestCase):
     def test_indexer_persists_sqlite_index_and_stats(self) -> None:
@@ -79,6 +83,58 @@ class IndexAndRetrievalTests(CodeAtlasTestCase):
             result.token_report.optimized_tokens,
             result.token_report.baseline_tokens,
         )
+
+    def test_exact_class_and_method_survive_high_degree_graph_with_tight_budget(self) -> None:
+        with self.make_repo() as root_name:
+            root = Path(root_name)
+            large_get_body = "x" * 1200
+            methods = [
+                "    def target_method(self, registry):\n"
+                "        return registry.get('target')\n"
+            ]
+            methods.extend(
+                f"    def operation_{index}(self, registry):\n"
+                f"        return registry.get({index})\n"
+                for index in range(180)
+            )
+            (root / "app" / "large_graph.py").write_text(
+                (
+                    "class Registry:\n"
+                    "    def get(self, value):\n"
+                    f"        payload = {large_get_body!r}\n"
+                    "        return value\n\n"
+                    "class OversizedService:\n"
+                    + "\n".join(methods)
+                ),
+                encoding="utf-8",
+            )
+            RepositoryIndexer().index(root)
+            engine = RetrievalEngine()
+            token_budget = 80
+
+            class_result = engine.retrieve(
+                root,
+                "OversizedService",
+                depth=2,
+                max_tokens=token_budget,
+            )
+            method_result = engine.retrieve(
+                root,
+                "target_method",
+                depth=2,
+                max_tokens=token_budget,
+            )
+
+        self.assertEqual(
+            class_result.snippets[0].qualified_name,
+            "app.large_graph.OversizedService",
+        )
+        self.assertLessEqual(class_result.snippets[0].estimated_tokens, token_budget)
+        self.assertEqual(
+            method_result.snippets[0].qualified_name,
+            "app.large_graph.OversizedService.target_method",
+        )
+        self.assertLessEqual(method_result.token_report.optimized_tokens, token_budget)
 
     def test_retrieval_uses_cached_symbol_snippets_when_source_file_moves(self) -> None:
         with self.make_repo() as root_name:

@@ -29,6 +29,12 @@ def index_status(repo_path: str | Path) -> dict[str, Any]:
         "index_age_seconds": None,
         "parser_errors": 0,
         "files_skipped": 0,
+        "files_content_parsed": 0,
+        "files_semantically_reresolved": 0,
+        "relationships_removed": 0,
+        "relationships_replaced": 0,
+        "conservative_fallback_used": False,
+        "conservative_fallback_reason": None,
         "supported_languages": [],
         "config": project_config.public_payload(),
     }
@@ -42,6 +48,7 @@ def index_status(repo_path: str | Path) -> dict[str, Any]:
         store.initialize()
         stats = store.repository_stats()
         report = store.get_metadata("last_index_report", {})
+        report_payload = report if isinstance(report, dict) else {}
         previous = store.previous_file_hashes()
         current_files = tuple(iter_source_files(repo_root))
         current = {source.relative_path: source.sha256 for source in current_files}
@@ -66,12 +73,28 @@ def index_status(repo_path: str | Path) -> dict[str, Any]:
                 "new_files": new,
                 "deleted_files": deleted,
                 "stale": bool(dirty or new or deleted),
-                "parser_errors": len(report.get("parser_errors") or [])
-                if isinstance(report, dict)
-                else 0,
-                "files_skipped": int(report.get("files_skipped") or 0)
-                if isinstance(report, dict)
-                else 0,
+                "parser_errors": len(report_payload.get("parser_errors") or []),
+                "files_skipped": int(report_payload.get("files_skipped") or 0),
+                "files_content_parsed": int(
+                    report_payload.get("files_content_parsed") or 0
+                ),
+                "files_semantically_reresolved": int(
+                    report_payload.get("files_semantically_reresolved") or 0
+                ),
+                "relationships_removed": int(
+                    report_payload.get("relationships_removed") or 0
+                ),
+                "relationships_replaced": int(
+                    report_payload.get("relationships_replaced") or 0
+                ),
+                "conservative_fallback_used": bool(
+                    report_payload.get("conservative_fallback_used", False)
+                ),
+                "conservative_fallback_reason": (
+                    str(report_payload["conservative_fallback_reason"])
+                    if report_payload.get("conservative_fallback_reason")
+                    else None
+                ),
                 "supported_languages": store.get_metadata("supported_languages", []),
                 "checked_at": datetime.now(UTC).isoformat(),
             }

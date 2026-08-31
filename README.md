@@ -10,7 +10,7 @@ This repository contains a working local-first implementation with Python, JavaS
 
 - Tree-sitter parser plugins for Python, JavaScript, and TypeScript/TSX
 - SQLite graph store under `.codeatlas/index.db`
-- Incremental indexing by file hash
+- Incremental content parsing with semantic relationship re-resolution
 - Graph-aware context retrieval with token estimates
 - Repository Memory Engine for git history, README/docs, ADRs, RFCs, release notes, and design docs
 - Commit intelligence heuristics for purpose, motivation, impacted components, risk, and architectural impact
@@ -183,7 +183,45 @@ Watch for changes:
 codeatlas watch /path/to/repo
 ```
 
-Incremental indexing compares file hashes and only reparses changed files. Deleted files are removed from the SQLite graph. Indexed file text and symbol snippets are cached in SQLite, so graph artifacts can still return exact snippets after export/import or source-file moves.
+Incremental indexing separates content parsing from semantic relationship re-resolution. It
+compares file hashes, content-parses only added or changed files, and removes deleted files from
+the SQLite graph. Before replacing changed graph sections, it snapshots their indexed definitions
+and imports; after all changed definitions are installed, it refreshes parser-produced `CALLS`,
+`REFERENCES`, `INHERITS`, and `HTTP_CALLS` edges for files whose resolution may have changed.
+
+The affected-file strategy is deliberately conservative:
+
+- If the indexed definition universe changes (file, module, simple name, qualified name, or kind),
+  schema v3 cannot identify every unresolved semantic use because those raw uses are not all
+  persisted. CodeAtlas therefore reparses and semantically re-resolves every otherwise unchanged
+  current source file. The index report sets `conservative_fallback_used=true` and includes a
+  `conservative_fallback_reason`.
+- If definitions are stable but imports change, CodeAtlas targets unchanged dependents using the
+  existing semantic edges, stored import records, and indexed source text. If that targeted lookup
+  fails, it falls back to re-resolving every unchanged source file and reports the reason.
+- No-op and body-only changes that leave definitions and imports stable do not trigger semantic
+  re-resolution of unchanged files.
+
+The CLI and persisted `last_index_report` distinguish the work performed:
+
+- `files_content_parsed` is the number of content-changed files parsed (and matches the legacy
+  `files_indexed` count).
+- `files_semantically_reresolved` counts unchanged files parsed only to regenerate semantic edges.
+- `files_skipped` retains its compatibility meaning of content-unchanged, so that count can include
+  files also reported as semantically re-resolved.
+- `relationships_removed` counts prior parser-produced semantic edge rows cleared for the files in
+  the update, while `relationships_replaced` counts the regenerated semantic edge rows present
+  afterward.
+- `conservative_fallback_used` and `conservative_fallback_reason` make repository-wide semantic
+  fallback explicit. The same fields are exposed by `codeatlas index-status`.
+
+Every incremental run still scans supported files to compare hashes. A no-op or body-only update
+adds parsing work only for changed files; an import-only change may reparse a targeted dependent
+set; a definition change intentionally can reparse all supported files for semantic consistency.
+That worst case approaches a repository-wide parse, but it rebuilds only resolution relationships
+for unchanged files rather than rewriting their cached content, definitions, and snippets. Indexed
+file text and symbol snippets remain cached in SQLite, so graph artifacts can still return exact
+snippets after export/import or source-file moves.
 
 ## Repository Memory Workflow
 
@@ -574,6 +612,11 @@ The implementation is organized in layers:
 ## Limitations
 
 - JavaScript and TypeScript parsing is Tree-sitter-backed, but cross-file reference resolution is still intentionally conservative and not type-aware.
+- Incremental semantic fallback is sound only for the static symbols and uses extracted by the built-in parsers. Dynamic `import()`/non-literal `require()`, Python import hooks, reflection, monkey-patching, computed calls, runtime dependency injection, and configuration-selected targets are not modeled.
+- Python named static import chains receive limited re-export resolution. JavaScript/TypeScript
+  named, default, star, and conditional re-exports and complete barrel-file semantics are not
+  supported.
+- Built-in package resolution does not implement `package.json` `exports`, Node directory/index and extension precedence, workspace/package-manager linking, `tsconfig` path aliases, bundler aliases, Python namespace-package behavior, or custom module loaders. Use SCIP/external-index evidence when those rules determine symbol identity.
 - Pyright/BasedPyright integration is currently an optional diagnostics hook; deeper type-aware reference resolution is a future extension.
 - Retrieval prefers DB-cached snippets and falls back to disk only for legacy or partial indexes.
 - Built-in call resolution is name-based, but its edges distinguish exact-qualified, import-scoped, same-module, unique-name, and unresolved matches. Ambiguous names remain unresolved. SCIP imports are the preferred precision tier when a language-specific indexer is available.
@@ -584,6 +627,9 @@ The implementation is organized in layers:
 - Impact radius is conservative and based on local git diff, file names, ownership, co-change history, and indexed evidence. It is not a substitute for test execution.
 - Built-in rule checks are review aids, not a full security scanner or CodeQL/Semgrep replacement.
 - External index import supports generic JSON, SCIP-style JSON, and binary SCIP protobuf indexes.
+- If a source file that owns imported SCIP/external symbols changes content, re-import the external
+  index after incremental indexing to restore that file-owned precise evidence. Semantic-only
+  re-resolution of unchanged files preserves precise edges.
 
 ## Roadmap
 
