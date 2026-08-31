@@ -10,7 +10,7 @@ from .analysis import dead_code, http_confidence_summary, route_summary, structu
 from .artifacts import export_graph_artifact, import_graph_artifact
 from .config import CodeAtlasPaths, resolve_repo_root
 from .external_index import import_external_index
-from .flow_trace import trace_flow
+from .flow_trace import trace_flow, validate_max_hops
 from .memory import MemoryQueryEngine
 from .packs import context_pack, render_context_pack
 from .retrieval import RetrievalEngine
@@ -121,7 +121,8 @@ def create_tool_handlers(
 
     def get_flow_trace(entrypoint: str, max_hops: int = 12) -> dict[str, Any]:
         """Return a canonical evidence-backed static trace for a route entrypoint."""
-        return trace_flow(repo_path, entrypoint, max_hops=max_hops).to_dict()
+        validated_max_hops = validate_max_hops(max_hops)
+        return trace_flow(repo_path, entrypoint, max_hops=validated_max_hops).to_dict()
 
     def get_decisions(question: str, limit: int = 5) -> list[dict[str, Any]]:
         return [asdict(answer) for answer in memory.decisions(repo_path, question, limit=limit)]

@@ -361,11 +361,19 @@ The local visualization server exposes the same canonical fields at `POST /api/f
 }
 ```
 
+`max_hops` is bounded consistently across Python, CLI, API, MCP, and UI callers:
+`1 <= max_hops <= 64`.
+
 Version 1 follows only `ROUTE -> HANDLES -> CALLS -> HTTP_CALLS`. Every returned link maps
 to a persisted graph edge and carries its source line, arguments, confidence, resolution tier,
 display name, endpoint keys, file paths, signatures, and HTTP target metadata. Unresolved calls
 become explicit trace steps and gaps; traversal never substitutes a convenient component or
 walks a call edge backward.
+
+Aggregated links expose an `occurrences` array containing each persisted occurrence's source line,
+arguments, and display name. The existing `source_line`, `source_lines`, and `arguments` fields
+remain for compatibility; `arguments` represents the first occurrence, while `occurrences` is the
+authoritative per-occurrence evidence.
 
 These are evidence-backed static traces, not verified runtime execution paths. The payload marks
 `trace_kind`, `ordering_basis`, `complete`, `gaps`, and `warnings` explicitly. Branches are

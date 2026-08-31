@@ -25,6 +25,7 @@ TraceEdgeType = Literal["HANDLES", "CALLS", "HTTP_CALLS"]
 OrderingBasis = Literal["source_order", "graph_path", "unknown"]
 
 FLOW_TRACE_SCHEMA_VERSION = 1
+MAX_FLOW_TRACE_HOPS = 64
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,29 @@ class TraceStep:
 
 
 @dataclass(frozen=True)
+class TraceOccurrence:
+    """One persisted call occurrence represented by an aggregated graph edge."""
+
+    source_line: int | None
+    arguments: tuple[str, ...]
+    display: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_line": self.source_line,
+            "arguments": list(self.arguments),
+            "display": self.display,
+        }
+
+
+@dataclass(frozen=True)
 class TraceLink:
+    """A persisted edge with normalized evidence.
+
+    ``arguments`` describes the first representative occurrence for compatibility;
+    ``occurrences`` is the authoritative per-occurrence evidence.
+    """
+
     edge_id: int
     source_step_id: str
     target_step_id: str
@@ -71,6 +94,7 @@ class TraceLink:
     confidence: float
     resolution_tier: str
     display: str | None
+    occurrences: tuple[TraceOccurrence, ...]
     source_file_path: str | None
     target_file_path: str | None
     source_signature: str | None
@@ -93,6 +117,7 @@ class TraceLink:
             "confidence": self.confidence,
             "resolution_tier": self.resolution_tier,
             "display": self.display,
+            "occurrences": [occurrence.to_dict() for occurrence in self.occurrences],
             "source_file_path": self.source_file_path,
             "target_file_path": self.target_file_path,
             "source_signature": self.source_signature,
@@ -155,8 +180,7 @@ def trace_flow(
     normalized_entrypoint = " ".join(entrypoint.strip().split())
     if not normalized_entrypoint:
         raise ValueError("entrypoint must not be empty")
-    if max_hops < 1:
-        raise ValueError("max_hops must be at least 1")
+    max_hops = validate_max_hops(max_hops)
 
     repo_root = resolve_repo_root(repo_path)
     database_path = CodeAtlasPaths(repo_root).database_path
@@ -173,6 +197,12 @@ def trace_flow(
         return _trace_from_store(store, normalized_entrypoint, max_hops)
     finally:
         store.close()
+
+
+def validate_max_hops(max_hops: int) -> int:
+    if not 1 <= max_hops <= MAX_FLOW_TRACE_HOPS:
+        raise ValueError(f"max_hops must be between 1 and {MAX_FLOW_TRACE_HOPS}")
+    return max_hops
 
 
 def flow_trace_payload(trace: FlowTrace) -> dict[str, Any]:
@@ -229,7 +259,7 @@ def _trace_from_store(store: GraphStore, entrypoint: str, max_hops: int) -> Flow
             if relationship_types
             else []
         )
-        rows, companion_arguments, evidence_overrides = _semantic_link_rows(rows)
+        rows, occurrence_overrides, evidence_overrides = _semantic_link_rows(rows)
 
         if depth >= max_hops:
             if rows:
@@ -285,16 +315,13 @@ def _trace_from_store(store: GraphStore, entrypoint: str, max_hops: int) -> Flow
                 relationship_id,
                 _decode_evidence(row["metadata_json"]),
             )
-            arguments = _call_arguments(evidence)
-            if not arguments:
-                arguments = companion_arguments.get(relationship_id, ())
             source_step = steps[current_step.id]
             link = _make_link(
                 row,
                 evidence,
                 source_step,
                 target_step,
-                arguments=arguments,
+                occurrences=occurrence_overrides.get(relationship_id),
                 target_evidence=target.evidence,
             )
             links.append(link)
@@ -487,7 +514,7 @@ def _semantic_link_rows(
     rows: list[sqlite3.Row],
 ) -> tuple[
     list[sqlite3.Row],
-    dict[int, tuple[str, ...]],
+    dict[int, tuple[TraceOccurrence, ...]],
     dict[int, dict[str, Any]],
 ]:
     """Collapse the indexer's unresolved CALLS companion for a recognized HTTP call."""
@@ -501,7 +528,7 @@ def _semantic_link_rows(
         and str(row["target_key"]).startswith("symbol_ref:")
     ]
     suppressed: set[int] = set()
-    companion_arguments: dict[int, tuple[str, ...]] = {}
+    occurrence_overrides: dict[int, tuple[TraceOccurrence, ...]] = {}
     evidence_overrides: dict[int, dict[str, Any]] = {}
     call_evidence = {
         int(row["id"]): _decode_evidence(row["metadata_json"])
@@ -521,8 +548,10 @@ def _semantic_link_rows(
     for http_row in http_rows:
         http_evidence = _decode_evidence(http_row["metadata_json"])
         http_occurrences = _edge_occurrences(http_evidence)
+        enriched_http_occurrences: list[dict[str, Any]] = []
         matches_for_http_row: dict[int, int] = {}
         for http_occurrence in http_occurrences:
+            enriched_occurrence = dict(http_occurrence)
             for call_row in call_rows:
                 relationship_id = int(call_row["id"])
                 occurrence_index = _matching_occurrence_index(
@@ -536,11 +565,16 @@ def _semantic_link_rows(
                 matches_for_http_row[relationship_id] = (
                     matches_for_http_row.get(relationship_id, 0) + 1
                 )
-                companion_arguments.setdefault(
-                    int(http_row["id"]),
-                    _call_arguments(call_occurrences[relationship_id][occurrence_index]),
+                arguments = _call_arguments(
+                    call_occurrences[relationship_id][occurrence_index]
                 )
+                if arguments:
+                    enriched_occurrence["arguments"] = list(arguments)
                 break
+            enriched_http_occurrences.append(enriched_occurrence)
+        occurrence_overrides[int(http_row["id"])] = _trace_occurrences(
+            enriched_http_occurrences
+        )
         if len(matches_for_http_row) == 1:
             relationship_id, represented_matches = next(iter(matches_for_http_row.items()))
             matched_occurrence_counts[relationship_id] += max(
@@ -575,7 +609,7 @@ def _semantic_link_rows(
             evidence_overrides.get(int(row["id"])),
         )
     )
-    return semantic_rows, companion_arguments, evidence_overrides
+    return semantic_rows, occurrence_overrides, evidence_overrides
 
 
 def _edge_occurrences(evidence: dict[str, Any]) -> tuple[dict[str, Any], ...]:
@@ -585,6 +619,19 @@ def _edge_occurrences(evidence: dict[str, Any]) -> tuple[dict[str, Any], ...]:
         if occurrences:
             return occurrences
     return (dict(evidence),)
+
+
+def _trace_occurrences(
+    evidence_items: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> tuple[TraceOccurrence, ...]:
+    return tuple(
+        TraceOccurrence(
+            source_line=_optional_int(evidence.get("line")),
+            arguments=_call_arguments(evidence),
+            display=_optional_text(evidence.get("display") or evidence.get("label")),
+        )
+        for evidence in evidence_items
+    )
 
 
 def _matching_occurrence_index(
@@ -673,11 +720,18 @@ def _make_link(
     source: TraceStep,
     target: TraceStep,
     *,
-    arguments: tuple[str, ...],
+    occurrences: tuple[TraceOccurrence, ...] | None,
     target_evidence: dict[str, Any],
 ) -> TraceLink:
-    source_lines = _source_lines(evidence)
+    link_occurrences = occurrences or _trace_occurrences(_edge_occurrences(evidence))
+    source_lines = _merge_lines(
+        _source_lines(evidence),
+        _occurrence_lines(link_occurrences),
+    )
     source_line = source_lines[0] if source_lines else None
+    representative = link_occurrences[0] if link_occurrences else None
+    arguments = representative.arguments if representative is not None else ()
+    display = representative.display if representative is not None else None
     confidence = _optional_float(evidence.get("confidence"))
     if confidence is None:
         confidence = float(row["weight"])
@@ -699,7 +753,8 @@ def _make_link(
         arguments=arguments,
         confidence=confidence,
         resolution_tier=str(evidence.get("resolution_tier") or "unknown"),
-        display=_optional_text(evidence.get("display") or evidence.get("label")),
+        display=display or _optional_text(evidence.get("display") or evidence.get("label")),
+        occurrences=link_occurrences,
         source_file_path=source.file_path,
         target_file_path=target.file_path,
         source_signature=source.signature,
@@ -708,6 +763,23 @@ def _make_link(
         http_target=http_target,
         ordering_basis="source_order" if source_line is not None else "graph_path",
     )
+
+
+def _occurrence_lines(occurrences: tuple[TraceOccurrence, ...]) -> tuple[int, ...]:
+    lines: list[int] = []
+    for occurrence in occurrences:
+        if occurrence.source_line is not None and occurrence.source_line not in lines:
+            lines.append(occurrence.source_line)
+    return tuple(lines)
+
+
+def _merge_lines(*line_groups: tuple[int, ...]) -> tuple[int, ...]:
+    lines: list[int] = []
+    for line_group in line_groups:
+        for line in line_group:
+            if line not in lines:
+                lines.append(line)
+    return tuple(lines)
 
 
 def _select_primary_path(

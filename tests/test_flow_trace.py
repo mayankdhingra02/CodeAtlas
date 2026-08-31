@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from codeatlas.config import CodeAtlasPaths
-from codeatlas.flow_trace import trace_flow
+from codeatlas.flow_trace import MAX_FLOW_TRACE_HOPS, trace_flow
 from codeatlas.indexer import RepositoryIndexer
 from codeatlas.storage import GraphStore
 
@@ -122,6 +122,10 @@ class FlowTraceTests(unittest.TestCase):
         self.assertEqual(http_link.http_target, "https://payments.example/charge")
         self.assertIn('"https://payments.example/charge"', http_link.arguments)
         self.assertTrue(any("amount" in argument for argument in http_link.arguments))
+        self.assertEqual(len(http_link.occurrences), 1)
+        self.assertEqual(http_link.occurrences[0].source_line, 17)
+        self.assertEqual(http_link.occurrences[0].arguments, http_link.arguments)
+        self.assertEqual(http_link.occurrences[0].display, "requests.post")
         self.assertEqual(http_link.source_file_path, "app/api.py")
         self.assertIsNotNone(http_link.source_signature)
         self.assertTrue(steps_by_id[trace.primary_path[-1]].is_sink)
@@ -134,6 +138,8 @@ class FlowTraceTests(unittest.TestCase):
         self.assertIsInstance(payload["steps"], list)
         self.assertIsInstance(payload["links"], list)
         self.assertIsInstance(payload["primary_path"], list)
+        self.assertIsInstance(payload["links"][-1]["occurrences"], list)
+        self.assertIsInstance(payload["links"][-1]["occurrences"][0]["arguments"], list)
         self.assertEqual(payload["trace_kind"], "static")
         self.assertEqual(payload["ordering_basis"], "graph_path")
 
@@ -227,6 +233,19 @@ class FlowTraceTests(unittest.TestCase):
             ("HANDLES", "CALLS"),
         )
         self.assertTrue(any("max_hops=2" in warning for warning in trace.warnings))
+
+    def test_max_hops_enforces_inclusive_public_bounds(self) -> None:
+        root = self.make_indexed_repo(LINEAR_FLOW)
+
+        self.assertEqual(MAX_FLOW_TRACE_HOPS, 64)
+        self.assertFalse(trace_flow(root, "POST /orders", max_hops=1).complete)
+        self.assertTrue(
+            trace_flow(root, "POST /orders", max_hops=MAX_FLOW_TRACE_HOPS).complete
+        )
+        for invalid_max_hops in (0, MAX_FLOW_TRACE_HOPS + 1):
+            with self.subTest(max_hops=invalid_max_hops):
+                with self.assertRaisesRegex(ValueError, "between 1 and 64"):
+                    trace_flow(root, "POST /orders", max_hops=invalid_max_hops)
 
     def test_branches_are_retained_and_primary_path_uses_source_line_clue(self) -> None:
         root = self.make_indexed_repo(
@@ -345,6 +364,85 @@ class FlowTraceTests(unittest.TestCase):
             http_links[0].arguments,
             ('"https://example.com/pay"', 'json={"attempt": 1}'),
         )
+        self.assertEqual(
+            [occurrence.source_line for occurrence in http_links[0].occurrences],
+            [8, 9],
+        )
+        self.assertEqual(
+            [occurrence.arguments for occurrence in http_links[0].occurrences],
+            [
+                ('"https://example.com/pay"', 'json={"attempt": 1}'),
+                ('"https://example.com/pay"', 'json={"attempt": 2}'),
+            ],
+        )
+        self.assertEqual(
+            [occurrence.display for occurrence in http_links[0].occurrences],
+            ["requests.post", "requests.post"],
+        )
+
+    def test_repeated_internal_target_preserves_both_argument_sets(self) -> None:
+        root = self.make_indexed_repo(
+            """
+            from fastapi import FastAPI
+
+            app = FastAPI()
+
+            @app.post("/process")
+            def run():
+                process("first")
+                return process("second")
+
+            def process(value):
+                return value
+            """
+        )
+
+        trace = trace_flow(root, "POST /process")
+        process_link = next(
+            link
+            for link in trace.links
+            if link.target_node_key == "symbol:app.api.process"
+        )
+
+        self.assertEqual(process_link.source_lines, (7, 8))
+        self.assertEqual(process_link.arguments, ('"first"',))
+        self.assertEqual(
+            [
+                (occurrence.source_line, occurrence.arguments, occurrence.display)
+                for occurrence in process_link.occurrences
+            ],
+            [
+                (7, ('"first"',), "process"),
+                (8, ('"second"',), "process"),
+            ],
+        )
+
+    def test_source_lines_retain_evidence_beyond_capped_occurrence_examples(self) -> None:
+        source_lines = [
+            "from fastapi import FastAPI",
+            "",
+            "app = FastAPI()",
+            "",
+            '@app.post("/many")',
+            "def run():",
+            *(f"    process({value})" for value in range(22)),
+            "",
+            "def process(value):",
+            "    return value",
+        ]
+        root = self.make_indexed_repo("\n".join(source_lines))
+
+        trace = trace_flow(root, "POST /many")
+        process_link = next(
+            link
+            for link in trace.links
+            if link.target_node_key == "symbol:app.api.process"
+        )
+
+        self.assertEqual(len(process_link.occurrences), 20)
+        self.assertEqual(len(process_link.source_lines), 22)
+        self.assertEqual(process_link.occurrences[0].arguments, ("0",))
+        self.assertEqual(process_link.occurrences[-1].arguments, ("19",))
 
 
 if __name__ == "__main__":

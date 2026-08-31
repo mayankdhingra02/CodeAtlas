@@ -20,6 +20,7 @@ from codeatlas.briefing import render_briefing_markdown, repo_briefing
 from codeatlas.cli import app
 from codeatlas.config import CodeAtlasPaths
 from codeatlas.external_index import import_external_index
+from codeatlas.flow_trace import MAX_FLOW_TRACE_HOPS
 from codeatlas.indexer import RepositoryIndexer
 from codeatlas.mcp_server import (
     attach_agent_staleness,
@@ -148,6 +149,80 @@ class BenchmarkAndMcpTests(CodeAtlasTestCase):
             payload,
         )
         self.assertIn("index_stale", result_payload)
+
+    def test_trace_flow_cli_enforces_lower_and_upper_hop_bounds(self) -> None:
+        runner = CliRunner()
+        trace = mock.Mock()
+        trace.to_dict.return_value = {
+            "entrypoint": "POST /orders",
+            "steps": [],
+            "links": [],
+            "complete": False,
+            "gaps": [],
+            "warnings": [],
+        }
+
+        for max_hops in (0, MAX_FLOW_TRACE_HOPS + 1):
+            with self.subTest(max_hops=max_hops):
+                with mock.patch("codeatlas.cli.trace_flow") as trace_mock:
+                    result = runner.invoke(
+                        app,
+                        [
+                            "trace-flow",
+                            ".",
+                            "--entrypoint",
+                            "POST /orders",
+                            "--max-hops",
+                            str(max_hops),
+                            "--json",
+                        ],
+                    )
+                self.assertEqual(result.exit_code, 2, result.output)
+                trace_mock.assert_not_called()
+
+        for max_hops in (1, MAX_FLOW_TRACE_HOPS):
+            with self.subTest(max_hops=max_hops):
+                with (
+                    mock.patch("codeatlas.cli.trace_flow", return_value=trace) as trace_mock,
+                    mock.patch("codeatlas.cli.console.print_json"),
+                ):
+                    result = runner.invoke(
+                        app,
+                        [
+                            "trace-flow",
+                            ".",
+                            "--entrypoint",
+                            "POST /orders",
+                            "--max-hops",
+                            str(max_hops),
+                            "--json",
+                        ],
+                    )
+                self.assertEqual(result.exit_code, 0, result.output)
+                trace_mock.assert_called_once_with(
+                    Path("."),
+                    "POST /orders",
+                    max_hops=max_hops,
+                )
+
+    def test_reduced_mcp_flow_trace_enforces_lower_and_upper_hop_bounds(self) -> None:
+        with self.make_repo() as root_name:
+            root = Path(root_name)
+            RepositoryIndexer().index(root)
+            handler = create_tool_handlers(root)["get_flow_trace"]
+
+            for max_hops in (1, MAX_FLOW_TRACE_HOPS):
+                with self.subTest(max_hops=max_hops):
+                    payload = handler("POST /orders", max_hops=max_hops)
+                    self.assertEqual(payload["entrypoint"], "POST /orders")
+
+            for max_hops in (0, MAX_FLOW_TRACE_HOPS + 1):
+                with self.subTest(max_hops=max_hops):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"between 1 and {MAX_FLOW_TRACE_HOPS}",
+                    ):
+                        handler("POST /orders", max_hops=max_hops)
 
     def test_mcp_staleness_payload_is_cached_per_index_mtime(self) -> None:
         with self.make_repo() as root_name:

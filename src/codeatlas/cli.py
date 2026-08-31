@@ -20,7 +20,7 @@ from .benchmark import Benchmarker
 from .briefing import render_briefing_markdown, repo_briefing
 from .doctor import doctor_report
 from .external_index import import_external_index
-from .flow_trace import trace_flow
+from .flow_trace import MAX_FLOW_TRACE_HOPS, trace_flow
 from .graph import GraphService
 from .indexer import RepositoryIndexer
 from .mcp_server import run_mcp_server
@@ -416,6 +416,7 @@ def trace_flow_cmd(
         typer.Option(
             "--max-hops",
             min=1,
+            max=MAX_FLOW_TRACE_HOPS,
             help="Maximum number of directed graph transitions to follow.",
         ),
     ] = 12,

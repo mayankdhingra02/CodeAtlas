@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from .analysis import dead_code, http_confidence_summary, route_summary, structural_query
 from .briefing import repo_briefing
 from .config import CodeAtlasPaths, resolve_repo_root
-from .flow_trace import trace_flow
+from .flow_trace import trace_flow, validate_max_hops
 from .indexer import RepositoryIndexer
 from .memory import MemoryQueryEngine, MemoryStore, component_for_path, metadata_files, parse_json
 from .packs import context_pack, render_context_pack
@@ -810,7 +810,7 @@ def create_visualization_server(
                     entrypoint = str(payload.get("entrypoint", ""))
                     if not entrypoint.strip():
                         raise ValueError("entrypoint is required")
-                    max_hops = int(payload.get("max_hops", 12))
+                    max_hops = validate_max_hops(int(payload.get("max_hops", 12)))
                     result = trace_flow(
                         repo_root,
                         entrypoint,
