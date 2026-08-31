@@ -48,6 +48,7 @@ src/codeatlas/
   cli.py              # codeatlas command surface
   indexer.py          # repository indexing and incremental updates
   retrieval.py        # context ranking, token reports, dependency explanation
+  flow_trace.py       # canonical directed static route/call traces
   storage.py          # SQLite schema and graph persistence
   scanner.py          # source file discovery and ignore rules
   graph.py            # graph neighborhood helpers
@@ -342,6 +343,44 @@ codeatlas briefing /path/to/repo
 codeatlas briefing /path/to/repo --json
 ```
 
+## Canonical Static Flow Traces
+
+Trace one indexed route through persisted directed relationships:
+
+```bash
+codeatlas trace-flow /path/to/repo --entrypoint "POST /orders"
+codeatlas trace-flow /path/to/repo --entrypoint "POST /orders" --json
+```
+
+The local visualization server exposes the same canonical fields at `POST /api/flow-trace`:
+
+```json
+{
+  "entrypoint": "POST /orders",
+  "max_hops": 12
+}
+```
+
+`max_hops` is bounded consistently across Python, CLI, API, MCP, and UI callers:
+`1 <= max_hops <= 64`.
+
+Version 1 follows only `ROUTE -> HANDLES -> CALLS -> HTTP_CALLS`. Every returned link maps
+to a persisted graph edge and carries its source line, arguments, confidence, resolution tier,
+display name, endpoint keys, file paths, signatures, and HTTP target metadata. Unresolved calls
+become explicit trace steps and gaps; traversal never substitutes a convenient component or
+walks a call edge backward.
+
+Aggregated links expose an `occurrences` array containing each persisted occurrence's source line,
+arguments, and display name. The existing `source_line`, `source_lines`, and `arguments` fields
+remain for compatibility; `arguments` represents the first occurrence, while `occurrences` is the
+authoritative per-occurrence evidence.
+
+These are evidence-backed static traces, not verified runtime execution paths. The payload marks
+`trace_kind`, `ordering_basis`, `complete`, `gaps`, and `warnings` explicitly. Branches are
+retained in `links`, while `primary_path` is only a deterministic sink-reaching graph path.
+Briefing playback requests this canonical payload when it has an exact route entrypoint and labels
+the older inferred reading path when a canonical trace is unavailable.
+
 ## Retrieval Flow
 
 Retrieve context:
@@ -383,12 +422,15 @@ Node types:
 - `FUNCTION`
 - `METHOD`
 - `SYMBOL`
+- `ROUTE`
 
 Edge types:
 
 - `CONTAINS`
 - `IMPORTS`
 - `CALLS`
+- `HANDLES`
+- `HTTP_CALLS`
 - `REFERENCES`
 - `DEFINES`
 - `INHERITS`
@@ -421,6 +463,7 @@ codeatlas export-graph /path/to/repo
 codeatlas import-graph /path/to/repo
 codeatlas index-status /path/to/repo
 codeatlas doctor /path/to/repo
+codeatlas trace-flow /path/to/repo --entrypoint "POST /orders"
 codeatlas query "callers:symbol" --repo-path /path/to/repo
 codeatlas dead-code /path/to/repo
 codeatlas routes /path/to/repo
@@ -453,6 +496,7 @@ Exposed tools:
 
 - `get_code_context(query, max_tokens, depth)`
 - `get_context_pack(task, max_tokens, output_format)`
+- `get_flow_trace(entrypoint, max_hops)`
 - `query_code_graph(expression, limit)`
 - `get_index_status()`
 - `get_verification_plan(base_ref, task)`
@@ -536,7 +580,7 @@ The implementation is organized in layers:
 - Token counts are estimates, not tokenizer-specific counts.
 - PR review comments and approvals are not fetched from GitHub yet; PullRequest entities are currently inferred from commit messages.
 - Commit intelligence uses deterministic local heuristics, not an LLM. It cites evidence but should be treated as an initial signal.
-- API-flow and infrastructure intelligence have conservative MCP surfaces, but deep endpoint/runtime topology extraction is still roadmap work.
+- Canonical flow traces currently cover static `HANDLES`, `CALLS`, and `HTTP_CALLS` edges only. They do not prove runtime order across conditionals, callbacks, dependency injection, dynamic dispatch, reflection, or configuration.
 - Impact radius is conservative and based on local git diff, file names, ownership, co-change history, and indexed evidence. It is not a substitute for test execution.
 - Built-in rule checks are review aids, not a full security scanner or CodeQL/Semgrep replacement.
 - External index import supports generic JSON, SCIP-style JSON, and binary SCIP protobuf indexes.
@@ -555,7 +599,7 @@ The implementation is organized in layers:
 - Add package-aware import resolution for monorepos.
 - Add GitHub/GitLab PR ingestion for review comments, approvals, and requested changes.
 - Add exact architecture evolution diffing between graph snapshots.
-- Add API route/event/infra parsers for end-to-end flow intelligence.
+- Extend canonical traces with database, event, queue, async, configuration, and runtime-observed evidence after the static contract is calibrated.
 - Add confidence calibration and larger evidence-backed benchmark suites.
 
 ## Development

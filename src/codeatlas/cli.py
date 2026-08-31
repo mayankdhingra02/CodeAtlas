@@ -20,10 +20,11 @@ from .benchmark import Benchmarker
 from .briefing import render_briefing_markdown, repo_briefing
 from .doctor import doctor_report
 from .external_index import import_external_index
+from .flow_trace import MAX_FLOW_TRACE_HOPS, trace_flow
 from .graph import GraphService
 from .indexer import RepositoryIndexer
-from .memory import MemoryQueryEngine
 from .mcp_server import run_mcp_server
+from .memory import MemoryQueryEngine
 from .packs import context_pack, render_context_pack
 from .retrieval import RetrievalEngine
 from .retrieval_eval import evaluate_retrieval_manifest, load_retrieval_eval_manifest
@@ -395,6 +396,84 @@ def briefing_cmd(
         console.print_json(json.dumps(payload, default=str))
         return
     console.print(render_briefing_markdown(payload))
+
+
+@app.command("trace-flow")
+def trace_flow_cmd(
+    entrypoint: Annotated[
+        str,
+        typer.Option(
+            "--entrypoint",
+            help="Route entrypoint to trace, for example 'POST /orders'.",
+        ),
+    ],
+    repo_path: Annotated[
+        Path,
+        typer.Argument(help="Repository containing .codeatlas/index.db."),
+    ] = Path("."),
+    max_hops: Annotated[
+        int,
+        typer.Option(
+            "--max-hops",
+            min=1,
+            max=MAX_FLOW_TRACE_HOPS,
+            help="Maximum number of directed graph transitions to follow.",
+        ),
+    ] = 12,
+    output_json: Annotated[
+        bool,
+        typer.Option("--json", help="Print the canonical FlowTrace payload as JSON."),
+    ] = False,
+) -> None:
+    """Trace a route through evidence-backed, directed static call edges."""
+    trace = trace_flow(repo_path, entrypoint, max_hops=max_hops)
+    payload = trace.to_dict()
+    if output_json:
+        console.print_json(json.dumps(payload, default=str))
+        return
+
+    console.rule(f"Static flow trace: {payload.get('entrypoint', entrypoint)}")
+    table = Table()
+    table.add_column("Trace")
+    table.add_column("Role")
+    table.add_column("Node")
+    table.add_column("Location")
+    table.add_column("Status")
+    steps = [step for step in payload.get("steps", []) if isinstance(step, dict)]
+    steps_by_id = {str(step.get("id") or ""): step for step in steps if step.get("id")}
+    primary_ids = [str(step_id) for step_id in payload.get("primary_path", [])]
+    primary_steps = [steps_by_id[step_id] for step_id in primary_ids if step_id in steps_by_id]
+    primary_step_ids = {str(step.get("id") or "") for step in primary_steps}
+    branch_steps = [step for step in steps if str(step.get("id") or "") not in primary_step_ids]
+    display_steps = [
+        (f"primary {position}", step)
+        for position, step in enumerate(primary_steps, start=1)
+    ]
+    branch_label = "branch" if primary_steps else "evidence"
+    display_steps.extend((branch_label, step) for step in branch_steps)
+    for trace_label, step in display_steps:
+        file_path = step.get("file_path") or ""
+        line_start = step.get("line_start")
+        location = f"{file_path}:{line_start}" if file_path and line_start else str(file_path)
+        table.add_row(
+            trace_label,
+            str(step.get("role", "")),
+            str(step.get("label") or step.get("node_key") or step.get("id") or ""),
+            location,
+            str(step.get("status", "")),
+        )
+    console.print(table)
+    completion = "complete" if payload.get("complete") else "incomplete"
+    console.print(
+        f"[bold]Trace:[/bold] {completion} · "
+        f"{len(payload.get('links', []))} directed links · "
+        f"{len(primary_steps)} primary-path steps · "
+        f"ordering {payload.get('ordering_basis', 'unknown')}"
+    )
+    for gap in payload.get("gaps", []):
+        console.print(f"[yellow]Gap: {gap}[/yellow]")
+    for warning in payload.get("warnings", []):
+        console.print(f"[yellow]Warning: {warning}[/yellow]")
 
 
 @app.command("query")

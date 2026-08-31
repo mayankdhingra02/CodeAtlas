@@ -10,6 +10,7 @@ from .analysis import dead_code, http_confidence_summary, route_summary, structu
 from .artifacts import export_graph_artifact, import_graph_artifact
 from .config import CodeAtlasPaths, resolve_repo_root
 from .external_index import import_external_index
+from .flow_trace import trace_flow, validate_max_hops
 from .memory import MemoryQueryEngine
 from .packs import context_pack, render_context_pack
 from .retrieval import RetrievalEngine
@@ -19,7 +20,6 @@ from .status import index_status
 from .verification import verification_plan
 from .visualization import VisualizationService
 
-
 AGENT_TOOL_NAMES = (
     "get_code_context",
     "get_context_pack",
@@ -28,6 +28,7 @@ AGENT_TOOL_NAMES = (
     "get_verification_plan",
     "run_rules",
     "get_source_outline",
+    "get_flow_trace",
     "repository_stats",
 )
 STALENESS_CACHE_TTL_SECONDS = 15.0
@@ -118,6 +119,11 @@ def create_tool_handlers(
             "evidence": evidence,
         }
 
+    def get_flow_trace(entrypoint: str, max_hops: int = 12) -> dict[str, Any]:
+        """Return a canonical evidence-backed static trace for a route entrypoint."""
+        validated_max_hops = validate_max_hops(max_hops)
+        return trace_flow(repo_path, entrypoint, max_hops=validated_max_hops).to_dict()
+
     def get_decisions(question: str, limit: int = 5) -> list[dict[str, Any]]:
         return [asdict(answer) for answer in memory.decisions(repo_path, question, limit=limit)]
 
@@ -203,6 +209,7 @@ def create_tool_handlers(
         "get_ownership": get_ownership,
         "get_dependencies": get_dependencies,
         "get_api_flow": get_api_flow,
+        "get_flow_trace": get_flow_trace,
         "get_decisions": get_decisions,
         "search_memory": search_memory,
         "get_impact": get_impact,

@@ -4,12 +4,14 @@ import json
 import shutil
 import subprocess
 import tempfile
-import threading
 import textwrap
+import threading
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from codeatlas.agent_install import install_agent
 from codeatlas.analysis import dead_code, http_confidence_summary, route_summary, structural_query
@@ -18,14 +20,19 @@ from codeatlas.benchmark import Benchmarker
 from codeatlas.briefing import render_briefing_markdown, repo_briefing
 from codeatlas.config import CodeAtlasPaths
 from codeatlas.external_index import import_external_index
+from codeatlas.flow_trace import MAX_FLOW_TRACE_HOPS
 from codeatlas.indexer import RepositoryIndexer
-from codeatlas.memory import MemoryQueryEngine
 from codeatlas.mcp_server import create_tool_handlers
+from codeatlas.memory import MemoryQueryEngine
 from codeatlas.models import SourceFile, estimate_tokens, estimate_tokens_for_size
 from codeatlas.packs import context_pack, render_context_pack
 from codeatlas.parsers.javascript import JavaScriptParser
 from codeatlas.parsers.python import PythonParser
-from codeatlas.project_config import load_project_config, restore_classification_config, update_classification_config
+from codeatlas.project_config import (
+    load_project_config,
+    restore_classification_config,
+    update_classification_config,
+)
 from codeatlas.retrieval import RetrievalEngine
 from codeatlas.rules import run_rule_checks
 from codeatlas.scanner import iter_source_files
@@ -42,8 +49,8 @@ from codeatlas.visualization import (
     render_visualization_app,
 )
 from codeatlas.workflow_cache import cached_workflow
-
 from tests.helpers import CodeAtlasTestCase, run_git
+
 
 class VisualizationTests(CodeAtlasTestCase):
     def test_visualization_assets_are_split_and_rendered(self) -> None:
@@ -123,6 +130,10 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertIn("function setInlineStatusLoading", js)
         self.assertIn("function setButtonLoading", js)
         self.assertIn("function startFlowPlayback", js)
+        self.assertIn("function requestCanonicalFlowTrace", js)
+        self.assertIn("function buildCanonicalFlowPlayback", js)
+        self.assertIn("function canonicalTracePrimaryPath", js)
+        self.assertIn("function flowPlaybackDirectedEdge", js)
         self.assertIn("function renderFlowPlaybackHud", js)
         self.assertIn("function drawFlowPlaybackPulse", js)
         self.assertIn("function drawFlowPlaybackVirtualEdge", js)
@@ -134,6 +145,126 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertEqual(HTML_APP, render_visualization_app())
         self.assertNotIn("{{ CODEATLAS_CSS }}", HTML_APP)
         self.assertNotIn("{{ CODEATLAS_JS }}", HTML_APP)
+
+    def test_canonical_flow_ui_helpers_require_exact_directed_links(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        js = (ASSET_DIR / "visualization.js").read_text(encoding="utf-8")
+        entry_start = js.index("    function exactRouteEntrypoint")
+        entry_end = js.index("    function requestCanonicalFlowTrace", entry_start)
+        path_start = js.index("    function canonicalTracePrimaryPath")
+        path_end = js.index("    function buildCanonicalFlowPlayback", path_start)
+        node_start = js.index("    function canonicalFlowPlaybackNodeId")
+        node_end = js.index("    function flowPlaybackDirectedEdge", node_start)
+        edge_start = js.index("    function flowPlaybackDirectedEdge")
+        edge_end = js.index("    function canonicalFlowPlaybackDetail", edge_start)
+        helpers = "\n".join(
+            (
+                js[entry_start:entry_end],
+                js[path_start:path_end],
+                js[node_start:node_end],
+                js[edge_start:edge_end],
+            )
+        )
+        script = textwrap.dedent(
+            f"""
+            {helpers}
+            const state = {{
+              nodeIndex: new Map([['api', {{}}], ['service', {{}}], ['payments', {{}}]]),
+              allEdges: [
+                {{ source: 'api', target: 'service', type: 'calls' }},
+                {{
+                  source: 'service',
+                  target: 'payments',
+                  type: 'http_calls',
+                  examples: [{{
+                    source: {{ key: 'symbol:charge_payment' }},
+                    target: {{ key: 'route:external:POST:https://payments.example/charge' }}
+                  }}]
+                }}
+              ]
+            }};
+            function briefingComponentFromPath(path) {{ return String(path || '').split('/')[0]; }}
+            function allKnownNodes() {{
+              return [{{ id: 'process_payment', label: 'process_payment' }}];
+            }}
+            const baseTrace = {{
+              trace_kind: 'static',
+              steps: [
+                {{ id: 'route', label: 'POST /orders' }},
+                {{ id: 'handler', label: 'post_order' }}
+              ],
+              links: [{{
+                source_step_id: 'route',
+                target_step_id: 'handler',
+                edge_type: 'HANDLES'
+              }}],
+              primary_path: ['route', 'handler']
+            }};
+            const validPath = canonicalTracePrimaryPath(baseTrace);
+            const reversePath = canonicalTracePrimaryPath({{
+              ...baseTrace,
+              primary_path: ['handler', 'route']
+            }});
+            const importPath = canonicalTracePrimaryPath({{
+              ...baseTrace,
+              links: [{{
+                source_step_id: 'route',
+                target_step_id: 'handler',
+                edge_type: 'IMPORTS'
+              }}]
+            }});
+            console.log(JSON.stringify({{
+              entrypoint: exactRouteEntrypoint('post /orders'),
+              nonRoute: exactRouteEntrypoint('orders route'),
+              evidenceEntrypoint: briefingFlowEntrypoint({{
+                steps: [{{ title: 'Request entrypoint', evidence: [{{ title: 'GET /health' }}] }}]
+              }}),
+              validIds: validPath && validPath.ids,
+              reversePath,
+              importPath,
+              mappedSink: canonicalFlowPlaybackNodeId({{
+                node_key: 'route:external:POST:https://payments.example/charge',
+                label: 'POST https://payments.example/charge',
+                role: 'external_http'
+              }}),
+              unknownSink: canonicalFlowPlaybackNodeId({{
+                node_key: 'route:external:POST:https://unknown.example/charge',
+                label: 'POST https://unknown.example/charge',
+                role: 'external_http'
+              }}),
+              unresolvedProjection: canonicalFlowPlaybackNodeId({{
+                node_key: 'route:external:POST:https://payments.example/charge',
+                label: 'process_payment',
+                role: 'unresolved',
+                status: 'unresolved'
+              }}),
+              directed: Boolean(flowPlaybackDirectedEdge('api', 'service', 'CALLS')),
+              reversed: Boolean(flowPlaybackDirectedEdge('service', 'api', 'CALLS')),
+              wrongType: Boolean(flowPlaybackDirectedEdge('api', 'service', 'HANDLES'))
+            }}));
+            """
+        )
+        result = subprocess.run(
+            [node, "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(result.stdout.strip())
+        self.assertEqual(payload["entrypoint"], "POST /orders")
+        self.assertEqual(payload["nonRoute"], "")
+        self.assertEqual(payload["evidenceEntrypoint"], "GET /health")
+        self.assertEqual(payload["validIds"], ["route", "handler"])
+        self.assertIsNone(payload["reversePath"])
+        self.assertIsNone(payload["importPath"])
+        self.assertEqual(payload["mappedSink"], "payments")
+        self.assertEqual(payload["unknownSink"], "")
+        self.assertEqual(payload["unresolvedProjection"], "")
+        self.assertTrue(payload["directed"])
+        self.assertFalse(payload["reversed"])
+        self.assertFalse(payload["wrongType"])
 
     def test_graph_worker_filter_matches_expected_small_fixture(self) -> None:
         node = shutil.which("node")
@@ -338,6 +469,190 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertTrue(briefing_payload["ok"])
         self.assertIn("start_here", briefing_payload)
         self.assertIn("agent_brief", briefing_payload)
+
+    def test_visualization_server_serves_canonical_flow_trace(self) -> None:
+        expected = {
+            "schema_version": 1,
+            "entrypoint": "POST /orders",
+            "trace_kind": "static",
+            "ordering_basis": "graph_path",
+            "steps": [],
+            "links": [],
+            "primary_path": [],
+            "complete": False,
+            "gaps": ["fixture gap"],
+            "warnings": [],
+        }
+        trace = mock.Mock()
+        trace.to_dict.return_value = expected
+        with self.make_repo() as root_name:
+            root = Path(root_name)
+            try:
+                server = create_visualization_server(root, host="127.0.0.1", port=0)
+            except PermissionError as exc:
+                raise self.skipTest("local socket binding is blocked in this sandbox") from exc
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            request = Request(
+                f"http://127.0.0.1:{server.server_address[1]}/api/flow-trace",
+                data=json.dumps({"entrypoint": "POST /orders", "max_hops": 7}).encode(
+                    "utf-8"
+                ),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with mock.patch(
+                    "codeatlas.visualization.trace_flow",
+                    return_value=trace,
+                ) as trace_mock:
+                    with urlopen(request, timeout=5) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        trace_mock.assert_called_once_with(root, "POST /orders", max_hops=7)
+        self.assertTrue(payload.pop("ok"))
+        self.assertEqual(payload, expected)
+
+    def test_real_api_and_reduced_mcp_return_the_same_canonical_trace(self) -> None:
+        source = textwrap.dedent(
+            '''
+            import requests
+            from fastapi import FastAPI
+
+            app = FastAPI()
+
+
+            @app.post("/orders")
+            def post_order():
+                return create_order()
+
+
+            def create_order():
+                return charge_payment()
+
+
+            def charge_payment():
+                return requests.post(
+                    "https://payments.example/charge",
+                    json={"amount": 100},
+                )
+            '''
+        ).lstrip()
+        canonical_fields = {
+            "schema_version",
+            "entrypoint",
+            "trace_kind",
+            "ordering_basis",
+            "steps",
+            "links",
+            "primary_path",
+            "complete",
+            "gaps",
+            "warnings",
+        }
+        with self.make_repo() as root_name:
+            root = Path(root_name)
+            (root / "app" / "api.py").write_text(source, encoding="utf-8")
+            RepositoryIndexer().index(root)
+
+            mcp_handler = create_tool_handlers(root)["get_flow_trace"]
+            mcp_payload = mcp_handler(
+                "POST /orders",
+                max_hops=MAX_FLOW_TRACE_HOPS,
+            )
+
+            try:
+                server = create_visualization_server(root, host="127.0.0.1", port=0)
+            except PermissionError as exc:
+                raise self.skipTest("local socket binding is blocked in this sandbox") from exc
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_address[1]}/api/flow-trace"
+
+            def post_trace(max_hops: int) -> dict[str, Any]:
+                request = Request(
+                    url,
+                    data=json.dumps(
+                        {"entrypoint": "POST /orders", "max_hops": max_hops}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=5) as response:
+                    return json.loads(response.read().decode("utf-8"))
+
+            try:
+                api_payload = post_trace(MAX_FLOW_TRACE_HOPS)
+                lower_payload = post_trace(1)
+                invalid_errors: list[dict[str, Any]] = []
+                for max_hops in (0, MAX_FLOW_TRACE_HOPS + 1):
+                    with self.assertRaises(HTTPError) as error_context:
+                        post_trace(max_hops)
+                    self.assertEqual(error_context.exception.code, 400)
+                    invalid_errors.append(
+                        json.loads(error_context.exception.read().decode("utf-8"))
+                    )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertTrue(api_payload["ok"])
+        self.assertTrue(lower_payload["ok"])
+        self.assertFalse(lower_payload["complete"])
+        self.assertEqual(
+            {key: api_payload[key] for key in canonical_fields},
+            {key: mcp_payload[key] for key in canonical_fields},
+        )
+        steps_by_id = {step["id"]: step for step in api_payload["steps"]}
+        self.assertEqual(
+            [steps_by_id[step_id]["node_key"] for step_id in api_payload["primary_path"]],
+            [
+                "route:app.api.post_order",
+                "symbol:app.api.post_order",
+                "symbol:app.api.create_order",
+                "symbol:app.api.charge_payment",
+                "route:external:POST:https://payments.example/charge",
+            ],
+        )
+        self.assertEqual(
+            [link["edge_type"] for link in api_payload["links"]],
+            ["HANDLES", "CALLS", "CALLS", "HTTP_CALLS"],
+        )
+        self.assertEqual(
+            [link["source_line"] for link in api_payload["links"]],
+            [None, 9, 13, 17],
+        )
+        self.assertEqual(
+            api_payload["links"][-1]["arguments"],
+            ['"https://payments.example/charge"', 'json={"amount": 100}'],
+        )
+        self.assertEqual(
+            api_payload["links"][-1]["occurrences"],
+            [
+                {
+                    "source_line": 17,
+                    "arguments": [
+                        '"https://payments.example/charge"',
+                        'json={"amount": 100}',
+                    ],
+                    "display": "requests.post",
+                }
+            ],
+        )
+        self.assertTrue(api_payload["complete"])
+        self.assertEqual(api_payload["gaps"], [])
+        self.assertTrue(all(not payload["ok"] for payload in invalid_errors))
+        self.assertTrue(
+            all(
+                f"between 1 and {MAX_FLOW_TRACE_HOPS}" in str(payload["error"])
+                for payload in invalid_errors
+            )
+        )
 
     def test_mcp_visual_map_handler_is_available(self) -> None:
         with self.make_memory_repo() as root_name:
@@ -555,6 +870,27 @@ class VisualizationTests(CodeAtlasTestCase):
         self.assertIn("selected.playback.nodeIds", HTML_APP)
         self.assertIn("flowPlaybackFallbackSteps", HTML_APP)
         self.assertIn("drawFlowPlaybackVirtualEdge", HTML_APP)
+        self.assertIn("/api/flow-trace", HTML_APP)
+        self.assertIn("max_hops", HTML_APP)
+        self.assertIn("canonicalTracePrimaryPath", HTML_APP)
+        self.assertIn("flowPlaybackDirectedEdge", HTML_APP)
+        self.assertIn("mode: 'canonical'", HTML_APP)
+        self.assertGreaterEqual(HTML_APP.count("state.flowPlayback.mode === 'canonical'"), 2)
+        self.assertIn(
+            "Canonical static trace unavailable. Showing inferred reading path.",
+            HTML_APP,
+        )
+        canonical_builder = HTML_APP[
+            HTML_APP.index("function buildCanonicalFlowPlayback") :
+            HTML_APP.index("function canonicalFlowPlaybackNodeId")
+        ]
+        self.assertNotIn("flowPlaybackFallbackSteps", canonical_builder)
+        self.assertNotIn("normalizeFlowPlaybackSteps", canonical_builder)
+        directed_matcher = HTML_APP[
+            HTML_APP.index("function flowPlaybackDirectedEdge") :
+            HTML_APP.index("function canonicalFlowPlaybackDetail")
+        ]
+        self.assertNotIn("edge.source === targetId", directed_matcher)
         self.assertIn("playback.steps.length <= 1", HTML_APP)
         self.assertIn("Loading architecture", HTML_APP)
         self.assertIn("Filtering map", HTML_APP)
